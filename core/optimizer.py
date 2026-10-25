@@ -2,21 +2,33 @@ import pandas as pd
 from typing import List, Dict, Any
 from core.keepa_client import KeepaClient
 from core.auditor import CatalogAuditor
+from core.state_manager import StateManager
 from config import MIN_BRAND_UNITS, DISTRIBUTOR_MOQ
 
 class UngateOptimizer:
     def __init__(self, keepa_client: KeepaClient):
         self.keepa = keepa_client
         self.auditor = CatalogAuditor()
+        self.state_mgr = StateManager()
 
     def process_catalog(self, df: pd.DataFrame) -> pd.DataFrame:
+        ungated_set = self.state_mgr.get_ungated_brands()
         brands = df['brand'].dropna().str.strip().unique()
-        print(f"[*] Processing {len(brands)} unique brands...")
+        
+        print(f"[*] Total brands in distributor catalog: {len(brands)}")
+        print(f"[*] Already UNGATED brands (skipping key optimization): {len(ungated_set)}")
 
         brand_keys = []
 
         for brand in brands:
-            brand_items = df[df['brand'].str.lower() == brand.lower()]
+            normalized_brand = brand.lower().strip()
+            
+            # --- THE CIRCUIT BREAKER ---
+            # If the brand is already ungated, completely exit the ungate optimizer for this brand
+            if normalized_brand in ungated_set:
+                continue
+
+            brand_items = df[df['brand'].str.lower() == normalized_brand]
             cheapest_items = brand_items.sort_values(by="unit_cost", ascending=True)
 
             for _, row in cheapest_items.iterrows():
@@ -42,7 +54,7 @@ class UngateOptimizer:
                         "buy_box": audit_result['buy_box'],
                         "monthly_velocity": audit_result['monthly_drops']
                     })
-                    break
+                    break  # Found the cheapest valid key for this gated brand
 
         sorted_keys = sorted(brand_keys, key=lambda x: x["line_total"])
 
@@ -55,5 +67,5 @@ class UngateOptimizer:
             po_items.append(item)
             running_total += item["line_total"]
 
-        print(f"[+] Ungate PO constructed: {len(po_items)} brands selected. Total: ${running_total:,.2f}")
+        print(f"[+] Ungate PO constructed: {len(po_items)} NEW brands selected. Total: ${running_total:,.2f}")
         return pd.DataFrame(po_items)
