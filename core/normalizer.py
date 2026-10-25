@@ -1,151 +1,143 @@
 import os
 import re
 import pandas as pd
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 
 class SmartCatalogNormalizer:
     """
-    Ingests raw distributor spreadsheets (.csv or .xlsx), validates that the file
-    is an authentic wholesale price list, and normalizes columns and UPCs
-    to a standardized schema.
+    Normalizes chaotic distributor CSV/Excel files into a strict schema:
+    ['upc', 'description', 'brand', 'unit_cost', 'case_qty']
+    Handles currency symbols, commas, corrupted barcodes, and varying header names.
     """
-    SYNONYM_MAP = {
+    HEADER_MAP = {
         "upc": [
-            "upc", "upc_code", "upccode", "barcode", "gtin", "ean", 
-            "item_upc", "upc_number", "bar_code", "product_code"
-        ],
-        "brand": [
-            "brand", "brand_name", "vendor", "mfr", "manufacturer", 
-            "mfg", "line", "make"
+            "upc", "upc code", "barcode", "ean", "item upc", "product upc", 
+            "upc/ean", "bar code", "gtin", "upc_code"
         ],
         "description": [
-            "description", "desc", "item_description", "title", 
-            "product_name", "item_name", "product_description", "item"
+            "description", "item description", "product description", "title", 
+            "item name", "product name", "desc", "name", "item_desc"
+        ],
+        "brand": [
+            "brand", "mfr", "manufacturer", "brand name", "line", "vendor"
         ],
         "unit_cost": [
-            "unit_cost", "cost", "price", "wholesale", "wholesale_price", 
-            "whsl", "unit_price", "price_ea", "our_price", "net_price"
+            "cost", "unit cost", "price", "whsl", "wholesale", "wholesale price", 
+            "price each", "our price", "unit_cost", "whsl price", "wsl", "ea cost"
         ],
         "case_qty": [
-            "case_qty", "pack", "case_pack", "pack_size", "moq", 
-            "master_pack", "inner_pack", "qty_per_case", "box_qty"
+            "case qty", "case pack", "pack", "pk", "master pack", "case count", 
+            "units/case", "qty/case", "moq", "case_qty", "pack size", "cs pk"
         ]
     }
 
     @classmethod
-    def clean_column_name(cls, col: str) -> str:
-        """Converts arbitrary column strings to snake_case alphanumeric."""
-        return re.sub(r"[^a-z0-9_]", "", str(col).strip().lower().replace(" ", "_"))
+    def clean_currency(cls, val: any) -> float:
+        if pd.isna(val):
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        # Remove '$', commas, spaces, and non-numeric characters except '.'
+        cleaned = re.sub(r"[^\d.]", "", str(val))
+        try:
+            return float(cleaned) if cleaned else 0.0
+        except ValueError:
+            return 0.0
 
     @classmethod
-    def format_upc(cls, raw_val: any) -> Optional[str]:
-        """Restores truncated leading zeros and cleans scientific notation artifacts."""
-        if pd.isna(raw_val):
+    def clean_upc(cls, val: any) -> Optional[str]:
+        if pd.isna(val):
             return None
-        
-        val_str = str(raw_val).strip()
-        # Handle scientific notation like 7.0066E+10
-        if "e" in val_str.lower():
+        # Convert floating point scientific notation (e.g. 1.23456E+11) or raw integers
+        raw_str = str(val).strip()
+        if "." in raw_str and ("e" in raw_str.lower() or raw_str.endswith(".0")):
             try:
-                val_str = f"{int(float(val_str))}"
+                raw_str = f"{int(float(raw_str))}"
             except ValueError:
                 pass
         
-        # Strip trailing decimal artifacts like 70066120015.0
-        val_str = re.sub(r"\.0$", "", val_str)
-        digits_only = re.sub(r"\D", "", val_str)
+        # Strip all non-digit characters
+        digits = re.sub(r"\D", "", raw_str)
+        if not digits or len(digits) < 8:
+            return None
 
-        # Standard barcode lengths (UPC-A: 12, EAN: 13, GTIN-14: 14)
-        if len(digits_only) in [10, 11]:
-            return digits_only.zfill(12)
-        elif len(digits_only) in [12, 13, 14]:
-            return digits_only
-        elif 0 < len(digits_only) < 10:
-            return digits_only.zfill(12)
-        return None
+        # Standard US retail barcodes are 12 digits (UPC-A) or 13 digits (EAN-13)
+        if len(digits) <= 12:
+            return digits.zfill(12)
+        elif len(digits) == 13:
+            return digits.zfill(13)
+        return digits
 
     @classmethod
-    def is_valid_price_catalog(cls, file_path: str) -> bool:
-        """
-        Structural Fingerprint Test:
-        Validates row threshold and presence of the 3 anchor columns (UPC, Cost, Brand).
-        Used by automated fetchers to filter out PDFs, receipts, and order forms.
-        """
+    def clean_integer(cls, val: any, default: int = 1) -> int:
+        if pd.isna(val):
+            return default
         try:
-            if file_path.endswith((".xlsx", ".xls")):
-                preview_df = pd.read_excel(file_path, nrows=20)
-            else:
-                try:
-                    preview_df = pd.read_csv(file_path, nrows=20, low_memory=False, encoding="utf-8")
-                except UnicodeDecodeError:
-                    preview_df = pd.read_csv(file_path, nrows=20, low_memory=False, encoding="latin1")
-        except Exception:
-            return False
-
-        if len(preview_df) < 5:
-            return False
-
-        clean_cols = [cls.clean_column_name(c) for c in preview_df.columns]
-        
-        has_upc = any(any(alias == col or alias in col for alias in cls.SYNONYM_MAP["upc"]) for col in clean_cols)
-        has_cost = any(any(alias == col or alias in col for alias in cls.SYNONYM_MAP["unit_cost"]) for col in clean_cols)
-        has_brand = any(any(alias == col or alias in col for alias in cls.SYNONYM_MAP["brand"]) for col in clean_cols)
-
-        return has_upc and has_cost and has_brand
+            digits = re.sub(r"\D", "", str(val))
+            return int(digits) if digits and int(digits) > 0 else default
+        except ValueError:
+            return default
 
     @classmethod
     def normalize(cls, file_path: str) -> pd.DataFrame:
-        """Loads and converts messy CSV or Excel sheets into a unified schema."""
-        if file_path.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file_path)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Catalog file not found: {file_path}")
+
+        ext = os.path.splitext(file_path)[-1].lower()
+        if ext in [".xlsx", ".xls"]:
+            # Try reading without headers first if rows start further down
+            df_raw = pd.read_excel(file_path)
         else:
             try:
-                df = pd.read_csv(file_path, low_memory=False, encoding="utf-8")
+                df_raw = pd.read_csv(file_path, encoding="utf-8", on_bad_lines="skip")
             except UnicodeDecodeError:
-                df = pd.read_csv(file_path, low_memory=False, encoding="latin1")
+                df_raw = pd.read_csv(file_path, encoding="latin1", on_bad_lines="skip")
 
-        raw_to_clean = {c: cls.clean_column_name(c) for c in df.columns}
-        df = df.rename(columns=raw_to_clean)
+        if df_raw.empty:
+            raise ValueError(f"Catalog {file_path} contains no data.")
 
-        resolved_headers: Dict[str, str] = {}
-        # Priority mapping: map exact matches before broad substring matches
-        for canonical, variants in cls.SYNONYM_MAP.items():
-            matched_col = None
-            for col in df.columns:
-                if col in variants:
-                    matched_col = col
+        # Match columns fuzzily
+        matched_cols: Dict[str, str] = {}
+        df_cols_clean = {re.sub(r"[_\s\-]+", " ", str(col).lower().strip()): col for col in df_raw.columns}
+
+        for canonical_name, aliases in cls.HEADER_MAP.items():
+            for alias in aliases:
+                if alias in df_cols_clean:
+                    matched_cols[canonical_name] = df_cols_clean[alias]
                     break
-            if not matched_col:
-                for col in df.columns:
-                    if any(v in col for v in variants):
-                        matched_col = col
-                        break
-            if matched_col and matched_col not in resolved_headers.values():
-                resolved_headers[matched_col] = canonical
 
-        df = df.rename(columns=resolved_headers)
+        if "upc" not in matched_cols or "unit_cost" not in matched_cols:
+            raise KeyError(
+                f"Could not reliably map mandatory headers ('upc' and 'unit_cost') in {file_path}. "
+                f"Detected columns: {list(df_raw.columns)}"
+            )
 
-        missing = [req for req in ["upc", "brand", "unit_cost"] if req not in df.columns]
-        if missing:
-            raise ValueError(f"Could not automatically detect columns: {missing}. Found: {list(df.columns)}")
-
-        # Clean and typecast columns
-        df["upc"] = df["upc"].apply(cls.format_upc)
-        df["unit_cost"] = pd.to_numeric(
-            df["unit_cost"].astype(str).str.replace(r"[$,\s]", "", regex=True), 
-            errors="coerce"
-        )
+        # Build clean DataFrame
+        normalized = pd.DataFrame()
+        normalized["upc"] = df_raw[matched_cols["upc"]].apply(cls.clean_upc)
+        normalized["unit_cost"] = df_raw[matched_cols["unit_cost"]].apply(cls.clean_currency)
         
-        if "case_qty" not in df.columns:
-            df["case_qty"] = 12
+        # Optional fields
+        if "description" in matched_cols:
+            normalized["description"] = df_raw[matched_cols["description"]].astype(str).str.strip()
         else:
-            df["case_qty"] = pd.to_numeric(df["case_qty"], errors="coerce").fillna(12).astype(int)
+            normalized["description"] = "Wholesale Item"
 
-        if "description" not in df.columns:
-            df["description"] = df["brand"].astype(str) + " Item"
+        if "brand" in matched_cols:
+            normalized["brand"] = df_raw[matched_cols["brand"]].astype(str).str.strip().str.title()
+        else:
+            # Fallback: extract first word of description
+            normalized["brand"] = normalized["description"].apply(lambda d: d.split()[0] if d else "Generic")
 
-        # Prune dead/invalid data
-        df = df.dropna(subset=["upc", "brand", "unit_cost"])
-        df = df[df["unit_cost"] > 0]
+        if "case_qty" in matched_cols:
+            normalized["case_qty"] = df_raw[matched_cols["case_qty"]].apply(lambda q: cls.clean_integer(q, default=12))
+        else:
+            normalized["case_qty"] = 12
 
-        return df[["upc", "brand", "description", "unit_cost", "case_qty"]]
+        # Filter out invalid rows (zero cost or missing barcode)
+        cleaned_df = normalized.dropna(subset=["upc"]).copy()
+        cleaned_df = cleaned_df[cleaned_df["unit_cost"] > 0.0]
+        cleaned_df = cleaned_df.drop_duplicates(subset=["upc"])
+
+        print(f"[✓] Successfully parsed {len(cleaned_df)} actionable SKUs from {os.path.basename(file_path)}")
+        return cleaned_df.reset_index(drop=True)
