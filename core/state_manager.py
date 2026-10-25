@@ -12,23 +12,31 @@ class StateManager:
     def _ensure_file_exists(self):
         if not os.path.exists(self.file_path):
             os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
-            with open(self.file_path, "w") as f:
+            with open(self.file_path, "w", encoding="utf-8") as f:
                 json.dump({"ungated_brands": [], "pending_applications": []}, f, indent=2)
 
     def load_state(self) -> dict:
-        with open(self.file_path, "r") as f:
-            return json.load(f)
+        self._ensure_file_exists()
+        with open(self.file_path, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return {"ungated_brands": [], "pending_applications": []}
 
     def get_ungated_brands(self) -> Set[str]:
         state = self.load_state()
         return set(b.lower().strip() for b in state.get("ungated_brands", []))
 
+    def get_pending_brands(self) -> Set[str]:
+        state = self.load_state()
+        return set(b.lower().strip() for b in state.get("pending_applications", []))
+
     def mark_brand_as_ungated(self, brand: str):
-        """Call this once Amazon approves your invoice in Seller Central."""
+        """Marks a brand as officially ungated in Amazon Seller Central."""
         state = self.load_state()
         normalized = brand.lower().strip()
         
-        ungated = set(state.get("ungated_brands", []))
+        ungated = set(b.lower().strip() for b in state.get("ungated_brands", []))
         ungated.add(normalized)
         
         # Remove from pending if present
@@ -37,16 +45,17 @@ class StateManager:
         state["ungated_brands"] = sorted(list(ungated))
         state["pending_applications"] = pending
 
-        with open(self.file_path, "w") as f:
+        with open(self.file_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-        print(f"[✓] Brand '{brand}' marked as UNGATED. Optimizer will bypass cheap keys for this brand.")
+        print(f"[✓] Brand '{brand}' is now UNGATED. The optimizer will bypass it.")
 
     def mark_brands_pending(self, brands: List[str]):
-        """Call this when a PO is placed and invoice is sent to distributor."""
+        """Records brands that were ordered and submitted to Amazon for invoice review."""
         state = self.load_state()
-        pending = set(state.get("pending_applications", []))
+        pending = set(b.lower().strip() for b in state.get("pending_applications", []))
         for b in brands:
             pending.add(b.lower().strip())
         state["pending_applications"] = sorted(list(pending))
-        with open(self.file_path, "w") as f:
+
+        with open(self.file_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
