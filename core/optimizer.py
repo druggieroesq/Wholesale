@@ -1,71 +1,81 @@
+import os
+import sys
 import pandas as pd
-from typing import List, Dict, Any
+from config import KEEPA_API_KEY
 from core.keepa_client import KeepaClient
-from core.auditor import CatalogAuditor
+from core.optimizer import UngateOptimizer
 from core.state_manager import StateManager
-from config import MIN_BRAND_UNITS, DISTRIBUTOR_MOQ
 
-class UngateOptimizer:
-    def __init__(self, keepa_client: KeepaClient):
-        self.keepa = keepa_client
-        self.auditor = CatalogAuditor()
-        self.state_mgr = StateManager()
+def run_pipeline(catalog_path: str, output_path: str = "data/output/ungate_purchase_order.csv"):
+    if not os.path.exists(catalog_path):
+        print(f"[!] Catalog file not found at: {catalog_path}")
+        return
 
-    def process_catalog(self, df: pd.DataFrame) -> pd.DataFrame:
-        ungated_set = self.state_mgr.get_ungated_brands()
-        brands = df['brand'].dropna().str.strip().unique()
-        
-        print(f"[*] Total brands in distributor catalog: {len(brands)}")
-        print(f"[*] Already UNGATED brands (skipping key optimization): {len(ungated_set)}")
+    print(f"[*] Ingesting catalog from: {catalog_path}")
+    df = pd.read_csv(catalog_path)
+    df.columns = [c.lower().strip() for c in df.columns]
 
-        brand_keys = []
+    client = KeepaClient(api_key=KEEPA_API_KEY)
+    optimizer = UngateOptimizer(keepa_client=client)
 
-        for brand in brands:
-            normalized_brand = brand.lower().strip()
-            
-            # --- THE CIRCUIT BREAKER ---
-            # If the brand is already ungated, completely exit the ungate optimizer for this brand
-            if normalized_brand in ungated_set:
-                continue
+    po_df = optimizer.process_catalog(df)
+    
+    if po_df.empty:
+        print("[!] No new ungate candidates found or target MOQ already met.")
+        return
 
-            brand_items = df[df['brand'].str.lower() == normalized_brand]
-            cheapest_items = brand_items.sort_values(by="unit_cost", ascending=True)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    po_df.to_csv(output_path, index=False)
+    print(f"[✓] Purchase order saved successfully to {output_path}")
 
-            for _, row in cheapest_items.iterrows():
-                upc = str(row['upc']).zfill(12)
-                keepa_data = self.keepa.get_product_by_upc(upc)
-                if not keepa_data:
-                    continue
+def print_help():
+    print("""
+Wholesale Ungate Sniper CLI
+============================
+Usage:
+  python main.py                    Run the ungate optimizer on default catalog
+  python main.py --catalog <path>   Run the optimizer on a specific catalog CSV
+  python main.py --ungate <brand>   Mark a brand as UNGATED (skips cheap keys permanently)
+  python main.py --list             List all currently ungated and pending brands
+    """)
 
-                audit_result = self.auditor.audit_sku_safety(keepa_data, float(row['unit_cost']))
-                if audit_result:
-                    case_qty = int(row.get('case_qty', MIN_BRAND_UNITS))
-                    order_units = case_qty if case_qty >= MIN_BRAND_UNITS else MIN_BRAND_UNITS
-                    line_total = round(float(row['unit_cost']) * order_units, 2)
+if __name__ == "__main__":
+    sm = StateManager()
 
-                    brand_keys.append({
-                        "brand": brand,
-                        "upc": upc,
-                        "description": row['description'],
-                        "asin": audit_result['asin'],
-                        "unit_cost": float(row['unit_cost']),
-                        "order_qty": order_units,
-                        "line_total": line_total,
-                        "buy_box": audit_result['buy_box'],
-                        "monthly_velocity": audit_result['monthly_drops']
-                    })
-                    break  # Found the cheapest valid key for this gated brand
+    if len(sys.argv) > 1:
+        flag = sys.argv[1].lower()
 
-        sorted_keys = sorted(brand_keys, key=lambda x: x["line_total"])
+        if flag == "--ungate":
+            if len(sys.argv) < 3:
+                print("[!] Error: Please specify the brand name. Example: python main.py --ungate CeraVe")
+            else:
+                brand_arg = " ".join(sys.argv[2:])
+                sm.mark_brand_as_ungated(brand_arg)
 
-        po_items: List[Dict[str, Any]] = []
-        running_total = 0.0
+        elif flag == "--list":
+            state = sm.load_state()
+            ungated = state.get("ungated_brands", [])
+            pending = state.get("pending_applications", [])
+            print("\n--- UNGATED BRANDS ---")
+            for b in ungated:
+                print(f" • {b.title()}")
+            print(f"\nTotal Ungated: {len(ungated)}")
 
-        for item in sorted_keys:
-            if running_total >= DISTRIBUTOR_MOQ:
-                break
-            po_items.append(item)
-            running_total += item["line_total"]
+            if pending:
+                print("\n--- PENDING REVIEW ---")
+                for p in pending:
+                    print(f" • {p.title()}")
 
-        print(f"[+] Ungate PO constructed: {len(po_items)} NEW brands selected. Total: ${running_total:,.2f}")
-        return pd.DataFrame(po_items)
+        elif flag == "--catalog" and len(sys.argv) > 2:
+            custom_catalog = sys.argv[2]
+            run_pipeline(custom_catalog)
+
+        elif flag in ("--help", "-h"):
+            print_help()
+        else:
+            print(f"[!] Unknown argument: {flag}")
+            print_help()
+    else:
+        # Default run using sample catalog
+        sample_csv = os.path.join("data", "sample_catalog.csv")
+        run_pipeline(sample_csv)
