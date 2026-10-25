@@ -1,1 +1,20 @@
-
+{
+  "distributors": [
+    {
+      "name": "Contar Wholesale",
+      "authorized_emails": ["sales@contarwholesale.com", "orders@contarwholesale.com"],
+      "domain_match": "@contarwholesale.com",
+      "moq": 2500.00,
+      "lead_time_days": 3,
+      "notes": "Beauty & Personal Care. Ships from Miami warehouse."
+    },
+    {
+      "name": "Empire Wholesale USA",
+      "authorized_emails": ["rep@empirewholesaleusa.com"],
+      "domain_match": "@empirewholesaleusa.com",
+      "moq": 1500.00,
+      "lead_time_days": 5,
+      "notes": "Health, household, OTC sundries."
+    }
+  ]
+}
