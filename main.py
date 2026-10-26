@@ -1,65 +1,76 @@
 import os
-import sys
-import glob
-from config import KEEPA_API_KEY
-from core.keepa_client import KeepaClient
-from core.profit_engine import ProfitFirstEngine
-from core.state_manager import StateManager
-from core.normalizer import SmartCatalogNormalizer
-from core.email_fetcher import DistributorEmailWatcher
+import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import pandas as pd
 
-def process_file(file_path: str, min_roi: float = 35.0):
-    print(f"\n[*] Normalizing file: {file_path}")
-    try:
-        normalized_df = SmartCatalogNormalizer.normalize(file_path)
-    except Exception as e:
-        print(f"[!] Error normalizing catalog: {e}")
-        return
+from core.profit_engine import ProfitEngine, ProfitFirstEngine
+from core.supplier_manager import SupplierManager
+from tools.reverse_gap_engine import ReverseGapEngine
 
-    client = KeepaClient(api_key=KEEPA_API_KEY)
-    engine = ProfitFirstEngine(keepa_client=client)
+# Lightweight Health-Check Server for Railway port binding
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status": "online", "service": "wholesale_engine", "hubs": ["Parkland_FL", "West_Bloomfield_MI"]}')
 
-    po_df = engine.scan_catalog_for_profit(normalized_df, min_roi=min_roi)
-    
-    if po_df.empty:
-        print("[!] No products met the safety, velocity, and ROI thresholds.")
-        return
+    def log_message(self, format, *args):
+        return  # Suppress noisy HTTP access logs
 
-    base_name = os.path.splitext(os.path.basename(file_path))[0]
-    out_path = os.path.join("data", "output", f"PO_{base_name}.csv")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    po_df.to_csv(out_path, index=False)
-    
-    print(f"\n[✓] Purchase order generated: {out_path}")
-    print(f"Total Lines: {len(po_df)} | Total Cart: ${po_df['line_total'].sum():,.2f}")
+def start_http_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"[Railway] Health check listening on port {port}...")
+    server.serve_forever()
+
+def run_scheduled_pipeline():
+    """Background engine loop running catalog scans and delta checks."""
+    print("[Pipeline] Background worker thread initialized.")
+    engine = ProfitEngine()
+    supplier_mgr = SupplierManager()
+
+    while True:
+        try:
+            catalog_dir = "data/incoming_catalogs"
+            if os.path.exists(catalog_dir):
+                files = [f for f in os.listdir(catalog_dir) if f.endswith((".csv", ".xlsx"))]
+                for filename in files:
+                    file_path = os.path.join(catalog_dir, filename)
+                    print(f"\n[Worker] Ingesting catalog: {filename}...")
+                    
+                    if filename.endswith(".csv"):
+                        df = pd.read_csv(file_path)
+                    else:
+                        df = pd.read_excel(file_path)
+
+                    # Ingest and scan using confirmed distributor metadata
+                    po = engine.scan_catalog_for_profit(df)
+                    if not po.empty:
+                        out_path = f"data/approved_po_{int(time.time())}.csv"
+                        po.to_csv(out_path, index=False)
+                        print(f"[✓] Generated Purchase Order with {len(po)} deals: {out_path}")
+                        
+                    # Move or rename processed file
+                    processed_path = os.path.join(catalog_dir, f"processed_{filename}")
+                    os.rename(file_path, processed_path)
+
+        except Exception as e:
+            print(f"[!] Worker loop error: {e}")
+
+        # Sleep for 15 minutes before checking for new catalogs
+        time.sleep(900)
 
 if __name__ == "__main__":
-    sm = StateManager()
+    print("=" * 65)
+    print("WHOLESALE ARBITRAGE DUAL-HUB ENGINE INITIALIZED")
+    print("Operating Hubs: Parkland, FL & West Bloomfield, MI")
+    print("=" * 65)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--auto":
-        # Mode 1: Automated Email Poller
-        watcher = DistributorEmailWatcher()
-        files = watcher.fetch_latest_catalogs()
-        for f in files:
-            process_file(f)
+    # Start background processing thread
+    worker_thread = threading.Thread(target=run_scheduled_pipeline, daemon=True)
+    worker_thread.start()
 
-    elif len(sys.argv) > 1 and sys.argv[1] == "--ungate":
-        brand_arg = " ".join(sys.argv[2:])
-        sm.mark_brand_as_ungated(brand_arg)
-
-    elif len(sys.argv) > 1 and sys.argv[1] == "--list":
-        state = sm.load_state()
-        print("\n--- UNGATED BRANDS ---")
-        for b in state.get("ungated_brands", []):
-            print(f" • {b.title()}")
-
-    else:
-        # Mode 2: Minimal Effort Manual
-        # Checks data/incoming/ for any file, otherwise runs sample_catalog.csv
-        incoming_files = glob.glob("data/incoming/*.csv") + glob.glob("data/incoming/*.xlsx")
-        if incoming_files:
-            latest_file = max(incoming_files, key=os.path.getctime)
-            process_file(latest_file)
-        else:
-            sample_path = os.path.join("data", "sample_catalog.csv")
-            process_file(sample_path)
+    # Start main blocking HTTP server for Railway
+    start_http_server()
