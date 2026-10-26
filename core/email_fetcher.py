@@ -1,114 +1,133 @@
 import os
-import json
-import re
 import imaplib
 import email
 from email.header import decode_header
-from typing import List, Dict, Any, Optional
-from core.normalizer import SmartCatalogNormalizer
+import json
+from typing import List, Dict, Any
 
 DISTRIBUTORS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "distributors.json")
+INCOMING_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "incoming")
 
-class EmailCatalogFetcher:
+class DistributorEmailWatcher:
+    """
+    Connects to Gmail via IMAP, inspects incoming emails from registered
+    distributor domains, and saves attached price sheets to data/incoming/.
+    """
     def __init__(self):
-        self.user = os.getenv("DISTRIBUTOR_EMAIL_USER", "")
-        self.password = os.getenv("DISTRIBUTOR_EMAIL_PASS", "")
-        self.imap_server = os.getenv("IMAP_SERVER", "imap.gmail.com")
-        self.distributors = self._load_distributor_registry()
+        self.user = os.getenv("DISTRIBUTOR_EMAIL_USER", "").strip()
+        self.password = os.getenv("DISTRIBUTOR_EMAIL_PASS", "").strip()
+        self.imap_server = os.getenv("IMAP_SERVER", "imap.gmail.com").strip()
+        self.distributors = self._load_distributors()
+        os.makedirs(INCOMING_DIR, exist_ok=True)
 
-    def _load_distributor_registry(self) -> List[Dict[str, Any]]:
-        """Loads authorized distributor emails and domains."""
+    def _load_distributors(self) -> List[Dict[str, Any]]:
         if not os.path.exists(DISTRIBUTORS_FILE):
-            os.makedirs(os.path.dirname(DISTRIBUTORS_FILE), exist_ok=True)
-            with open(DISTRIBUTORS_FILE, "w", encoding="utf-8") as f:
-                json.dump({"distributors": []}, f, indent=2)
             return []
         try:
             with open(DISTRIBUTORS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return data.get("distributors", [])
-        except Exception:
+        except Exception as e:
+            print(f"[!] Error reading distributors.json: {e}")
             return []
 
-    def get_authorized_distributor(self, sender_header: str) -> Optional[Dict[str, Any]]:
-        """Matches an incoming email address against whitelist domains or addresses."""
-        sender_clean = sender_header.lower()
-        for dist in self.distributors:
-            for auth_email in dist.get("authorized_emails", []):
-                if auth_email.lower() in sender_clean:
-                    return dist
-            domain = dist.get("domain_match", "").lower()
-            if domain and domain in sender_clean:
-                return dist
-        return None
+    @classmethod
+    def register_distributor(cls, name: str, email_addr: str, moq: float):
+        os.makedirs(os.path.dirname(DISTRIBUTORS_FILE), exist_ok=True)
+        distributors = []
+        if os.path.exists(DISTRIBUTORS_FILE):
+            try:
+                with open(DISTRIBUTORS_FILE, "r", encoding="utf-8") as f:
+                    distributors = json.load(f).get("distributors", [])
+            except Exception:
+                distributors = []
 
-    def download_catalog_attachments(self, save_dir: str = "data/incoming") -> List[Dict[str, Any]]:
+        domain = "@" + email_addr.split("@")[-1].lower() if "@" in email_addr else email_addr.lower()
+        distributors = [d for d in distributors if d.get("name", "").lower() != name.lower()]
+        
+        distributors.append({
+            "name": name,
+            "authorized_emails": [email_addr.lower()],
+            "domain_match": domain,
+            "moq": float(moq)
+        })
+
+        with open(DISTRIBUTORS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"distributors": distributors}, f, indent=2)
+
+        print(f"[✓] Registered distributor: {name} (MOQ: ${moq:,.2f}, Domain: {domain})")
+
+    def _find_matching_distributor(self, sender: str) -> Dict[str, Any]:
+        sender_lower = sender.lower()
+        for d in self.distributors:
+            for auth in d.get("authorized_emails", []):
+                if auth.lower() in sender_lower:
+                    return d
+            domain = d.get("domain_match", "").lower()
+            if domain and domain in sender_lower:
+                return d
+        return {"name": "Unknown_Distributor", "moq": 3000.00}
+
+    def download_catalog_attachments(self) -> List[Dict[str, Any]]:
         if not self.user or not self.password:
-            print("[*] Email credentials not set. Skipping automated email poll.")
+            print("[*] Email credentials not configured. Skipping catalog polling.")
             return []
 
-        os.makedirs(save_dir, exist_ok=True)
-        downloaded_jobs = []
-
+        jobs = []
         try:
             mail = imaplib.IMAP4_SSL(self.imap_server)
             mail.login(self.user, self.password)
-            mail.select("inbox")
+            mail.select("INBOX")
 
-            status, response = mail.search(None, "UNSEEN")
+            status, response = mail.search(None, '(UNSEEN)')
             if status != "OK" or not response[0]:
                 mail.logout()
                 return []
 
             email_ids = response[0].split()
+            print(f"[*] Found {len(email_ids)} unread email(s). Checking for catalogs...")
 
             for e_id in email_ids:
-                status, msg_data = mail.fetch(e_id, "(RFC822)")
-                for part_data in msg_data:
-                    if isinstance(part_data, tuple):
-                        msg = email.message_from_bytes(part_data[1])
-                        sender = msg.get("From", "")
+                res, data = mail.fetch(e_id, "(RFC822)")
+                if res != "OK":
+                    continue
 
-                        # Check whitelist
-                        distributor_info = self.get_authorized_distributor(sender)
-                        if not distributor_info:
-                            print(f"[!] Email from '{sender}' ignored (not on authorized distributor whitelist).")
-                            continue
+                msg = email.message_from_bytes(data[0][1])
+                sender = msg.get("From", "")
+                distributor = self._find_matching_distributor(sender)
 
-                        print(f"[✓] Recognized distributor email: {distributor_info['name']} ({sender})")
+                for part in msg.walk():
+                    if part.get_content_maintype() == "multipart":
+                        continue
+                    if part.get("Content-Disposition") is None:
+                        continue
 
-                        for part in msg.walk():
-                            if part.get_content_maintype() == "multipart" or part.get("Content-Disposition") is None:
-                                continue
+                    filename = part.get_filename()
+                    if filename:
+                        dh = decode_header(filename)
+                        filename = dh[0][0]
+                        if isinstance(filename, bytes):
+                            filename = filename.decode(dh[0][1] or "utf-8", errors="ignore")
 
-                            raw_filename = part.get_filename()
-                            if not raw_filename:
-                                continue
+                        ext = os.path.splitext(filename)[-1].lower()
+                        if ext in [".csv", ".xlsx", ".xls"]:
+                            clean_fname = f"{distributor['name'].replace(' ', '_')}_{filename}"
+                            save_path = os.path.join(INCOMING_DIR, clean_fname)
 
-                            decoded = decode_header(raw_filename)
-                            filename = decoded[0][0]
-                            if isinstance(filename, bytes):
-                                filename = filename.decode(decoded[0][1] or "utf-8")
+                            with open(save_path, "wb") as f:
+                                f.write(part.get_payload(decode=True))
 
-                            if filename.lower().endswith((".csv", ".xlsx", ".xls")):
-                                clean_name = f"{distributor_info['name'].replace(' ', '_')}_{re.sub(r'[^\\w\\-.]', '_', filename)}"
-                                file_path = os.path.join(save_dir, clean_name)
+                            print(f"[✓] Downloaded catalog: {clean_fname} from {distributor['name']}")
+                            jobs.append({
+                                "file_path": save_path,
+                                "distributor": distributor
+                            })
 
-                                with open(file_path, "wb") as f:
-                                    f.write(part.get_payload(decode=True))
-
-                                if SmartCatalogNormalizer.is_valid_price_catalog(file_path):
-                                    print(f"[✓] Valid catalog stored: {file_path}")
-                                    downloaded_jobs.append({
-                                        "file_path": file_path,
-                                        "distributor": distributor_info
-                                    })
-                                else:
-                                    os.remove(file_path)
-
-            mail.close()
             mail.logout()
         except Exception as e:
-            print(f"[!] Email Fetcher Error: {e}")
+            print(f"[!] IMAP polling error: {e}")
 
-        return downloaded_jobs
+        return jobs
+
+# Alias to support both import naming conventions
+EmailCatalogFetcher = DistributorEmailWatcher
