@@ -1,19 +1,22 @@
 import time
 from typing import Dict, Any, Optional
+from core.walmart_cost_engine import WalmartCostEngine
 
 class WalmartRadar:
     """
-    Advanced Walmart Velocity & Out-Of-Stock Intelligence.
-    Filters out dead/discontinued SKUs and identifies high-demand items
-    where Walmart 1P recently stocked out, creating an attractive WFS opportunity.
+    Precision Walmart Velocity, Stockout & Margin Intelligence.
+    Cross-references Keepa CSV tracking history with true-demand metrics
+    and executes exact WFS/Referral calculations via WalmartCostEngine.
     """
+    # Keepa CSV sub-array index for Walmart price history
     KEEPA_CSV_WALMART_INDEX = 11
 
-    # Keepa time offset constant (Keepa epoch starts at 2011-01-01)
+    # Keepa time epoch starts on 2011-01-01 (minutes offset from Unix epoch)
     KEEPA_TIME_OFFSET_MINUTES = 21564000
 
     @classmethod
     def keepa_time_to_epoch(cls, keepa_minute: int) -> int:
+        """Converts Keepa minute timestamp to standard Unix epoch seconds."""
         return (keepa_minute + cls.KEEPA_TIME_OFFSET_MINUTES) * 60
 
     @classmethod
@@ -24,16 +27,31 @@ class WalmartRadar:
         monthly_drops: int
     ) -> Dict[str, Any]:
         """
-        Evaluates real consumer demand, stockout recency, and profitability
-        before clearing an item as a Walmart WFS opportunity.
+        Evaluates real consumer demand, stockout recency, price parity,
+        and all-in WFS profitability for an item.
         """
         csv_data = keepa_prod.get("csv", [])
         stats = keepa_prod.get("stats", {})
         
-        # 1. Base consumer proof: Review count check
+        # 1. Base Social Proof & Amazon Price Benchmark
         total_reviews = stats.get("reviewCount", 0)
+        amz_bb_cents = stats.get("buyBoxPrice", -1)
+        amz_buy_box = round(amz_bb_cents / 100.0, 2) if amz_bb_cents > 0 else 0.0
+
+        # 2. Extract Physical Dimensions & Weight for Precision WFS Calculation
+        package_weight_grams = keepa_prod.get("packageWeight", 453)  # Default: ~1 lb
+        weight_lbs = max(0.2, round(package_weight_grams / 453.592, 2))
         
-        # Check if Walmart tracking array exists in Keepa
+        # Dimensions in inches (Keepa stores in millimeters)
+        pkg_len_mm = keepa_prod.get("packageLength", 152)  # Default ~6 inches
+        pkg_w_mm = keepa_prod.get("packageWidth", 101)    # Default ~4 inches
+        pkg_h_mm = keepa_prod.get("packageHeight", 50)    # Default ~2 inches
+        
+        len_in = max(1.0, round(pkg_len_mm / 25.4, 1))
+        width_in = max(1.0, round(pkg_w_mm / 25.4, 1))
+        height_in = max(1.0, round(pkg_h_mm / 25.4, 1))
+
+        # 3. Inspect Keepa's Walmart Price History Array
         walmart_csv = csv_data[cls.KEEPA_CSV_WALMART_INDEX] if len(csv_data) > cls.KEEPA_CSV_WALMART_INDEX else None
 
         current_walmart_price = -1.0
@@ -45,7 +63,7 @@ class WalmartRadar:
         ninety_days_ago = now_epoch - (90 * 86400)
 
         if walmart_csv and len(walmart_csv) >= 2:
-            # Last recorded price in the series
+            # Check the most recent point in time
             last_price_cents = walmart_csv[-1]
             if last_price_cents > 0:
                 current_walmart_price = round(last_price_cents / 100.0, 2)
@@ -53,8 +71,7 @@ class WalmartRadar:
             else:
                 is_walmart_oos = True
 
-            # Walk backward to find when Walmart was last in stock and at what price
-            # Array format: [time_0, price_0, time_1, price_1, ...]
+            # Walk backward to find the last valid price and the timestamp when Walmart was in stock
             for i in range(len(walmart_csv) - 1, 0, -2):
                 price_cents = walmart_csv[i]
                 time_min = walmart_csv[i - 1]
@@ -63,28 +80,38 @@ class WalmartRadar:
                     last_seen_in_stock_timestamp = cls.keepa_time_to_epoch(time_min)
                     break
 
-        # Check recency: Was it in stock within the last 90 days?
+        # Verification check: Was this item active on Walmart within the last 90 days?
         was_recently_active = last_seen_in_stock_timestamp >= ninety_days_ago
 
-        # 2. Benchmark target selling price on Walmart
-        stats_bb = stats.get("buyBoxPrice", -1)
-        amz_buy_box = round(stats_bb / 100.0, 2) if stats_bb > 0 else 0.0
-
-        target_walmart_price = current_walmart_price if current_walmart_price > 0 else (
+        # 4. Target Selling Price Determination & Parity Protection
+        # Protects against Walmart's price crawler suppressing listings priced way higher than Amazon
+        benchmark_price = current_walmart_price if current_walmart_price > 0 else (
             historical_walmart_price if historical_walmart_price > 0 else amz_buy_box
         )
+        
+        if amz_buy_box > 0 and benchmark_price > (amz_buy_box * 1.15):
+            target_walmart_price = round(amz_buy_box * 1.10, 2)
+        else:
+            target_walmart_price = benchmark_price
 
-        # Walmart Commission (15%) + Average WFS Standard Fulfillment ($3.45)
-        wfs_fulfillment_est = 3.45
-        walmart_net_payout = target_walmart_price * 0.85 - wfs_fulfillment_est
-        walmart_profit = round(walmart_net_payout - wholesale_cost, 2)
-        walmart_roi = round((walmart_profit / wholesale_cost) * 100.0, 1) if wholesale_cost > 0 else 0.0
+        # 5. Execute Precision Fee Engine (Referral, Tiered WFS, Tare Weight, Inbound Freight)
+        category_hint = keepa_prod.get("binding", "beauty")
+        wmt_financials = WalmartCostEngine.calculate_total_walmart_payout(
+            sell_price=target_walmart_price,
+            wholesale_cost=wholesale_cost,
+            weight_lbs=weight_lbs,
+            inbound_freight_per_unit=0.35,
+            category=category_hint
+        )
 
-        # --- TRUE DEMAND CRITERIA ---
-        # 1. Product must move (minimum 30 monthly sales drops)
-        # 2. Product must have legitimate social proof (>= 30 reviews)
-        # 3. If OOS on Walmart, it must be a RECENT stockout (in stock within 90 days), not dead stock
-        # 4. Target price must hit our minimum ROI hurdle (>= 35%)
+        walmart_profit = wmt_financials["net_profit"]
+        walmart_roi = wmt_financials["roi"]
+
+        # 6. Apply True-Demand Multi-Channel Gate
+        # Item MUST have:
+        # a) Minimum 30 verified monthly sales drops
+        # b) Minimum 30 product reviews (not an unvetted ghost listing)
+        # c) Positive Walmart ROI >= 35.0%
         has_true_demand = (monthly_drops >= 30) and (total_reviews >= 30)
         is_fresh_stockout = is_walmart_oos and was_recently_active
 
@@ -106,6 +133,9 @@ class WalmartRadar:
             "walmart_current_price": current_walmart_price,
             "walmart_hist_price": historical_walmart_price,
             "walmart_target_price": target_walmart_price,
+            "weight_lbs": weight_lbs,
+            "wfs_fee": wmt_financials["wfs_fulfillment_fee"],
+            "walral_fee": wmt_financials["walral_fee"],
             "walmart_roi": walmart_roi,
             "walmart_profit": walmart_profit,
             "has_true_demand": has_true_demand,
