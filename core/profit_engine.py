@@ -1,271 +1,204 @@
 import os
-import math
 import pandas as pd
 from typing import List, Dict, Any
+
 from core.keepa_client import KeepaClient
-from core.auditor import SafetyAuditor
-from core.state_manager import StateManager
+from core.safety_auditor import SafetyAuditor
+from core.walmart_cost_engine import WalmartCostEngine
 from core.walmart_radar import WalmartRadar
+from core.inventory_planner import InventoryPlanner
+from core.incentive_optimizer import IncentiveOptimizer
+from core.quantity_resolver import PackageQuantityResolver
+from core.amazon_stockout_radar import AmazonStockoutRadar
+from core.opportunity_scorer import OpportunityScorer
+from core.multipack_synthesizer import MultiPackSynthesizer
+from core.buybox_leak_unsuppressor import BuyBoxLeakUnsuppressor
+from core.catalog_delta_sniper import CatalogDeltaSniper
+from core.geo_hub_resolver import GeoHubResolver
+from core.fulfillment_router import FulfillmentRouter
 
-class ProfitFirstEngine:
-    """
-    Multichannel ROI Engine with True-Demand Enforcement.
-    Only allocates units to Walmart when hard proof of recent velocity exists.
-    """
-    def __init__(self, keepa_client: KeepaClient):
-        self.keepa = keepa_client
-        self.auditor = SafetyAuditor()
-        self.state_mgr = StateManager()
-
-    def calculate_fba_fees(self, sell_price: float, weight_lbs: float = 1.0) -> float:
-        referral_fee = sell_price * 0.15
-        if weight_lbs <= 0.5:
-            fulfillment = 3.22
-        elif weight_lbs <= 1.0:
-            fulfillment = 3.77
-        elif weight_lbs <= 2.0:
-            fulfillment = 4.75
-        else:
-            fulfillment = 5.40 + (weight_lbs - 2.0) * 0.40
-        return round(referral_fee + fulfillment, 2)
-
-    def compute_strict_allocation(
-        self, 
-        monthly_drops: int, 
-        fba_sellers: int, 
-        case_qty: int, 
-        strategy: str
-    ) -> Dict[str, int]:
-        case_qty = max(1, case_qty)
-        seller_pool = max(1, fba_sellers + 1)
-        amz_est_demand = max(10, int(monthly_drops / seller_pool))
-
-        if strategy == "WALMART_HIGH_DEMAND_OOS":
-            # High proven demand + Walmart stockout: Split 60% Amz / 40% Walmart
-            total_target = int(amz_est_demand * 1.5)
-            walmart_target = int(total_target * 0.40)
-            amz_target = total_target - walmart_target
-        elif strategy == "DUAL_CHANNEL_SPLIT":
-            # Both channels healthy: 75% Amz / 25% Walmart
-            total_target = int(amz_est_demand * 1.25)
-            walmart_target = max(case_qty, int(total_target * 0.25))
-            amz_target = total_target - walmart_target
-        else:
-            # Amazon only: Do NOT risk sending inventory to Walmart
-            total_target = amz_est_demand
-            amz_target = total_target
-            walmart_target = 0
-
-        # Snap to whole cases
-        amz_cases = max(1, round(amz_target / case_qty))
-        walmart_cases = 0 if walmart_target == 0 else max(1, round(walmart_target / case_qty))
-
-        amz_units = amz_cases * case_qty
-        walmart_units = walmart_cases * case_qty
-        total_units = amz_units + walmart_units
-
-        return {
-            "total_buy_qty": total_units,
-            "send_to_amazon": amz_units,
-            "send_to_walmart": walmart_units
-        }
+class ProfitEngine:
+    def __init__(self, keepa_client: KeepaClient = None):
+        self.keepa = keepa_client or KeepaClient()
+        self.safety_auditor = SafetyAuditor()
+        self.walmart_costs = WalmartCostEngine()
+        self.walmart_radar = WalmartRadar()
+        self.inventory_planner = InventoryPlanner(target_days=35, max_days=45)
+        self.incentive_optimizer = IncentiveOptimizer()
+        self.quantity_resolver = PackageQuantityResolver()
+        self.amz_stockout_radar = AmazonStockoutRadar()
+        self.scorer = OpportunityScorer()
+        self.multipack_synthesizer = MultiPackSynthesizer()
+        self.suppression_radar = BuyBoxLeakUnsuppressor()
+        self.delta_sniper = CatalogDeltaSniper()
+        self.geo_resolver = GeoHubResolver()
+        self.fulfillment_router = FulfillmentRouter()
 
     def scan_catalog_for_profit(
-        self, 
-        normalized_df: pd.DataFrame, 
-        distributor_name: str = "Distributor",
-        min_roi: float = 35.0, 
-        moq: float = 3000.00
+        self,
+        catalog_df: pd.DataFrame,
+        distributor_meta: Dict[str, Any] = None,
+        force_self_pickup: bool = False,
+        min_roi: float = 35.0,
+        max_amz_buybox_share: float = 0.15,
+        parity_cap_pct: float = 0.15
     ) -> pd.DataFrame:
-        print(f"[*] Sifting {distributor_name} catalog for verified high-velocity winners...")
-
-        upc_list = normalized_df['upc'].dropna().unique().tolist()
-        keepa_results = self.keepa.fetch_products_by_upc(upc_list)
-        
-        keepa_map: Dict[str, Dict[str, Any]] = {}
-        for prod in keepa_results:
-            prod_upcs = prod.get("upcList", [])
-            for u in prod_upcs:
-                keepa_map[str(u).zfill(12)] = prod
-
-        prizes: List[Dict[str, Any]] = []
-        brand_sacrifices: Dict[str, Dict[str, Any]] = {}
-
-        for _, row in normalized_df.iterrows():
-            upc = str(row['upc']).zfill(12)
-            cost = float(row['unit_cost'])
-            desc = row.get('description', '')
-            brand = row.get('brand', 'Unknown')
-            case_qty = int(row.get('case_qty', 12))
-
-            keepa_prod = keepa_map.get(upc)
-            if not keepa_prod:
-                continue
-
-            asin = keepa_prod.get("asin", "")
-            stats = keepa_prod.get("stats", {})
-            buy_box_cents = stats.get("buyBoxPrice", -1)
-            buy_box = round(buy_box_cents / 100.0, 2) if buy_box_cents > 0 else 0.0
-
-            if brand not in brand_sacrifices or cost < brand_sacrifices[brand]['unit_cost']:
-                brand_sacrifices[brand] = {
-                    "upc": upc, "asin": asin, "description": desc,
-                    "brand": brand, "unit_cost": cost, "case_qty": case_qty
-                }
-
-            # Safety Audit (IP drops, Amazon 1P dominance, review anomalies)
-            is_safe, reason = self.auditor.audit_product(keepa_prod)
-            if not is_safe or buy_box <= 0:
-                continue
-
-            # Monthly sales drops (velocity)
-            monthly_drops = self.auditor.get_monthly_sales_drops(keepa_prod)
-
-            # Amazon Margins
-            fba_fees = self.calculate_fba_fees(buy_box)
-            inbound_freight = 0.35
-            net_amz_profit = round(buy_box - cost - fba_fees - inbound_freight, 2)
-            amz_roi = round((net_amz_profit / cost) * 100.0, 1)
-
-            # Walmart Demand & OOS Analysis
-            walmart_intel = WalmartRadar.analyze_walmart_opportunity(
-                keepa_prod=keepa_prod, 
-                wholesale_cost=cost, 
-                monthly_drops=monthly_drops
-            )
-
-            # Only accept if it clears the minimum ROI threshold
-            if amz_roi >= min_roi or walmart_intel['is_walmart_winner']:
-                strategy = walmart_intel['channel_strategy']
-                fba_sellers = stats.get("current_fba_sellers", 2)
-                
-                allocation = self.compute_strict_allocation(
-                    monthly_drops=monthly_drops,
-                    fba_sellers=fba_sellers,
-                    case_qty=case_qty,
-                    strategy=strategy
-                )
-
-                prizes.append({
-                    "upc": upc,
-                    "asin": asin,
-                    "brand": brand,
-                    "description": desc,
-                    "unit_cost": cost,
-                    "case_qty": case_qty,
-                    "monthly_drops": monthly_drops,
-                    "amz_buy_box": buy_box,
-                    "amz_net_profit": net_amz_profit,
-                    "amz_roi": amz_roi,
-                    "walmart_intel": walmart_intel,
-                    "allocation": allocation
-                })
-
-        if not prizes:
-            print("[!] No catalog items met strict velocity, safety, and ROI thresholds.")
+        if catalog_df.empty or "upc" not in catalog_df.columns:
+            print("[!] Catalog is empty or missing 'upc' column.")
             return pd.DataFrame()
 
-        # Sort by verified sales velocity first, then ROI
-        prizes = sorted(prizes, key=lambda x: (x['monthly_drops'], x['amz_roi']), reverse=True)
+        distributor_meta = distributor_meta or {}
+        dist_name = distributor_meta.get("name", "Regional_Distributor")
+        wh_city = distributor_meta.get("city", "")
+        wh_state = distributor_meta.get("state", "")
+        wh_zip = distributor_meta.get("zip", "")
 
-        final_po_lines = []
-        current_cart_total = 0.0
-        gated_brands_in_po = set()
+        # 1. Determine Self-Pickup vs. 3PL Routing Confirmation
+        is_confirmed_pickup = force_self_pickup or distributor_meta.get("self_pickup", False)
+        geo_eval = self.geo_resolver.evaluate_supplier_location(
+            warehouse_city=wh_city,
+            warehouse_state=wh_state,
+            warehouse_zip=wh_zip,
+            confirmed_pickup=is_confirmed_pickup
+        )
+        print(f"[Geo Hub] {geo_eval['note']}")
 
-        for item in prizes:
-            brand = item['brand']
-            asin = item['asin']
-            cost = item['unit_cost']
-            w_info = item['walmart_intel']
-            alloc = item['allocation']
+        # 2. Payment Terms Surcharges & Discounts
+        payment_terms = distributor_meta.get("payment_terms", {})
+        payment_method = payment_terms.get("payment_method", "ACH")
+        cc_fee = float(payment_terms.get("cc_surcharge_pct", 0.0))
+        early_pay = float(payment_terms.get("early_pay_discount_pct", 0.0))
 
-            is_ungated = self.state_mgr.is_brand_ungated(brand)
-            amz_link = f"https://sellercentral.amazon.com/productsearch?q={asin}"
-            walmart_link = f"https://seller.walmart.com/items-and-inventory/add-items?search={item['upc']}"
+        cost_multiplier = 1.0
+        if payment_method == "CREDIT_CARD" and cc_fee > 0:
+            cost_multiplier += cc_fee
+        elif (payment_method == "TERMS_2_10_NET_30" or payment_method == "ACH") and early_pay > 0:
+            cost_multiplier -= early_pay
 
-            total_buy = alloc['total_buy_qty']
-            amz_send = alloc['send_to_amazon']
-            wmt_send = alloc['send_to_walmart']
-            line_total = round(total_buy * cost, 2)
+        # 3. Query Keepa
+        upc_list = [str(u).strip().zfill(12) for u in catalog_df["upc"].dropna().unique()]
+        keepa_products = self.keepa.fetch_products_by_upc(upc_list)
+        if not keepa_products:
+            return pd.DataFrame()
 
-            strat = w_info['channel_strategy']
-            if strat == "WALMART_HIGH_DEMAND_OOS":
-                summary_tag = "🔥 HIGH DEMAND WMT OOS"
-            elif strat == "DUAL_CHANNEL_SPLIT":
-                summary_tag = "⚖️ DUAL-CHANNEL WINNER"
+        product_map = {}
+        for kp in keepa_products:
+            for code in (kp.get("upcList", []) or []) + (kp.get("eanList", []) or []):
+                product_map[str(code).strip().zfill(12)] = kp
+
+        preliminary_po = []
+
+        for _, row in catalog_df.iterrows():
+            clean_upc = str(row.get("upc", "")).strip().zfill(12)
+            kp = product_map.get(clean_upc)
+            if not kp:
+                continue
+
+            # Safety Audit
+            is_safe, _ = self.safety_auditor.audit_product(kp, row.to_dict(), max_amz_share=max_amz_buybox_share)
+            if not is_safe:
+                continue
+
+            base_cost = float(row.get("cost", 0.0))
+            if base_cost <= 0:
+                continue
+
+            # Buy Box Pricing & Suppression Handling
+            stats = kp.get("stats", {}) or {}
+            curr = stats.get("current", [])
+            suppress_info = self.suppression_radar.evaluate_suppression(kp)
+            bb_cents = curr[18] if len(curr) > 18 else -1
+            if bb_cents and bb_cents > 0:
+                amz_retail = bb_cents / 100.0
+            elif suppress_info["is_suppressed_opportunity"]:
+                amz_retail = suppress_info["target_unsuppress_price"]
             else:
-                summary_tag = "📦 AMZ FBA WINNER"
+                continue
 
-            if not is_ungated:
-                gated_brands_in_po.add(brand)
-                directive = (
-                    f"⚠️ GATED ON AMZ | {summary_tag} | BUY {total_buy} from {distributor_name} -> "
-                    f"SEND {amz_send} to Amazon (after ungate), SEND {wmt_send} to Walmart"
-                )
-            else:
-                directive = (
-                    f"🎯 {summary_tag} | BUY {total_buy} from {distributor_name} -> "
-                    f"SEND {amz_send} to Amazon, SEND {wmt_send} to Walmart"
-                )
+            pack_qty = self.quantity_resolver.resolve_pack_quantity(kp)
+            raw_item_cost = round((base_cost * pack_qty) * cost_multiplier, 2)
 
-            final_po_lines.append({
-                "brand": brand,
-                "description": item['description'],
-                "unit_cost": cost,
-                "total_order_qty": total_buy,
-                "line_total": line_total,
-                "send_to_amazon": amz_send,
-                "send_to_walmart": wmt_send,
-                "monthly_velocity_drops": item['monthly_drops'],
-                "amz_roi_%": item['amz_roi'],
-                "walmart_roi_%": w_info['walmart_roi'],
-                "walmart_oos": "YES" if w_info['walmart_oos'] else "NO",
-                "direct_instruction": directive,
-                "upc": item['upc'],
-                "asin": asin,
-                "amazon_ungate_link": amz_link,
-                "walmart_link": walmart_link
+            weight_grams = kp.get("packageWeight", 453) or 453
+            weight_lbs = max(0.5, round(weight_grams / 453.592, 2))
+
+            # 4. Multi-Facility Fulfillment Router
+            best_route = self.fulfillment_router.find_optimal_fulfillment(
+                supplier_meta=distributor_meta,
+                retail_price=amz_retail,
+                raw_product_cost=raw_item_cost,
+                unit_weight_lbs=weight_lbs,
+                pack_qty=pack_qty,
+                allow_self_pickup=is_confirmed_pickup
+            )
+
+            landed_cost = best_route["landed_cost"]
+            amz_profit = best_route["net_profit"]
+            amz_roi = best_route["roi"]
+
+            # Walmart Economics (WFS)
+            wm_retail = min(amz_retail * (1.0 + parity_cap_pct), amz_retail * 1.05)
+            wm_costs = self.walmart_costs.calculate_fees(wm_retail, weight_lbs)
+            wm_profit = round(wm_retail - wm_costs["total_cost"] - landed_cost, 2)
+            wm_roi = round((wm_profit / landed_cost) * 100.0, 1)
+
+            # Supply Gap & Opportunity Scoring
+            amz_gap = self.amz_stockout_radar.evaluate_opportunity(kp).get("is_stockout_opportunity", False)
+            wm_gap = self.walmart_radar.check_opportunity(clean_upc).get("is_walmart_needed", False)
+
+            score, grade, breakdown = self.scorer.score_product(
+                keepa_product=kp,
+                amz_roi=amz_roi,
+                wm_roi=wm_roi,
+                is_amz_gap=amz_gap,
+                is_wm_gap=wm_gap,
+                min_roi=min_roi,
+                payment_terms=payment_terms
+            )
+
+            if grade != "A++" and (amz_roi < min_roi and wm_roi < min_roi):
+                continue
+
+            # Allocation Plan
+            fba_sellers = breakdown["fba_sellers"]
+            case_pack = int(row.get("case_pack", 6))
+            ceilings = self.inventory_planner.calculate_order_ceiling(kp, fba_sellers, case_pack)
+
+            amz_units = ceilings["amz_max_ceiling"] if grade in ["A++", "A+"] else (ceilings["amz_recommended"] if amz_roi >= min_roi else 0)
+            wm_units = ceilings["wm_max_ceiling"] if grade == "A++" else (ceilings["wm_recommended"] if wm_roi >= min_roi else 0)
+
+            if amz_units + wm_units == 0:
+                continue
+
+            preliminary_po.append({
+                "Grade": grade,
+                "Score": score,
+                "Route": best_route["facility_name"],
+                "Strategy": geo_eval["strategy"],
+                "Payment_Perk": breakdown["payment_benefit"],
+                "SKU": row.get("sku", clean_upc),
+                "UPC": clean_upc,
+                "Title": kp.get("title", "Unknown")[:75],
+                "Pack_Qty": pack_qty,
+                "Unit_Cost": raw_item_cost,
+                "Prep_Fee": best_route["prep_cost"],
+                "Inbound_Freight": best_route["inbound_freight"],
+                "Landed_Cost": landed_cost,
+                "Amazon_Retail": amz_retail,
+                "Amazon_ROI%": amz_roi,
+                "Amazon_Units": amz_units,
+                "Walmart_Retail": round(wm_retail, 2),
+                "Walmart_ROI%": wm_roi,
+                "Walmart_Units": wm_units,
+                "Total_Units": amz_units + wm_units,
+                "Total_PO_Spend": round((amz_units + wm_units) * raw_item_cost, 2)
             })
-            current_cart_total += line_total
 
-        # Ungate keys insertion
-        for brand in gated_brands_in_po:
-            if brand in brand_sacrifices:
-                sac = brand_sacrifices[brand]
-                if not any(l['upc'] == sac['upc'] for l in final_po_lines):
-                    sac_qty = max(10, sac['case_qty'])
-                    sac_total = round(sac_qty * sac['unit_cost'], 2)
-                    final_po_lines.insert(0, {
-                        "brand": brand,
-                        "description": f"[UNGATE KEY] {sac['description']}",
-                        "unit_cost": sac['unit_cost'],
-                        "total_order_qty": sac_qty,
-                        "line_total": sac_total,
-                        "send_to_amazon": sac_qty,
-                        "send_to_walmart": 0,
-                        "monthly_velocity_drops": 0,
-                        "amz_roi_%": 0.0,
-                        "walmart_roi_%": 0.0,
-                        "walmart_oos": "N/A",
-                        "direct_instruction": f"🔑 UNGATE KEY: BUY {sac_qty} from {distributor_name} -> Submit invoice to Amazon",
-                        "upc": sac['upc'],
-                        "asin": sac['asin'],
-                        "amazon_ungate_link": f"https://sellercentral.amazon.com/productsearch?q={sac['asin']}",
-                        "walmart_link": f"https://seller.walmart.com/items-and-inventory/add-items?search={sac['upc']}"
-                    })
-                    current_cart_total += sac_total
+        if not preliminary_po:
+            return pd.DataFrame()
 
-        # Top off cart to hit MOQ using highest velocity item
-        if current_cart_total < moq and final_po_lines:
-            deficit = moq - current_cart_total
-            profit_items = [l for l in final_po_lines if "UNGATE KEY" not in l["description"]]
-            if profit_items:
-                top_item = profit_items[0]
-                unit_cost = top_item["unit_cost"]
-                extra_units = math.ceil(deficit / unit_cost)
-                top_item["total_order_qty"] += extra_units
-                top_item["send_to_amazon"] += extra_units
-                top_item["line_total"] = round(top_item["total_order_qty"] * unit_cost, 2)
-                top_item["direct_instruction"] += f" (Scaled +{extra_units} units to meet ${moq:,.2f} MOQ)"
-
-        return pd.DataFrame(final_po_lines)
+        df = pd.DataFrame(preliminary_po)
+        grade_order = {"A++": 0, "A+": 1, "A": 2, "B": 3, "C": 4}
+        df["Rank"] = df["Grade"].map(grade_order)
+        df.sort_values(by=["Rank", "Score"], ascending=[True, False], inplace=True)
+        df.drop(columns=["Rank"], inplace=True)
+        return df
