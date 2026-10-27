@@ -13,7 +13,7 @@ class AutonomousRecruiter:
     Automated Wholesale Dealer Onboarding Engine:
     - Scans vacuum opportunities (data/vacuum_opportunities.json)
     - Checks data/distributors.json to see if the supplier is known
-    - If NOT registered or contacted, registers them and fires professional onboarding email
+    - If NOT registered or contacted, registers them and prepares/sends dealer onboarding email
     - Attaches Florida Form DR-13 Resale Certificate automatically
     - Tracks sent status in data/recruiter_audit_log.json
     """
@@ -29,13 +29,13 @@ class AutonomousRecruiter:
         os.makedirs(self.DRAFT_DIR, exist_ok=True)
 
         # Business Identity Configuration
-        self.company_name = os.getenv("COMPANY_NAME", "Bizbridge Advisors, Inc.")
-        self.owner_name = os.getenv("OWNER_NAME", "Owner")
-        self.fein = os.getenv("COMPANY_FEIN", "99-1254887 ")
+        self.company_name = os.getenv("COMPANY_NAME", "Meridian Commerce Group LLC")
+        self.owner_name = os.getenv("OWNER_NAME", "Operations Manager")
+        self.fein = os.getenv("COMPANY_FEIN", "XX-XXXXXXX")
         self.primary_hub = "Parkland, FL 33076"
         self.secondary_hub = "West Bloomfield, MI 48322"
 
-        # Email SMTP Configuration (e.g. Gmail App Password)
+        # Email SMTP Configuration
         self.smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
         self.smtp_port = int(os.getenv("SMTP_PORT", 587))
         self.sender_email = os.getenv("RECRUITER_EMAIL", "")
@@ -55,13 +55,13 @@ class AutonomousRecruiter:
             json.dump(data, f, indent=2)
 
     def generate_email_body(self, distributor_name: str, brand_name: str) -> str:
-        return f"""Good morning / afternoon,
+        return f"""Good day,
 
-My name is {self.owner_name}, Procurement Director at {self.company_name}. We operate an omni-channel commercial distribution network with primary warehousing in {self.primary_hub} and secondary distribution in {self.secondary_hub}.
+My name is {self.owner_name}, Procurement Director at {self.company_name}. We operate a commercial distribution and fulfillment network headquartered in {self.primary_hub} with secondary operations in {self.secondary_hub}.
 
-We are seeking to establish a direct wholesale commercial account with {distributor_name} to source replenishment inventory for {brand_name} product lines.
+We are seeking to establish a direct wholesale dealer account with {distributor_name} to source replenishment inventory for {brand_name} product lines.
 
-Our Business & Tax Credentials:
+Our Credentials & Business Details:
 - Entity Name: {self.company_name}
 - State of Formation: Florida
 - Federal EIN: {self.fein}
@@ -70,36 +70,30 @@ Our Business & Tax Credentials:
 - Preferred Settlement: Credit Card / Net Terms on Invoice
 - Sales Tax Exemption: Active Florida Form DR-13 Resale Certificate (attached)
 
-Could you please send over your new dealer onboarding application alongside your latest wholesale price catalog (.xlsx or .csv format including UPC barcodes, MOQ, and case-pack tiers)? 
+Could you please provide your new dealer onboarding application forms and your latest wholesale price catalog (.xlsx or .csv format including UPC barcodes, minimum order quantities, and case pack tiers)?
 
-Our logistics team is prepared to submit opening purchase orders immediately upon account activation.
+Our procurement team is prepared to submit opening purchase orders immediately upon account activation.
 
-Thank you for your time and assistance.
-
-Sincerely,
+Thanks,
 
 {self.owner_name}
 Procurement & Supply Chain
 {self.company_name}
 Email: {self.sender_email or 'procurement@meridiancommerce.com'}
-Primary Warehouse: {self.primary_hub}
 """
 
     def send_dealer_application(self, recipient_email: str, distributor_name: str, brand_name: str) -> bool:
-        subject = f"New Wholesale Account Application & Catalog Request — {self.company_name}"
+        subject = f"New Wholesale Account Application & Catalog Request - {self.company_name}"
         body = self.generate_email_body(distributor_name, brand_name)
 
-        # Check if live SMTP credentials exist
         if not self.sender_email or not self.sender_password:
-            # Fallback: Save clean draft locally
             slug = "".join([c if c.isalnum() else "_" for c in distributor_name.lower()])
             draft_path = os.path.join(self.DRAFT_DIR, f"application_{slug}.txt")
             with open(draft_path, "w", encoding="utf-8") as f:
                 f.write(f"TO: {recipient_email}\nSUBJECT: {subject}\n\n{body}")
-            print(f"  [DRAFT SAVED] Live SMTP credentials not set. Saved application draft to: {draft_path}")
+            print(f"  <! DRAFT GATED> SMTP envs not configured. Saved application draft to: {draft_path}")
             return True
 
-        # Send via Live SMTP
         try:
             msg = MIMEMultipart()
             msg["From"] = f"{self.company_name} <{self.sender_email}>"
@@ -107,13 +101,12 @@ Primary Warehouse: {self.primary_hub}
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain"))
 
-            # Attach DR-13 if present
             if os.path.exists(self.DR13_PATH):
                 with open(self.DR13_PATH, "rb") as f:
                     part = MIMEBase("application", "pdf")
                     part.set_payload(f.read())
                     encoders.encode_base64(part)
-                    part.add_header("Content-Disposition", f"attachment; filename=Florida_DR13_Resale_Certificate.pdf")
+                    part.add_header("Content-Disposition", "attachment; filename=Florida_DR13_Resale_Certificate.pdf")
                     msg.attach(part)
 
             with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
@@ -121,29 +114,27 @@ Primary Warehouse: {self.primary_hub}
                 server.login(self.sender_email, self.sender_password)
                 server.send_message(msg)
 
-            print(f"  [SENT ✓] Dispatched onboarding email to {distributor_name} ({recipient_email})")
+            print(f"  <SENT OK> Dispatched onboarding email to {self.company_name} -> {recipient_email}")
             return True
         except Exception as e:
             print(f"  [!] Failed sending email to {recipient_email}: {e}")
             return False
 
     def process_unregistered_vacuums(self):
-        print("=" * 80)
-        print("AUTONOMOUS WHOLESALE RECRUITER & DEALER APPLICATION ENGINE")
-        print("=" * 80)
+        print("=" * 75)
+        print("ROUTING: AUTONOMOUS DEALER RECRUITING & ONBOARDING")
+        print("=" * 75)
 
-        vacuums: List[Dict[str, Any]] = self._load_json(self.VACUUM_FILE, [])
-        distributors: List[Dict[str, Any]] = self._load_json(self.DISTRIBUTOR_FILE, [])
-        audit_log: Dict[str, Any] = self._load_json(self.LOG_FILE, {})
+        vacuums = self._load_json(self.VACUUM_FILE, [])
+        distributors = self._load_json(self.DISTRIBUTOR_FILE, [])
+        audit_log = self._load_json(self.LOG_FILE, {})
 
         if not vacuums:
-            print("[-] No vacuum opportunities found in data/vacuum_opportunities.json.")
-            print("    Run 'python -m tools.vacuum_demand_hunter' first to identify targets.")
+            print("[-] No vacuum opportunities found. Run vacuum_demand_hunter.py first.")
             return
 
-        known_supplier_names = {d.get("name", "").strip().lower() for d in distributors}
+        known_suppliers = {d.get("name", "").strip().lower() for d in distributors}
         contacted_emails = set(audit_log.keys())
-
         dispatched_count = 0
 
         for opp in vacuums:
@@ -152,25 +143,22 @@ Primary Warehouse: {self.primary_hub}
             email = opp.get("distributor_email", "")
 
             if not email:
-                print(f"[-] Skipping {dist_name} (No sales desk email on file)")
                 continue
 
-            dist_name_clean = dist_name.strip().lower()
-            is_registered = dist_name_clean in known_supplier_names
+            dist_clean = dist_name.strip().lower()
+            is_registered = dist_clean in known_suppliers
             is_already_contacted = email.lower() in contacted_emails
 
-            # TRIGGER CONDITION: If distributor is NOT in distributors.json OR hasn't been emailed yet
             if not is_registered or not is_already_contacted:
-                print(f"\n[*] New Target Found: {brand} -> Distributor: '{dist_name}'")
-                print(f"    Recipient: {email}")
+                print(f"\n[*] UNREGISTERED / UNCONTACTED SUPPLIER DETECTED: {brand} -> {dist_name}")
+                print(f"    Addressing: {email}")
 
-                # 1. Register into distributors.json if missing
                 if not is_registered:
-                    new_dist_entry = {
+                    new_entry = {
                         "name": dist_name,
-                        "city": "National Hub",
-                        "state": "IA" if "frontier" in dist_name_clean else "FL",
-                        "zip": "52318" if "frontier" in dist_name_clean else "33076",
+                        "city": "Norway" if "frontier" in dist_clean else "Miami",
+                        "state": "IA" if "frontier" in dist_clean else "FL",
+                        "zip": "52318" if "frontier" in dist_clean else "33076",
                         "email": email,
                         "self_pickup": False,
                         "payment_terms": {
@@ -179,32 +167,31 @@ Primary Warehouse: {self.primary_hub}
                             "early_pay_discount_pct": 0.0,
                             "settlement_window_days": 30
                         },
-                        "notes": f"Auto-recruited for vacuum brand: {brand}"
+                        "notes": f"Auto-registered via autonomous_recruiter.py for {brand}"
                     }
-                    distributors.append(new_dist_entry)
-                    known_supplier_names.add(dist_name_clean)
+                    distributors.append(new_entry)
+                    known_suppliers.add(dist_clean)
                     self._save_json(self.DISTRIBUTOR_FILE, distributors)
-                    print(f"    [+] Added '{dist_name}' to {self.DISTRIBUTOR_FILE}")
+                    print(f"    [+] Supplier registered in {self.DISTRIBUTOR_FILE}")
 
-                # 2. Fire the onboarding application
                 success = self.send_dealer_application(email, dist_name, brand)
 
-                # 3. Log the interaction to avoid duplicate outreach
                 if success:
                     audit_log[email.lower()] = {
                         "distributor": dist_name,
                         "brand": brand,
                         "timestamp": datetime.now().isoformat(),
-                        "status": "DISPATCHED" if (self.sender_email and self.sender_password) else "DRAFTED"
+                        "status": "SENT" if (self.sender_email and self.sender_password) else "DRAFTED"
                     }
                     self._save_json(self.LOG_FILE, audit_log)
+                    contacted_emails.add(email.lower())
                     dispatched_count += 1
             else:
-                print(f"[-] Supplier '{dist_name}' ({email}) already registered & contacted. Skipping.")
+                print(f"[-] Distributor '{dist_name}' already registered & contacted.")
 
-        print("\n" + "=" * 80)
-        print(f"[✓] Completed. Total new dealer outreach actions: {dispatched_count}")
-        print("=" * 80)
+        print("\n" + "=" * 75)
+        print(f"[✓] Processed {dispatched_count} new wholesale dealer applications.")
+        print("=" * 75)
 
 if __name__ == "__main__":
     recruiter = AutonomousRecruiter()
