@@ -1,20 +1,28 @@
-{
-  "distributors": [
-    {
-      "name": "Contar Wholesale",
-      "authorized_emails": ["sales@contarwholesale.com", "orders@contarwholesale.com"],
-      "domain_match": "@contarwholesale.com",
-      "moq": 2500.00,
-      "lead_time_days": 3,
-      "notes": "Beauty & Personal Care. Ships from Miami warehouse."
-    },
-    {
-      "name": "Empire Wholesale USA",
-      "authorized_emails": ["rep@empirewholesaleusa.com"],
-      "domain_match": "@empirewholesaleusa.com",
-      "moq": 1500.00,
-      "lead_time_days": 5,
-      "notes": "Health, household, OTC sundries."
-    }
-  ]
-}
+python3 -c "import json, os
+os.makedirs('data', exist_ok=True)
+wholesalers = [
+    {'name': 'Frontier Co-op Wholesale', 'city': 'Norway', 'state': 'IA', 'zip': '52318', 'email': 'customercare@frontiercoop.com', 'portal': 'https://wholesale.frontiercoop.com', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Organic bulk spices, extracts, Aura Cacia. 0% CC fees.'},
+    {'name': 'Boss PetEdge', 'city': 'Beverly', 'state': 'MA', 'zip': '01915', 'email': 'support@bosspetedge.com', 'portal': 'https://www.bosspetedge.com/customer/account/create', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Master Equipment grooming, pet dental, tie-outs. 0% CC fees.'},
+    {'name': 'Marlo Beauty Supply', 'city': 'Livonia', 'state': 'MI', 'zip': '48150', 'email': 'custserv@marlobeauty.com', 'portal': 'https://www.marlobeauty.com/register', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Salon hair toners, developers, bonding treatments (Wella, Clairol).'},
+    {'name': 'Bradley Caldwell Wholesale', 'city': 'Hazleton', 'state': 'PA', 'zip': '18202', 'email': 'sales@bradleycaldwell.com', 'portal': 'https://www.bradleycaldwell.com/become-a-dealer', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Farm, ranch, heavy pet toys (Tuffy, Kong), galvanized feed pans.'},
+    {'name': 'Central Garden & Pet', 'city': 'Walnut Creek', 'state': 'CA', 'zip': '94597', 'email': 'customerrelations@central.com', 'portal': 'https://www.central.com/partners/retailers', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Aquarium test kits (API), avian nutrition, pet wellness lines.'},
+    {'name': 'Global Industrial Resale', 'city': 'Port Washington', 'state': 'NY', 'zip': '11050', 'email': 'resale@globalindustrial.com', 'portal': 'https://www.globalindustrial.com/reseller', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Commercial janitorial dispenser refills (Purell/Gojo), hardware.'},
+    {'name': 'Essendant Wholesale', 'city': 'Deerfield', 'state': 'IL', 'zip': '60015', 'email': 'newaccounts@essendant.com', 'portal': 'https://www.essendant.com/become-a-customer', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Janitorial dispenser refills, facility packaging, breakroom.'},
+    {'name': 'Pet Wholesale USA', 'city': 'Fort Lauderdale', 'state': 'FL', 'zip': '33309', 'email': 'accounts@petwholesaleusa.com', 'portal': 'https://www.petwholesaleusa.com/register', 'self_pickup': True, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Reptile heat lamps (Zoo Med), avian vitamins, aquarium hardware.'},
+    {'name': 'Wholesale Pet Group', 'city': 'Richmond', 'state': 'VA', 'zip': '23219', 'email': 'support@wholesalepet.com', 'portal': 'https://www.wholesalepet.com/Registration', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Boutique pet treats, natural chews, organic supplements.'},
+    {'name': 'Kole Imports Direct', 'city': 'Carson', 'state': 'CA', 'zip': '90745', 'email': 'sales@koleimports.com', 'portal': 'https://www.koleimports.com/sales-faq', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Hardware multi-packs, storage utility straps, emergency gear.'},
+    {'name': 'QualMax Beauty Wholesale', 'city': 'Dallas', 'state': 'TX', 'zip': '75201', 'email': 'sales@qualmaxwholesale.com', 'portal': 'https://qualmaxwholesale.com', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Nail lacquer multi-packs, developer gallons, salon supplies.'},
+    {'name': 'Green Supply Sports', 'city': 'Vandalia', 'state': 'MO', 'zip': '63382', 'email': 'dealers@greensupply.com', 'portal': 'https://www.greensupply.com/dealers', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Outdoor equipment, waterproof gear packs, camping utilities.'},
+    {'name': 'Zanders Sporting Goods', 'city': 'Sparta', 'state': 'IL', 'zip': '62286', 'email': 'sales@gzanders.com', 'portal': 'https://www.gzanders.com/dealer-application', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Outdoor recreation, hydration accessories, tactical paracord.'},
+    {'name': 'Universal General Products', 'city': 'Doral', 'state': 'FL', 'zip': '33122', 'email': 'info@universalgeneral.com', 'portal': 'Direct Order Desk', 'self_pickup': True, 'payment_terms': {'payment_method': 'ACH', 'cc_surcharge_pct': 0.03, 'settlement_window_days': 30}, 'notes': 'Local South Florida pickup ($0 freight). Grocery and sundries.'},
+    {'name': 'Worldwide Sport Supply', 'city': 'Vestal', 'state': 'NY', 'zip': '13850', 'email': 'info@worldwidesport.com', 'portal': 'https://www.worldwidesport.com', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Athletic tape multi-packs, compression sleeves, training gear.'},
+    {'name': 'Midwest Goods Distribution', 'city': 'Bensenville', 'state': 'IL', 'zip': '60106', 'email': 'sales@midwestgoods.com', 'portal': 'https://www.midwestgoods.com/register', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Compact consumer electronics, batteries, replacement hardware.'},
+    {'name': 'JB Tools Supply', 'city': 'Livonia', 'state': 'MI', 'zip': '48150', 'email': 'sales@jbtools.com', 'portal': 'https://www.jbtools.com/wholesale', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Automotive specialty diagnostic bits, trim clip master packs.'},
+    {'name': 'Atlantic Spice Company', 'city': 'North Truro', 'state': 'MA', 'zip': '02652', 'email': 'sales@atlanticspice.com', 'portal': 'https://www.atlanticspice.com/Wholesale_ep_42.html', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Bulk dehydrated culinary spices, whole cloves, dried botanicals.'},
+    {'name': 'Wholesale Point Medical', 'city': 'Lincolnshire', 'state': 'IL', 'zip': '60069', 'email': 'sales@wholesalepoint.com', 'portal': 'https://www.wholesalepoint.com', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Medical consumables, diagnostic scales, clinic disposables.'},
+    {'name': 'Vistar Specialty Distribution', 'city': 'Englewood', 'state': 'CO', 'zip': '80112', 'email': 'vistarnewaccounts@pfgc.com', 'portal': 'https://www.vistar.com/customer-portal', 'self_pickup': False, 'payment_terms': {'payment_method': 'CREDIT_CARD', 'cc_surcharge_pct': 0.0, 'settlement_window_days': 30}, 'notes': 'Concession master-packs, bulk beverage syrups, specialty snacks.'}
+]
+with open('data/distributors.json', 'w', encoding='utf-8') as f:
+    json.dump(wholesalers, f, indent=2)
+print(f'[✓] Successfully populated {len(wholesalers)} wholesalers into data/distributors.json')
+"
