@@ -6,12 +6,12 @@ class VacuumDemandHunter:
     """
     Zero-Seller Vacuum Demand Hunter & Allocation Engine
     ---------------------------------------------------
-    - Strategy: Zero-Seller Monopoly (0 active FBA/WFS sellers, Amazon 1P OOS)
+    - Status: 6 Confirmed Commercial Distributor Approvals
+    - Filters: Active FBA/WFS Sellers == 0, Amazon 1P Out of Stock
     - Velocity Gate: >= 75 monthly drops (~100+ units/mo organic volume)
     - Margin Gate: >= 50.0% ROI
     - Yield Gate: >= $1,000.00 / month net profit per SKU
-    - Local Logistics: Automatic $0 inbound freight computation for local South FL pickup hubs
-    - Persistence: Automatically initializes and syncs data/distributors.json on boot
+    - Local Logistics: Automatic $0 inbound freight for local South FL pickup hubs
     """
 
     OUTPUT_FILE = "data/vacuum_opportunities.json"
@@ -20,7 +20,6 @@ class VacuumDemandHunter:
     MIN_MONTHLY_DROPS = 75
     MIN_SKU_MONTHLY_PROFIT = 1000.0
 
-    # Permanent Master Wholesale Registry
     MASTER_WHOLESALERS = [
         # APPROVED LOCAL DOCKS (< 30 MILES FROM PARKLAND - $0 INBOUND FREIGHT)
         {
@@ -34,11 +33,7 @@ class VacuumDemandHunter:
             "distance_miles": 12,
             "status": "APPROVED",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
             "notes": "APPROVED ACCOUNT. Local Pompano dock ($0 freight). Cleaning chemicals, Gojo/Purell refills."
         },
         {
@@ -52,87 +47,11 @@ class VacuumDemandHunter:
             "distance_miles": 28,
             "status": "APPROVED",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
             "notes": "APPROVED ACCOUNT. Local Doral dock ($0 freight). Personal care, HBA, sundry multi-packs."
         },
-        {
-            "name": "All Florida Paper & Janitorial",
-            "city": "Pompano Beach",
-            "state": "FL",
-            "zip": "33069",
-            "email": "orders@allfloridapaper.com",
-            "portal": "https://www.allfloridapaper.com",
-            "self_pickup": True,
-            "distance_miles": 10,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Local Pompano dock ($0 freight). Purell/Gojo refills, paper products, commercial janitorial."
-        },
-        {
-            "name": "Coral Packaging & Janitorial",
-            "city": "Pompano Beach",
-            "state": "FL",
-            "zip": "33069",
-            "email": "sales@coralpack.com",
-            "portal": "https://www.coralpack.com",
-            "self_pickup": True,
-            "distance_miles": 11,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Pompano warehouse pickup ($0 freight). Nitrile glove bundles, commercial cleaners."
-        },
-        {
-            "name": "Unique Wholesale Distributors",
-            "city": "Pompano Beach",
-            "state": "FL",
-            "zip": "33069",
-            "email": "info@uniquewholesale.net",
-            "portal": "https://uniquewholesale.net",
-            "self_pickup": True,
-            "distance_miles": 10,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Customer pickup window (3141 SW 10th St). Hardware, tools, commercial supplies."
-        },
-        {
-            "name": "Action Packaging & Industrial",
-            "city": "Pompano Beach",
-            "state": "FL",
-            "zip": "33069",
-            "email": "sales@actionpack.com",
-            "portal": "https://www.actionpack.com",
-            "self_pickup": True,
-            "distance_miles": 11,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Pompano warehouse will-call ($0 freight). Shipping boxes, poly bags, strapping supplies."
-        },
 
-        # NATIONAL COMMERCIAL WHOLESALERS (CREDIT-CARD FRIENDLY, 0% SURCHARGE)
+        # APPROVED NATIONAL WHOLESALERS (0% CC FEES)
         {
             "name": "Frontier Co-op Wholesale",
             "city": "Norway",
@@ -141,15 +60,52 @@ class VacuumDemandHunter:
             "email": "customercare@frontiercoop.com",
             "portal": "https://wholesale.frontiercoop.com",
             "self_pickup": False,
-            "status": "PENDING",
+            "status": "APPROVED",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Organic bulk spices, extracts, Aura Cacia. 0% CC fees."
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
+            "notes": "APPROVED ACCOUNT. Organic bulk spices, extracts, Aura Cacia, Simply Organic. 0% CC fees."
         },
+        {
+            "name": "Marlo Beauty Supply",
+            "city": "Livonia",
+            "state": "MI",
+            "zip": "48150",
+            "email": "custserv@marlobeauty.com",
+            "portal": "https://www.marlobeauty.com/register",
+            "self_pickup": False,
+            "status": "APPROVED",
+            "credit_card_enabled": True,
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
+            "notes": "APPROVED ACCOUNT. Salon toners (Wella T18), developer gallons, bonding treatments."
+        },
+        {
+            "name": "Atlantic Spice Company",
+            "city": "North Truro",
+            "state": "MA",
+            "zip": "02652",
+            "email": "sales@atlanticspice.com",
+            "portal": "https://www.atlanticspice.com/Wholesale_ep_42.html",
+            "self_pickup": False,
+            "status": "APPROVED",
+            "credit_card_enabled": True,
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
+            "notes": "APPROVED ACCOUNT. Bulk dehydrated culinary spices, whole cloves, dried botanicals."
+        },
+        {
+            "name": "JB Tools Supply",
+            "city": "Livonia",
+            "state": "MI",
+            "zip": "48150",
+            "email": "sales@jbtools.com",
+            "portal": "https://www.jbtools.com/wholesale",
+            "self_pickup": False,
+            "status": "APPROVED",
+            "credit_card_enabled": True,
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
+            "notes": "APPROVED ACCOUNT. Automotive diagnostic bits, trim clip assortments, specialty tools."
+        },
+
+        # PENDING NATIONAL & LOCAL WHOLESALERS
         {
             "name": "Boss PetEdge",
             "city": "Beverly",
@@ -160,29 +116,8 @@ class VacuumDemandHunter:
             "self_pickup": False,
             "status": "PENDING",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
             "notes": "Master Equipment grooming, pet dental, tie-outs. 0% CC fees."
-        },
-        {
-            "name": "Marlo Beauty Supply",
-            "city": "Livonia",
-            "state": "MI",
-            "zip": "48150",
-            "email": "custserv@marlobeauty.com",
-            "portal": "https://www.marlobeauty.com/register",
-            "self_pickup": False,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Salon hair toners, developers, bonding treatments (Wella, Clairol). Open to general commercial retail."
         },
         {
             "name": "Bradley Caldwell Wholesale",
@@ -194,11 +129,7 @@ class VacuumDemandHunter:
             "self_pickup": False,
             "status": "PENDING",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
             "notes": "Farm, ranch, heavy pet toys (Tuffy, Kong), galvanized feed pans."
         },
         {
@@ -211,11 +142,7 @@ class VacuumDemandHunter:
             "self_pickup": False,
             "status": "PENDING",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
             "notes": "Aquarium test kits (API), avian nutrition, pet wellness lines."
         },
         {
@@ -228,80 +155,22 @@ class VacuumDemandHunter:
             "self_pickup": False,
             "status": "PENDING",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
             "notes": "Commercial janitorial dispenser refills (Purell/Gojo), hardware."
         },
         {
-            "name": "Essendant Wholesale",
-            "city": "Deerfield",
-            "state": "IL",
-            "zip": "60015",
-            "email": "newaccounts@essendant.com",
-            "portal": "https://www.essendant.com/become-a-customer",
-            "self_pickup": False,
+            "name": "All Florida Paper & Janitorial",
+            "city": "Pompano Beach",
+            "state": "FL",
+            "zip": "33069",
+            "email": "orders@allfloridapaper.com",
+            "portal": "https://www.allfloridapaper.com",
+            "self_pickup": True,
+            "distance_miles": 10,
             "status": "PENDING",
             "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Janitorial dispenser refills, facility packaging, breakroom."
-        },
-        {
-            "name": "QualMax Beauty Wholesale",
-            "city": "Dallas",
-            "state": "TX",
-            "zip": "75201",
-            "email": "sales@qualmaxwholesale.com",
-            "portal": "https://qualmaxwholesale.com",
-            "self_pickup": False,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Nail lacquer multi-packs, developer gallons, salon supplies."
-        },
-        {
-            "name": "JB Tools Supply",
-            "city": "Livonia",
-            "state": "MI",
-            "zip": "48150",
-            "email": "sales@jbtools.com",
-            "portal": "https://www.jbtools.com/wholesale",
-            "self_pickup": False,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Automotive specialty diagnostic bits, trim clip master packs."
-        },
-        {
-            "name": "Atlantic Spice Company",
-            "city": "North Truro",
-            "state": "MA",
-            "zip": "02652",
-            "email": "sales@atlanticspice.com",
-            "portal": "https://www.atlanticspice.com/Wholesale_ep_42.html",
-            "self_pickup": False,
-            "status": "PENDING",
-            "credit_card_enabled": True,
-            "payment_terms": {
-                "payment_method": "CREDIT_CARD",
-                "cc_surcharge_pct": 0.0,
-                "settlement_window_days": 30
-            },
-            "notes": "Bulk dehydrated culinary spices, whole cloves, dried botanicals."
+            "payment_terms": {"payment_method": "CREDIT_CARD", "cc_surcharge_pct": 0.0, "settlement_window_days": 30},
+            "notes": "Local Pompano dock ($0 freight). Purell/Gojo refills, paper products, commercial janitorial."
         }
     ]
 
@@ -323,7 +192,6 @@ class VacuumDemandHunter:
         else:
             fba_fee = 6.95 + (weight_lbs - 4.0) * 0.45
 
-        # Local South Florida docks incur $0 inbound freight
         inbound_freight = 0.0 if is_local_pickup else round(weight_lbs * 0.45, 2)
         total_costs = estimated_cost + referral_fee + fba_fee + inbound_freight
         net_profit = round(retail_price - total_costs, 2)
@@ -338,7 +206,6 @@ class VacuumDemandHunter:
         }
 
     def sync_distributor_registry(self):
-        """Persists the Master Wholesaler list into data/distributors.json on boot."""
         with open(self.DISTRIBUTOR_REGISTRY, "w", encoding="utf-8") as f:
             json.dump(self.MASTER_WHOLESALERS, f, indent=2)
 
@@ -350,33 +217,7 @@ class VacuumDemandHunter:
         self.sync_distributor_registry()
 
         candidates = [
-            # Local Approved: JPro Supplies ($0 freight pickup)
-            {
-                "brand": "Purell / GOJO",
-                "title": "LTX-12 Advanced Green Hand Sanitizer 1200mL Refill (Case of 2)",
-                "upc": "073852019034",
-                "retail_price": 62.99,
-                "wholesale_cost": 24.50,
-                "weight_lbs": 5.4,
-                "drops_30": 95,
-                "distributor": "JPro Supplies Wholesale",
-                "email": "help@jprosupplies.com",
-                "is_local": True
-            },
-            # Local Approved: Contarmarket ($0 freight pickup)
-            {
-                "brand": "Dove Men+Care",
-                "title": "Extra Fresh Body and Face Bar Soap 3.75 oz (14-Pack Value Bundle)",
-                "upc": "011111613898",
-                "retail_price": 38.99,
-                "wholesale_cost": 14.20,
-                "weight_lbs": 3.8,
-                "drops_30": 125,
-                "distributor": "Contarmarket Wholesale Direct",
-                "email": "store@contarmarket.com",
-                "is_local": True
-            },
-            # Frontier Co-op (Spices & Extracts)
+            # Frontier Co-op (APPROVED)
             {
                 "brand": "Frontier Co-op",
                 "title": "Certified Organic Whole Black Peppercorns 1 lb (Case of 3 Master Pack)",
@@ -401,20 +242,19 @@ class VacuumDemandHunter:
                 "email": "customercare@frontiercoop.com",
                 "is_local": False
             },
-            # Boss PetEdge (Pet Grooming)
             {
-                "brand": "Boss PetEdge",
-                "title": "Master Equipment Stainless Steel Grooming Arm & Clamp Combo (Pack of 2)",
-                "upc": "076930009988",
-                "retail_price": 79.99,
-                "wholesale_cost": 32.50,
-                "weight_lbs": 4.8,
-                "drops_30": 82,
-                "distributor": "Boss PetEdge",
-                "email": "support@bosspetedge.com",
+                "brand": "Frontier Co-op",
+                "title": "Organic Ground Ceylon Cinnamon 16 oz Bulk Bag (2-Pack Bundle)",
+                "upc": "089836000101",
+                "retail_price": 44.99,
+                "wholesale_cost": 18.80,
+                "weight_lbs": 2.2,
+                "drops_30": 98,
+                "distributor": "Frontier Co-op Wholesale",
+                "email": "customercare@frontiercoop.com",
                 "is_local": False
             },
-            # Marlo Beauty
+            # Marlo Beauty Supply (APPROVED)
             {
                 "brand": "Wella Professionals",
                 "title": "Color Charm Permanent Liquid Hair Toner T18 Lightest Ash (Pack of 6)",
@@ -427,18 +267,57 @@ class VacuumDemandHunter:
                 "email": "custserv@marlobeauty.com",
                 "is_local": False
             },
-            # Bradley Caldwell
+            # Atlantic Spice Company (APPROVED)
             {
-                "brand": "Miller Manufacturing",
-                "title": "Little Giant Heavy-Duty Galvanized Steel Feed Pan 12-Quart (2-Pack)",
-                "upc": "084369012023",
-                "retail_price": 64.99,
-                "wholesale_cost": 26.20,
-                "weight_lbs": 4.6,
-                "drops_30": 88,
-                "distributor": "Bradley Caldwell Wholesale",
-                "email": "sales@bradleycaldwell.com",
+                "brand": "Atlantic Spice",
+                "title": "Whole Madagascar Cloves Premium Culinary Grade 1 lb Bag (Pack of 2)",
+                "upc": "029871004123",
+                "retail_price": 46.99,
+                "wholesale_cost": 17.80,
+                "weight_lbs": 2.1,
+                "drops_30": 100,
+                "distributor": "Atlantic Spice Company",
+                "email": "sales@atlanticspice.com",
                 "is_local": False
+            },
+            # JB Tools Supply (APPROVED)
+            {
+                "brand": "JB Professional",
+                "title": "Master Automotive Weatherproof Shield Clips 500pc Assortment Box",
+                "upc": "642109880192",
+                "retail_price": 52.99,
+                "wholesale_cost": 18.00,
+                "weight_lbs": 2.2,
+                "drops_30": 90,
+                "distributor": "JB Tools Supply",
+                "email": "sales@jbtools.com",
+                "is_local": False
+            },
+            # JPro Supplies (APPROVED - Local $0 Freight)
+            {
+                "brand": "Purell / GOJO",
+                "title": "LTX-12 Advanced Green Hand Sanitizer 1200mL Refill (Case of 2)",
+                "upc": "073852019034",
+                "retail_price": 62.99,
+                "wholesale_cost": 24.50,
+                "weight_lbs": 5.4,
+                "drops_30": 95,
+                "distributor": "JPro Supplies Wholesale",
+                "email": "help@jprosupplies.com",
+                "is_local": True
+            },
+            # Contarmarket (APPROVED - Local $0 Freight)
+            {
+                "brand": "Dove Men+Care",
+                "title": "Extra Fresh Body and Face Bar Soap 3.75 oz (14-Pack Value Bundle)",
+                "upc": "011111613898",
+                "retail_price": 38.99,
+                "wholesale_cost": 14.20,
+                "weight_lbs": 3.8,
+                "drops_30": 125,
+                "distributor": "Contarmarket Wholesale Direct",
+                "email": "store@contarmarket.com",
+                "is_local": True
             }
         ]
 
@@ -472,15 +351,14 @@ class VacuumDemandHunter:
                 }
                 qualified.append(record)
 
-        # Sort strictly descending by monthly profit yield
         qualified.sort(key=lambda x: x["monthly_net_profit"], reverse=True)
 
-        fmt = "{:<30} | {:<26} | {:<10} | {:<8} | {:<14}"
+        fmt = "{:<28} | {:<26} | {:<10} | {:<8} | {:<14}"
         print(fmt.format("Distributor", "Brand / Item", "Profit/Unit", "ROI", "Monthly Profit"))
         print("-" * 105)
         for q in qualified:
             print(fmt.format(
-                q["recommended_distributor"][:30],
+                q["recommended_distributor"][:28],
                 f"{q['brand']} ({q['monthly_units_projected']}u)"[:26],
                 f"${q['net_profit_per_unit']:.2f}",
                 q["roi_pct"],
@@ -493,7 +371,7 @@ class VacuumDemandHunter:
         total_profit = sum(q['monthly_net_profit'] for q in qualified)
         print("=" * 105)
         print(f"[✓] Permanent Distributor Registry written to: {self.DISTRIBUTOR_REGISTRY}")
-        print(f"[✓] Identified {len(qualified)} power SKUs yielding ${total_profit:,.2f}/mo total profit.")
+        print(f"[✓] Identified {len(qualified)} power SKUs yielding ${total_profit:,.2f}/mo total profit across APPROVED distributors.")
         print(f"    Saved prioritized targets to: {self.OUTPUT_FILE}")
 
 if __name__ == "__main__":
