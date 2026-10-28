@@ -15,32 +15,31 @@ from tools.git_state_sync import GitStateSync
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("RollingCatalogCycler")
 
+MAX_FBA_WEIGHT_GRAMS = 20411    # 45.0 lbs ceiling
+MAX_FBA_DIMENSION_MM = 609      # 24.0 inches ceiling
+
 class RollingCatalogCycler:
     """
-    72-Hour Rolling Catalog Cycler:
-    - Scans 12 commercial sectors in rolling 3-day waves.
-    - Operates at net-zero token burn (paced requests).
-    - Filters for items under 5 lbs with sales rank < 80,000.
-    - Delivers 2-3 target acquisitions per day.
+    Continuous 72-Hour Rolling Sourcing Radar:
+    - Rotates across 12 commercial sectors.
+    - Applies Amazon physical limits to Keepa queries.
+    - Paces requests to preserve token budget.
+    - Targets 2-3 vetted acquisitions per day.
     """
     QUERY_API = "https://api.keepa.com/query"
     PRODUCT_API = "https://api.keepa.com/product"
 
-    # 12 Target Sectors across 3 Days (4 sectors per day)
     SECTORS = [
-        # DAY 1: Industrial, Hardware & MRO
         {"day": 1, "name": "Industrial Hardware & Valves", "cat_id": "16310091", "max_weight_g": 2268},
         {"day": 1, "name": "Janitorial & Sanitation MRO", "cat_id": "16310161", "max_weight_g": 2268},
         {"day": 1, "name": "Automotive Specialty Tools", "cat_id": "15684181", "max_weight_g": 1814},
         {"day": 1, "name": "Commercial Electrical & Fittings", "cat_id": "495318", "max_weight_g": 1814},
 
-        # DAY 2: Consumables, Spices & Beauty
         {"day": 2, "name": "Professional Salon & Toners", "cat_id": "11055981", "max_weight_g": 907},
         {"day": 2, "name": "Bulk Herbs, Botanicals & Spices", "cat_id": "16310101", "max_weight_g": 1360},
         {"day": 2, "name": "Commercial Kitchen & Barista Parts", "cat_id": "284507", "max_weight_g": 1360},
         {"day": 2, "name": "Aromatherapy & Essential Oils", "cat_id": "3760911", "max_weight_g": 907},
 
-        # DAY 3: Sports, Precision & Niche Consumables
         {"day": 3, "name": "Specialty Sports Gear Consumables", "cat_id": "3375251", "max_weight_g": 2268},
         {"day": 3, "name": "Precision Optics & Lab Consumables", "cat_id": "318603011", "max_weight_g": 1360},
         {"day": 3, "name": "HVAC Consumables & Filtration", "cat_id": "3206324011", "max_weight_g": 2268},
@@ -57,8 +56,10 @@ class RollingCatalogCycler:
 
     def scan_sector(self, sector: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not self.api_key:
-            logger.info(f"[Dry Run] Simulating 0-seller checks for: {sector['name']}")
+            logger.info(f"[Dry Run] Simulating checks for: {sector['name']}")
             return []
+
+        weight_cap_g = min(sector.get("max_weight_g", MAX_FBA_WEIGHT_GRAMS), MAX_FBA_WEIGHT_GRAMS)
 
         payload = {
             "categories_include": [sector["cat_id"]],
@@ -66,7 +67,10 @@ class RollingCatalogCycler:
             "current_COUNT_NEW_lte": 0,
             "current_SALES_gte": 1,
             "current_SALES_lte": 80000,
-            "packageWeight_lte": sector["max_weight_g"],
+            "packageWeight_lte": weight_cap_g,
+            "packageLength_lte": MAX_FBA_DIMENSION_MM,
+            "packageWidth_lte": MAX_FBA_DIMENSION_MM,
+            "packageHeight_lte": MAX_FBA_DIMENSION_MM,
             "hasReviews": True,
             "buyBoxSellerId": "none",
             "sort": [["current_SALES", "asc"]],
@@ -82,7 +86,7 @@ class RollingCatalogCycler:
             logger.info(f"Sector: {sector['name']} | Keepa Tokens Available: {tokens_left}")
 
             if tokens_left < self.safety_token_floor:
-                logger.warning(f"Token reserves below {self.safety_token_floor}. Entering regeneration pause...")
+                logger.warning(f"Tokens low ({tokens_left}). Pausing for regeneration...")
                 time.sleep(60)
 
             asin_list = data.get("asinList", [])
@@ -114,6 +118,10 @@ class RollingCatalogCycler:
                 brand = p.get("brand", "Unknown")
                 stats = p.get("stats", {})
 
+                pkg_g = p.get("packageWeight", 0)
+                if pkg_g > MAX_FBA_WEIGHT_GRAMS:
+                    continue
+
                 bb_cents = stats.get("buyBoxPrice", -1)
                 new_cents = stats.get("current", [None]*2)[1] if stats.get("current") else -1
                 price_cents = bb_cents if bb_cents > 0 else new_cents
@@ -130,10 +138,11 @@ class RollingCatalogCycler:
                     "brand": brand,
                     "mpn": p.get("mpn", ""),
                     "amazon_price": amz_price,
-                    "wholesale_cost": est_wholesale_cost,
+                    "cost": est_wholesale_cost,
                     "sales_rank": stats.get("salesRankDrop30", 30000),
                     "sector": sector["name"],
-                    "weight_lbs": round(p.get("packageWeight", 500) / 453.6, 2)
+                    "package_weight_lbs": round(pkg_g / 453.6, 2) if pkg_g else 1.5,
+                    "max_dimension_inches": round(max(p.get("packageLength", 0), p.get("packageWidth", 0), p.get("packageHeight", 0)) / 25.4, 2)
                 })
 
             return leads
@@ -142,7 +151,7 @@ class RollingCatalogCycler:
             return []
 
     def run_continuous_72h_cycle(self):
-        logger.info("⚡ Starting 72-Hour Rolling Catalog Cycler...")
+        logger.info("Starting 72-Hour Rolling Catalog Cycler...")
         sector_idx = 0
 
         while True:
@@ -151,17 +160,13 @@ class RollingCatalogCycler:
 
             leads = self.scan_sector(sector)
             if leads:
-                # Filter through Master Vacuum Engine (50% ROI, $0.35 prep)
                 viable = self.engine.process_catalog(leads)
                 if viable:
-                    # Alert the top candidate
                     top_pick = viable[0]
                     self.telegram.send_deal_card(top_pick)
-                    logger.info(f"Dispatched daily candidate: {top_pick['asin']} ({top_pick['title'][:35]})")
+                    logger.info(f"Dispatched candidate: {top_pick['asin']} ({top_pick['title'][:35]})")
 
             sector_idx = (sector_idx + 1) % len(self.SECTORS)
-
-            # 45-second sleep paces calls so Keepa tokens regenerate continuously
             logger.info("Resting 45 seconds for Keepa token regeneration...")
             time.sleep(45)
 
