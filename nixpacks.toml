@@ -17,4 +17,4 @@ cmds = [
 ]
 
 [start]
-cmd = "/app/.venv/bin/python -m tools.rolling_catalog_cycler"
+cmd = "/app/.venv/bin/python main.py"
