@@ -196,7 +196,7 @@ if __name__ == "__main__":
     test_basket = [
         {"sku": "GI-49201", "name": "3M Safety Goggles", "wholesale_price": 6.50, "qty": 40, "weight_lbs": 0.5, "target_sell_price": 19.99},
         {"sku": "GI-88122", "name": "Klein Wire Stripper", "wholesale_price": 14.00, "qty": 10, "weight_lbs": 0.8, "target_sell_price": 38.50},
-        {"sku": "GI-HEAVY", "name": "55 Gallon Drum Dolly", "wholesale_price": 120.00, "qty": 1, "weight_lbs": 58.0, "target_sell_price": 280.00}
+        {"sku": "GI-HEAVY", "name": "55 Gallon Drum Drum", "wholesale_price": 120.00, "qty": 1, "weight_lbs": 58.0, "target_sell_price": 280.00}
     ]
     res = consolidate_vendor_basket("global_industrial", test_basket)
     print(json.dumps(res, indent=2))
