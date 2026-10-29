@@ -1,21 +1,44 @@
 #!/usr/bin/env python3
 """
-Automated Brand Anchor Keeper & 170-Day Anti-Regating Pulse Daemon
+Automated Brand Anchor Keeper & Staggered Anti-Regating Pulse Daemon
 Features:
 1. Tracks only brands that required formal approval and were ungated.
 2. Creates FBM Anchor Listing (Qty=0) on Seller Central to hold backend permissions.
-3. Automatically executes 170-day pulse (<180-day cliff) to simulate active seller presence.
-4. Realistic price guardrail: 1.8x to 2.2x Buy Box (prevents High Pricing Error suppression).
+3. Staggered Jitter Architecture:
+   - Eliminates predictable batching at day 170.
+   - Deterministic brand-specific pulse window: 145 to 168 days (randomly distributed by brand hash).
+   - Dynamic pulse duration: 10 to 18 days (instead of a static 14-day block).
+4. Realistic price guardrail: 1.85x to 2.15x Buy Box with cent randomization (.49, .79, .95).
 5. 14-day handling time valve on Dormancy-Keeper-Template.
-6. Automatically reverts Qty back to 0 on Day 14.
+6. Automatically reverts Qty back to 0 when brand-specific pulse duration expires.
 """
 
 import json
 import os
 import datetime
+import hashlib
 from typing import Dict, Any, List
 
 REGISTRY_FILE = "data/brand_ungate_registry.json"
+
+def calculate_brand_pulse_interval(brand_name: str, min_days: int = 145, max_days: int = 168) -> int:
+    """Computes a deterministic, staggered cycle interval per brand (145-168 days)."""
+    h = int(hashlib.sha256(brand_name.encode('utf-8')).hexdigest(), 16)
+    return min_days + (h % (max_days - min_days + 1))
+
+def calculate_brand_pulse_duration(brand_name: str, min_duration: int = 10, max_duration: int = 18) -> int:
+    """Computes a staggered pulse duration per brand (10-18 days)."""
+    h = int(hashlib.sha256((brand_name + "_duration").encode('utf-8')).hexdigest(), 16)
+    return min_duration + (h % (max_duration - min_duration + 1))
+
+def calculate_dynamic_pulse_price(brand_name: str, ref_price: float) -> float:
+    """Calculates realistic uncompetitive price (1.85x - 2.15x) with natural ending digits."""
+    h = int(hashlib.sha256((brand_name + "_price").encode('utf-8')).hexdigest(), 16)
+    multiplier = 1.85 + ((h % 30) / 100.0)  # 1.85 to 2.14
+    raw_price = ref_price * multiplier
+    cents_options = [0.49, 0.79, 0.89, 0.95, 0.99]
+    selected_cents = cents_options[h % len(cents_options)]
+    return round(int(raw_price) + selected_cents, 2)
 
 def load_registry() -> Dict[str, Any]:
     if not os.path.exists(REGISTRY_FILE):
@@ -57,9 +80,7 @@ def generate_sp_api_listing_payload(brand_name: str, brand_data: Dict[str, Any],
     sku = brand_data["anchor_sku"]
     asin = brand_data["anchor_asin"]
     ref_price = brand_data.get("buy_box_reference", 20.00)
-    
-    # 1.8x to 2.2x Buy Box Guardrail
-    pulse_price = round(ref_price * 2.0, 2)
+    pulse_price = calculate_dynamic_pulse_price(brand_name, ref_price)
 
     if action == "START_PULSE":
         return {
@@ -96,7 +117,11 @@ def evaluate_and_run_pulse():
         last_pulse = datetime.datetime.strptime(info["last_pulse_date"], "%Y-%m-%d").date()
         days_since_pulse = (today - last_pulse).days
 
-        # Case 1: Revert active pulse after 14 days
+        # Brand-specific staggered cadence
+        staggered_interval = calculate_brand_pulse_interval(brand)
+        pulse_duration = calculate_brand_pulse_duration(brand)
+
+        # Case 1: Revert active pulse after brand duration expires
         if active_pulse:
             end_date = datetime.datetime.strptime(info["pulse_end_date"], "%Y-%m-%d").date()
             if today >= end_date:
@@ -107,17 +132,20 @@ def evaluate_and_run_pulse():
                 actions_taken.append({
                     "action": "PULSE_CONCLUDED_REVERTED_TO_ZERO",
                     "brand": brand,
+                    "duration_days": (today - (end_date - datetime.timedelta(days=pulse_duration))).days,
                     "payload": payload
                 })
-        # Case 2: Trigger new pulse if reached 170 days
-        elif days_since_pulse >= 170:
+        # Case 2: Trigger new pulse when reaching brand-specific staggered interval
+        elif days_since_pulse >= staggered_interval:
             payload = generate_sp_api_listing_payload(brand, info, "START_PULSE")
             info["active_pulse"] = True
-            info["pulse_end_date"] = str(today + datetime.timedelta(days=14))
+            info["pulse_end_date"] = str(today + datetime.timedelta(days=pulse_duration))
             actions_taken.append({
-                "action": "PULSE_ACTIVATED_14_DAYS",
+                "action": "PULSE_ACTIVATED_STAGGERED",
                 "brand": brand,
                 "days_since_last": days_since_pulse,
+                "target_interval": staggered_interval,
+                "active_duration_days": pulse_duration,
                 "payload": payload
             })
 
@@ -126,5 +154,5 @@ def evaluate_and_run_pulse():
 
 if __name__ == "__main__":
     results = evaluate_and_run_pulse()
-    print(f"Executed pulse evaluation. Actions count: {len(results)}")
+    print(f"Executed staggered pulse evaluation. Actions count: {len(results)}")
     print(json.dumps(results, indent=2))
