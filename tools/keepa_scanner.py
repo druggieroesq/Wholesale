@@ -159,8 +159,12 @@ class KeepaScanner:
 
         return leads
 
+    def run_full_scan(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        """Invoked by the sniper loop background cycle."""
+        return self.scan_master_catalog(*args, **kwargs)
+
 
 if __name__ == "__main__":
     scanner = KeepaScanner()
-    found = scanner.scan_master_catalog()
+    found = scanner.run_full_scan()
     print(f"Discovered {len(found)} candidate opportunities within FBA limits.")
