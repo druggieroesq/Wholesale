@@ -1,63 +1,84 @@
+"""
+main.py
+Master Production Runner for Wholesale MRO Arbitrage Fleet.
+
+Orchestrates:
+1. Telegram Polling Daemon (Background Thread) with anti-collision multi-user state.
+2. Scheduled Morning Scout Run (7:00 AM ET): Generates Feed A (Buys) & Feed B (Reverse RFQs).
+3. Scheduled Evening Digest (8:00 PM ET): Dispatches partner email digest.
+4. Healthcheck / Ping loop for hosting runtime (Railway / Docker).
+"""
+
 import os
 import sys
 import time
 import logging
 import threading
+import schedule
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("WholesaleMain")
+logger = logging.getLogger("MasterFleet")
 
-# Upgraded Core & Tools Imports
-from tools.master_vacuum_engine import MasterVacuumEngine
-from tools.automated_deal_sniper import AutomatedDealSniper
-from tools.telegram_polling_daemon import TelegramPollingDaemon
-from tools.git_state_sync import GitStateSync
+from tools.queue_manager import send_daily_decision_email_digest
+from tools.dual_feed_dispatcher import generate_daily_worklist
+from tools.walmart_morning_scout import evaluate_walmart_wfs_gap, send_morning_scout_telegram
 
-def run_scheduled_sniper():
-    """
-    Periodically executes the Deal Sniper pipeline to harvest 
-    0-seller vacuums and dispatch actionable cards to Telegram.
-    """
-    sniper = AutomatedDealSniper()
-    interval_seconds = int(os.getenv("SCAN_INTERVAL_SECONDS", "3600"))  # Default: hourly
-    
-    logger.info(f"Starting Sniper background loop (interval: {interval_seconds}s)...")
-    while True:
-        try:
-            logger.info("Executing scheduled vacuum sniper scan...")
-            sniper.run_sniper_mission(max_alerts=5)
-        except Exception as e:
-            logger.error(f"Error during sniper execution cycle: {e}")
-        time.sleep(interval_seconds)
+def run_morning_dispatch_job():
+    """Triggers at 7:00 AM ET every morning."""
+    logger.info("Executing 7:00 AM Morning Dispatch Routine...")
+    try:
+        # Load active scan pools and generate Feed A & Feed B queues
+        confirmed_buys = []
+        reverse_rfqs = []
+        
+        worklist = generate_daily_worklist(confirmed_buys, reverse_rfqs, feed_a_limit=25, feed_b_limit=25)
+        logger.info(f"Daily worklist compiled: {len(worklist.get('feed_a_buys', []))} Buys, {len(worklist.get('feed_b_rfqs', []))} RFQs.")
+    except Exception as e:
+        logger.error(f"Error in morning dispatch job: {e}")
+
+def run_evening_digest_job():
+    """Triggers at 8:00 PM ET every evening."""
+    logger.info("Executing 8:00 PM Partner Email Digest Routine...")
+    try:
+        send_daily_decision_email_digest()
+        logger.info("Daily decision email digest successfully sent.")
+    except Exception as e:
+        logger.error(f"Error sending evening digest: {e}")
+
+def start_telegram_daemon():
+    """Runs Telegram listener thread."""
+    try:
+        from tools.telegram_polling_daemon import bot
+        if bot:
+            logger.info("Starting Telegram Bot Polling thread...")
+            bot.infinity_polling(timeout=20, long_polling_timeout=10)
+        else:
+            logger.warning("TELEGRAM_BOT_TOKEN not configured. Telegram bot daemon skipped.")
+    except Exception as e:
+        logger.error(f"Telegram polling crashed: {e}")
 
 def main():
-    logger.info("==================================================")
-    logger.info("  WHOLESALE MRO AUTOMATION: SYSTEM INITIALIZING   ")
-    logger.info("  DOCK LOCATION: PARKLAND, FL STATION (LOCAL_HQ)  ")
-    logger.info("==================================================")
+    logger.info("Booting Wholesale MRO Engine v2.0...")
 
-    # Validate essential environment variables
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    # 1. Start Telegram Bot in background daemon thread
+    tg_thread = threading.Thread(target=start_telegram_daemon, daemon=True)
+    tg_thread.start()
 
-    if not bot_token:
-        logger.warning("[SECURITY] TELEGRAM_BOT_TOKEN is not set in environment.")
-    if not chat_id:
-        logger.warning("[SECURITY] TELEGRAM_CHAT_ID is not set in environment.")
+    # 2. Configure Cron Schedule (Eastern Time baseline)
+    schedule.every().day.at("07:00").do(run_morning_dispatch_job)
+    schedule.every().day.at("20:00").do(run_evening_digest_job)
 
-    # 1. Start Sniper in a background thread
-    sniper_thread = threading.Thread(target=run_scheduled_sniper, daemon=True)
-    sniper_thread.start()
-    logger.info("Deal Sniper background scanner thread active.")
+    logger.info("Schedules initialized: 07:00 AM Morning Dispatch, 20:00 PM Evening Digest.")
 
-    # 2. Run Telegram Polling Daemon in the foreground
-    # This keeps Railway's container running 24/7 and listens for button clicks
-    logger.info("Starting Telegram Polling Daemon on primary process...")
-    daemon = TelegramPollingDaemon()
-    daemon.run()
+    # 3. Main scheduler keep-alive loop
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
 
 if __name__ == "__main__":
     main()
