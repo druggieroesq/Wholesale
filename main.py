@@ -62,7 +62,11 @@ def start_telegram_daemon():
 
         logger.info("Purging old Telegram sessions / webhooks before starting listener...")
         try:
-            bot.remove_webhook(drop_pending_updates=True)
+            # Correct telebot syntax: delete_webhook accepts drop_pending_updates
+            if hasattr(bot, "delete_webhook"):
+                bot.delete_webhook(drop_pending_updates=True)
+            else:
+                bot.remove_webhook()
             time.sleep(2)
         except Exception as e:
             logger.warning(f"Webhook reset notice: {e}")
