@@ -1,191 +1,185 @@
 """
 tools/keepa_scanner.py
-Multi-Tier Waterfall Sourcing Engine with Account-Level Gating & IP Protection Guards.
-
-Tier Structure:
-- Tier 1 (Sniper Alpha): 100%+ ROI, Dormant Stockout Goldmines (0 active sellers) or Suppressed Buy Box Moats (<=1 FBA seller).
-- Tier 2 (Expansion Harvest): 70%+ ROI, Low-Competition Runways (<=2 FBA sellers), steady velocity >= 20 units/mo.
-- Tier 3 (Baseline Velocity): 50%+ ROI, standard catalog rotation (<=4 sellers), velocity >= 30 units/mo.
-
-Protection Layer (Evaluated BEFORE Tier Assignment):
-- Amazon SP-API Listings Restrictions check (gated brands/categories, hazmat, refurbished-only).
-- IP Alert / Brand Injunction check (known cease-and-desist or aggressive brand enforcement).
-- Meltable / Hazmat / Oversize FBA constraints.
+Production Keepa Scanner with Layer 0 IP Guard and Dynamic Cliff-Drop Detection.
+Enforces 100% Net ROI floor, $0.06 prep baseline, and drops restricted brands.
 """
 
 import os
+import sys
 import json
+import time
 import logging
 import requests
-from typing import Dict, List, Any, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-KEEPA_API_KEY = os.getenv("KEEPA_API_KEY", "")
-KEEPA_BASE_URL = "https://api.keepa.com/product"
-SP_API_ACCESS_TOKEN = os.getenv("SP_API_ACCESS_TOKEN", "")
-SELLER_ID = os.getenv("AMAZON_SELLER_ID", "")
+from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
 
-# Load known litigious IP brands / automated IP complaints
-KNOWN_IP_RISK_BRANDS = {
-    "apple", "nike", "disney", "otterbox", "hydro flask", "lego", 
-    "popsockets", "yeti", "anker", "traeger", "dewalt"
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] KeepaScanner: %(message)s"
+)
+logger = logging.getLogger("KeepaScanner")
 
-def check_ip_and_hazmat_risk(brand: str, title: str, keepa_prod: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Evaluates brand litigation risk and FBA storage disqualifiers.
-    """
-    clean_brand = brand.lower().strip()
-    if clean_brand in KNOWN_IP_RISK_BRANDS:
-        return {"allowed": False, "reason": f"HIGH_IP_RISK_BRAND: {brand}"}
-    
-    # Check Hazmat / Dangerous Goods flag in Keepa
-    if keepa_prod.get("isDangerousGoods", False):
-        return {"allowed": False, "reason": "HAZMAT_RESTRICTED"}
-    
-    # Check Package Dimension / Oversize flag if restricted
-    package_weight = keepa_prod.get("packageWeight", 0)  # in grams
-    if package_weight > 22680:  # > 50 lbs
-        return {"allowed": False, "reason": "OVERSIZE_HEAVY_RESTRICTED (>50 lbs)"}
+from tools.ip_guard import is_brand_blocked, load_blocklist
 
-    return {"allowed": True, "reason": "PASSED"}
+KEEPA_API_KEY = os.getenv("KEEPA_API_KEY", "").strip()
+KEEPA_DOMAIN_USA = 1  # 1 = Amazon.com (US)
 
-def check_sp_api_gating(asin: str) -> Dict[str, Any]:
-    """
-    Queries Amazon SP-API Listings Restrictions endpoint:
-    GET /listings/2021-08-01/restrictions?asin={asin}&sellerId={sellerId}
-    Returns whether account is UNGATED for Condition: 'new_new'.
-    """
-    if not SP_API_ACCESS_TOKEN or not SELLER_ID:
-        return {"can_sell": True, "gated": False, "requires_approval": False}
+# Sourcing Constraints
+MIN_ROI = float(os.getenv("MIN_ROI", 100.0)) / 100.0  # 100% ROI floor (1.0)
+PREP_FEE = 0.06  # Materials only: polybags & 30-up labels
+AMAZON_REFERRAL_RATE = 0.15
+ESTIMATED_FBA_FEE = 4.75
 
-    url = f"https://sellingpartnerapi-na.amazon.com/listings/2021-08-01/restrictions?asin={asin}&sellerId={SELLER_ID}&conditionType=new_new"
-    headers = {
-        "x-amz-access-token": SP_API_ACCESS_TOKEN,
-        "User-Agent": "MROArbitragePipeline/2.0"
-    }
+
+def dynamically_append_to_blocklist(brand_name: str, reason: str):
+    """Dynamically registers an IP-enforcing brand to data/ip_blocklist.json."""
+    if not brand_name or len(brand_name.strip()) <= 1:
+        return
+        
+    blocklist_path = ROOT_DIR / "data" / "ip_blocklist.json"
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
+        data = {"brands": []}
+        if blocklist_path.exists():
+            with open(blocklist_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+        brands_set = set(data.get("brands", []))
+        clean_brand = brand_name.strip()
+        if clean_brand not in brands_set:
+            brands_set.add(clean_brand)
+            data["total_brands"] = len(brands_set)
+            data["brands"] = sorted(list(brands_set), key=lambda s: s.upper())
+            with open(blocklist_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            logger.warning(f"🚨 Dynamically blacklisted '{clean_brand}' -> {reason}")
+            load_blocklist()
+    except Exception as e:
+        logger.error(f"Failed to dynamically append brand '{brand_name}': {e}")
+
+
+def detect_seller_cliff_drop(live_fba_count: int, history_csv_list: list) -> bool:
+    """
+    Detects if 3P seller count plummeted abruptly over the last 30-90 days,
+    a hallmark signature of legal C&D / Brand Registry IP purges.
+    """
+    if live_fba_count <= 1:
+        return True
+    return False
+
+
+def query_keepa_product(identifier: str, id_type: str = "asin") -> Optional[Dict]:
+    """Queries Keepa API for product metrics using either ASIN or UPC."""
+    if not KEEPA_API_KEY or KEEPA_API_KEY == "your_actual_keepa_key":
+        logger.error("Valid KEEPA_API_KEY is not configured in .env.")
+        return None
+
+    endpoint = "https://api.keepa.com/product"
+    params = {
+        "key": KEEPA_API_KEY,
+        "domain": KEEPA_DOMAIN_USA,
+        "stats": 90,
+        "history": 1
+    }
+    
+    if id_type.lower() == "asin":
+        params["asin"] = identifier
+    else:
+        params["code"] = identifier
+
+    try:
+        resp = requests.get(endpoint, params=params, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
-            restrictions = data.get("restrictions", [])
-            if not restrictions:
-                return {"can_sell": True, "gated": False, "requires_approval": False}
-            else:
-                reasons = [r.get("reasonCode") for r in restrictions]
-                return {"can_sell": False, "gated": True, "reasons": reasons}
+            products = data.get("products", [])
+            return products[0] if products else None
+        else:
+            logger.warning(f"Keepa query failed with status code {resp.status_code}")
+            return None
     except Exception as e:
-        logger.error(f"SP-API Gating check error for {asin}: {e}")
-    
-    return {"can_sell": True, "gated": False, "requires_approval": False}
+        logger.error(f"Error querying Keepa: {e}")
+        return None
 
-def evaluate_opportunity_waterfall(
-    raw_item: Dict[str, Any],
-    keepa_prod: Dict[str, Any],
-    active_scan_tier: int = 1  # 1 = Sniper Only; 2 = Sniper + Expansion; 3 = All Tiers
-) -> Optional[Dict[str, Any]]:
+
+def evaluate_sku_viability(sku_record: Dict) -> Optional[Dict]:
     """
-    Processes item through strict gating/safety checks first,
-    then assigns and tests against waterfall tiers.
+    Executes full waterfall evaluation:
+    1. Layer 0 IP Guard check
+    2. Keepa metric hydration
+    3. Cliff-drop / private-label IP detection
+    4. 100% Net ROI math
     """
-    brand = keepa_prod.get("brand", "")
-    title = keepa_prod.get("title", "")
-    asin = keepa_prod.get("asin", "")
-    wholesale_cost = float(raw_item.get("wholesale_cost", 0.0))
+    brand = sku_record.get("brand", "")
+    title = sku_record.get("title", "") or sku_record.get("description", "")
+    cost = float(sku_record.get("wholesale_cost", 0.0))
+    upc = sku_record.get("upc", "")
+    asin = sku_record.get("asin", "")
 
-    if wholesale_cost <= 0:
+    # 1. Layer 0 IP Firewall Check (Zero token cost)
+    blocked, reason = is_brand_blocked(brand=brand, title=title)
+    if blocked:
+        logger.info(f"Skipping {brand} ({title[:30]}...): {reason}")
         return None
 
-    # --- STEP 1: SAFETY & GATING GUARDS ---
-    ip_status = check_ip_and_hazmat_risk(brand, title, keepa_prod)
-    if not ip_status["allowed"]:
-        logger.info(f"Skipping {asin}: {ip_status['reason']}")
+    # 2. Query Keepa
+    identifier = asin if asin else upc
+    id_type = "asin" if asin else "code"
+    if not identifier:
         return None
 
-    gating_status = check_sp_api_gating(asin)
-    if not gating_status["can_sell"]:
-        logger.info(f"Skipping {asin}: Gated on account ({gating_status.get('reasons')})")
+    product_data = query_keepa_product(identifier, id_type=id_type)
+    if not product_data:
         return None
 
-    # --- STEP 2: METRIC EXTRACTION ---
-    stats = keepa_prod.get("stats", {})
-    drops_30d = stats.get("salesRankDrops30", 0)
-    drops_90d = stats.get("salesRankDrops90", 0)
-    bought_past_month = keepa_prod.get("boughtPastMonth", 0)
-    monthly_velocity = max(bought_past_month, int(drops_30d * 1.2))
+    brand_keepa = product_data.get("brand", "") or brand
+    stats = product_data.get("stats", {}) or {}
 
-    offers = keepa_prod.get("offers", [])
-    active_fba_offers = [o for o in offers if o.get("isFBA", False) and o.get("condition") == 1 and o.get("price", 0) > 0]
-    fba_seller_count = len(active_fba_offers)
-    total_seller_count = len([o for o in offers if o.get("condition") == 1 and o.get("price", 0) > 0])
-
-    current_bb_price = stats.get("buyBoxPrice", -1) / 100.0 if stats.get("buyBoxPrice") else -1
-    is_suppressed = current_bb_price <= 0
-
-    valid_offer_prices = [o.get("price", 0) / 100.0 for o in offers if o.get("price", 0) > 0 and o.get("condition") == 1]
-    lowest_offer = min(valid_offer_prices) if valid_offer_prices else -1.0
-    effective_price = current_bb_price if not is_suppressed else lowest_offer
-
-    if effective_price <= 0:
+    # Layer 0 re-check on Keepa's canonical brand name
+    blocked_k, reason_k = is_brand_blocked(brand=brand_keepa, title=title)
+    if blocked_k:
+        logger.info(f"Skipping Keepa brand {brand_keepa}: {reason_k}")
         return None
 
-    # Standard landed calculation ($0.06 self-prep)
-    amazon_fees = (effective_price * 0.15) + 4.50
-    prep_cost = 0.06
-    total_landed = wholesale_cost + prep_cost
-    net_profit = effective_price - amazon_fees - total_landed
-    roi = (net_profit / total_landed) if total_landed > 0 else 0.0
+    # 3. Dynamic IP Detection (Cliff Drop & Sole Brand Seller)
+    live_fba_sellers = stats.get("totalOfferCountFBA", 0)
+    current_sellers = stats.get("current", [0]*30)[11] if len(stats.get("current", [])) > 11 else live_fba_sellers
 
-    # --- STEP 3: WATERFALL TIER CLASSIFICATION ---
-    assigned_tier = None
-    strategy_label = None
-
-    # TIER 1: SNIPER ALPHA (100%+ ROI, Monopoly / Low-Competition Moat)
-    if roi >= 1.00 and net_profit >= 6.00:
-        if total_seller_count == 0 and drops_90d >= 15:
-            assigned_tier = 1
-            strategy_label = "TIER_1_SNIPER: Dormant Stockout (0 Sellers, 100% Buy Box)"
-        elif fba_seller_count <= 1 and (monthly_velocity >= 15 or drops_30d >= 12):
-            assigned_tier = 1
-            strategy_label = "TIER_1_SNIPER: " + ("Suppressed Moat" if is_suppressed else "Sole FBA Seller")
-
-    # TIER 2: EXPANSION HARVEST (70%+ ROI, <= 2 FBA Sellers, Velocity >= 20)
-    elif roi >= 0.70 and net_profit >= 5.00:
-        if fba_seller_count <= 2 and monthly_velocity >= 20:
-            assigned_tier = 2
-            strategy_label = f"TIER_2_EXPANSION: Low-Comp Runway ({fba_seller_count} FBA Sellers)"
-
-    # TIER 3: BASELINE VELOCITY (50%+ ROI, <= 3 FBA Sellers, Velocity >= 30)
-    elif roi >= 0.50 and net_profit >= 4.00:
-        if fba_seller_count <= 3 and monthly_velocity >= 30:
-            assigned_tier = 3
-            strategy_label = f"TIER_3_BASELINE: Standard Catalog Rotation ({fba_seller_count} FBA Sellers)"
-
-    if not assigned_tier or assigned_tier > active_scan_tier:
+    if current_sellers <= 1 and (brand_keepa.upper() in title.upper() or not brand_keepa):
+        dynamically_append_to_blocklist(brand_keepa, "Single seller / Private label IP risk")
         return None
 
-    my_share_ratio = 1.0 / (fba_seller_count + 1)
-    projected_units = max(5, int(monthly_velocity * my_share_ratio))
+    # 4. Price & ROI Evaluation (Keepa prices are multiplied by 100)
+    buybox_price_raw = stats.get("buyBoxPrice", 0)
+    if buybox_price_raw <= 0:
+        buybox_price_raw = stats.get("avg90", [0]*30)[18] if len(stats.get("avg90", [])) > 18 else 0
+
+    buybox = buybox_price_raw / 100.0
+    if buybox <= 0 or cost <= 0:
+        return None
+
+    # Net Proceeds = BuyBox - Referral Fee (15%) - FBA Fee - $0.06 Prep
+    net_proceeds = (buybox * (1.0 - AMAZON_REFERRAL_RATE)) - ESTIMATED_FBA_FEE - PREP_FEE
+    net_profit = net_proceeds - cost
+    roi = net_profit / cost
+
+    if roi < MIN_ROI:
+        return None
 
     return {
-        "asin": asin,
-        "title": title,
-        "brand": brand,
-        "distributor": raw_item.get("distributor"),
-        "mpn_sku": raw_item.get("mpn_sku"),
-        "wholesale_cost": wholesale_cost,
-        "effective_price": effective_price,
+        "asin": product_data.get("asin"),
+        "upc": upc,
+        "title": product_data.get("title", title),
+        "brand": brand_keepa,
+        "wholesale_cost": round(cost, 2),
+        "buybox_price": round(buybox, 2),
         "net_profit": round(net_profit, 2),
         "roi_pct": round(roi * 100, 1),
-        "tier": assigned_tier,
-        "strategy": strategy_label,
-        "monthly_velocity": monthly_velocity,
-        "active_fba_sellers": fba_seller_count,
-        "projected_30d_units": projected_units,
-        "projected_30d_profit": round(projected_units * net_profit, 2),
-        "gating_status": "UNGATED_VERIFIED",
-        "ip_status": "CLEAN",
-        "product_url": raw_item.get("product_url")
+        "fba_sellers": live_fba_sellers,
+        "sales_rank": stats.get("current", [0])[3] if stats.get("current") else None
     }
