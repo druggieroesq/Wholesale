@@ -1,80 +1,98 @@
+"""
+tools/rolling_catalog_cycler.py
+Phased Sourcing Cycler for Keepa API (Starter 20 Tokens/Min Compliant).
+- Phase 1: Deep scan across Industrial & Scientific and Tools & Hardware.
+- Phase 2: Cycles into Commercial Consumables, Safety, and Plumbing.
+- Enforces Supply Vacuums: Amazon OOS, FBA sellers <= 1, Buy Box >= $30.
+- No BSR rank caps — driven by verified demand and 100% Net ROI floor.
+- Integrated Layer 0 IP Guard (659+ protected brands).
+"""
+
 import os
 import sys
 import time
 import json
 import logging
 import requests
-from datetime import datetime
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
 
 from tools.master_vacuum_engine import MasterVacuumEngine
 from tools.telegram_action_handler import TelegramActionHandler
 from tools.sku_resolver import SKUResolver
-from tools.git_state_sync import GitStateSync
+from tools.ip_guard import is_brand_blocked
+from tools.logistics_engine import LogisticsEngine
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("RollingCatalogCycler")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] RollingCycler: %(message)s")
+logger = logging.getLogger("RollingCycler")
 
 MAX_FBA_WEIGHT_GRAMS = 20411    # 45.0 lbs ceiling
 MAX_FBA_DIMENSION_MM = 609      # 24.0 inches ceiling
 
+
 class RollingCatalogCycler:
-    """
-    Continuous 72-Hour Rolling Sourcing Radar:
-    - Rotates across 12 commercial sectors.
-    - Applies Amazon physical limits to Keepa queries.
-    - Paces requests to preserve token budget.
-    - Targets 2-3 vetted acquisitions per day.
-    """
     QUERY_API = "https://api.keepa.com/query"
     PRODUCT_API = "https://api.keepa.com/product"
 
-    SECTORS = [
-        {"day": 1, "name": "Industrial Hardware & Valves", "cat_id": "16310091", "max_weight_g": 2268},
-        {"day": 1, "name": "Janitorial & Sanitation MRO", "cat_id": "16310161", "max_weight_g": 2268},
-        {"day": 1, "name": "Automotive Specialty Tools", "cat_id": "15684181", "max_weight_g": 1814},
-        {"day": 1, "name": "Commercial Electrical & Fittings", "cat_id": "495318", "max_weight_g": 1814},
+    # Phased Category Progression
+    # Phase 1: Deep Industrial, Scientific & Tool sectors
+    # Phase 2: Broader expansion after Phase 1 inventory is fully indexed
+    PRIMARY_PHASE_1_SECTORS = [
+        {"phase": 1, "name": "Industrial Hardware, Fasteners & Valves", "cat_id": "16310091", "max_weight_g": 6800},
+        {"phase": 1, "name": "Industrial & Scientific Supplies (MRO)", "cat_id": "16310161", "max_weight_g": 9070},
+        {"phase": 1, "name": "Power & Hand Tools Commercial", "cat_id": "228013", "max_weight_g": 6800},
+        {"phase": 1, "name": "Commercial Electrical Fittings & Conduit", "cat_id": "495318", "max_weight_g": 4536},
+        {"phase": 1, "name": "Pneumatic & Hydraulic Equipment", "cat_id": "383599011", "max_weight_g": 6800},
+        {"phase": 1, "name": "Industrial Janitorial & Sanitation", "cat_id": "16310181", "max_weight_g": 9070}
+    ]
 
-        {"day": 2, "name": "Professional Salon & Toners", "cat_id": "11055981", "max_weight_g": 907},
-        {"day": 2, "name": "Bulk Herbs, Botanicals & Spices", "cat_id": "16310101", "max_weight_g": 1360},
-        {"day": 2, "name": "Commercial Kitchen & Barista Parts", "cat_id": "284507", "max_weight_g": 1360},
-        {"day": 2, "name": "Aromatherapy & Essential Oils", "cat_id": "3760911", "max_weight_g": 907},
-
-        {"day": 3, "name": "Specialty Sports Gear Consumables", "cat_id": "3375251", "max_weight_g": 2268},
-        {"day": 3, "name": "Precision Optics & Lab Consumables", "cat_id": "318603011", "max_weight_g": 1360},
-        {"day": 3, "name": "HVAC Consumables & Filtration", "cat_id": "3206324011", "max_weight_g": 2268},
-        {"day": 3, "name": "Plumbing Specialty Valves", "cat_id": "680345011", "max_weight_g": 2268}
+    EXPANSION_PHASE_2_SECTORS = [
+        {"phase": 2, "name": "Commercial HVAC & Air Quality", "cat_id": "3206324011", "max_weight_g": 4536},
+        {"phase": 2, "name": "Commercial Plumbing Specialty", "cat_id": "680345011", "max_weight_g": 4536},
+        {"phase": 2, "name": "Commercial Kitchen & Foodservice Parts", "cat_id": "284507", "max_weight_g": 3628},
+        {"phase": 2, "name": "Specialty Consumables & Lab Ware", "cat_id": "318603011", "max_weight_g": 2268}
     ]
 
     def __init__(self):
         self.api_key = os.getenv("KEEPA_API_KEY", "").strip()
-        self.engine = MasterVacuumEngine(prep_override=0.35)
+        # Uses updated $0.06 prep baseline and 100% ROI floor
+        self.engine = MasterVacuumEngine(prep_override=0.06)
         self.telegram = TelegramActionHandler()
         self.resolver = SKUResolver()
-        self.syncer = GitStateSync()
-        self.safety_token_floor = 25
+        self.logistics = LogisticsEngine()
+        self.safety_token_floor = 15
+        self.active_phase = 1
 
-    def scan_sector(self, sector: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if not self.api_key:
-            logger.info(f"[Dry Run] Simulating checks for: {sector['name']}")
+    def scan_sector_vacuums(self, sector: Dict[str, Any]) -> List[str]:
+        """
+        Executes bulk /query to pull supply vacuums for ~10 tokens.
+        No BSR caps — isolates listings where Amazon is OOS and 3P FBA <= 1.
+        """
+        if not self.api_key or self.api_key == "your_actual_keepa_key":
+            logger.warning(f"[Dry Run] Keepa API Key not configured. Skipping live scan for {sector['name']}.")
             return []
 
         weight_cap_g = min(sector.get("max_weight_g", MAX_FBA_WEIGHT_GRAMS), MAX_FBA_WEIGHT_GRAMS)
 
         payload = {
             "categories_include": [sector["cat_id"]],
-            "current_COUNT_NEW_gte": 0,
-            "current_COUNT_NEW_lte": 0,
-            "current_SALES_gte": 1,
-            "current_SALES_lte": 80000,
+            "current_AMAZON": -1,              # Amazon 1P is completely Out of Stock
+            "current_COUNT_NEW_lte": 1,        # 0 or 1 competitor (Supply Vacuum)
+            "avg90_BUY_BOX_gte": 3000,         # Minimum $30 Buy Box price
             "packageWeight_lte": weight_cap_g,
             "packageLength_lte": MAX_FBA_DIMENSION_MM,
             "packageWidth_lte": MAX_FBA_DIMENSION_MM,
             "packageHeight_lte": MAX_FBA_DIMENSION_MM,
             "hasReviews": True,
-            "buyBoxSellerId": "none",
-            "sort": [["current_SALES", "asc"]],
-            "perPage": 30
+            "sort": [["current_SALES", "asc"]], # Priority by velocity, NO hard cutoff
+            "perPage": 25
         }
 
         params = {"key": self.api_key, "domain": "1", "selection": json.dumps(payload)}
@@ -83,19 +101,20 @@ class RollingCatalogCycler:
             res = requests.get(self.QUERY_API, params=params, timeout=30)
             data = res.json()
             tokens_left = data.get("tokensLeft", 100)
-            logger.info(f"Sector: {sector['name']} | Keepa Tokens Available: {tokens_left}")
+            logger.info(f"Sector: {sector['name']} | Keepa Tokens Left: {tokens_left}")
 
             if tokens_left < self.safety_token_floor:
-                logger.warning(f"Tokens low ({tokens_left}). Pausing for regeneration...")
-                time.sleep(60)
+                sleep_secs = 60
+                logger.warning(f"Tokens low ({tokens_left} < {self.safety_token_floor}). Pausing {sleep_secs}s to regenerate...")
+                time.sleep(sleep_secs)
 
-            asin_list = data.get("asinList", [])
-            return self.fetch_product_details(asin_list[:15], sector)
+            return data.get("asinList", [])[:15]
         except Exception as e:
             logger.error(f"Error querying sector {sector['name']}: {e}")
             return []
 
-    def fetch_product_details(self, asins: List[str], sector: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def hydrate_and_screen_asins(self, asins: List[str], sector: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Hydrates product metrics and screens brands through Layer 0 IP Guard."""
         if not asins:
             return []
 
@@ -103,74 +122,112 @@ class RollingCatalogCycler:
             "key": self.api_key,
             "domain": "1",
             "asin": ",".join(asins),
-            "stats": "1",
+            "stats": "90",
             "history": "0"
         }
 
         try:
             res = requests.get(self.PRODUCT_API, params=params, timeout=30)
             products = res.json().get("products", [])
-            leads = []
+            screened_leads = []
 
             for p in products:
                 asin = p.get("asin")
-                title = p.get("title", "Commercial Item")
-                brand = p.get("brand", "Unknown")
-                stats = p.get("stats", {})
+                title = p.get("title", "")
+                brand = p.get("brand", "")
+                stats = p.get("stats", {}) or {}
+
+                # 1. Layer 0 IP Guard Filter
+                blocked, reason = is_brand_blocked(brand=brand, title=title)
+                if blocked:
+                    logger.debug(f"IP Dropped: {brand} ({reason})")
+                    continue
 
                 pkg_g = p.get("packageWeight", 0)
                 if pkg_g > MAX_FBA_WEIGHT_GRAMS:
                     continue
 
+                # Pricing: Buy Box cents or fallback to New price
                 bb_cents = stats.get("buyBoxPrice", -1)
-                new_cents = stats.get("current", [None]*2)[1] if stats.get("current") else -1
+                new_cents = stats.get("current", [None] * 2)[1] if stats.get("current") else -1
                 price_cents = bb_cents if bb_cents > 0 else new_cents
-
                 if price_cents <= 0:
                     continue
 
                 amz_price = round(price_cents / 100.0, 2)
-                est_wholesale_cost = round(amz_price * 0.45, 2)
+                weight_lbs = round(pkg_g / 453.6, 2) if pkg_g else 1.5
 
-                leads.append({
+                # Calculate Maximum Allowable Cost (MAC) for 100% Net ROI
+                route = self.logistics.route_purchase_order(
+                    vendor_key="regional_supplier",
+                    unit_cost=amz_price * 0.35,
+                    weight_lbs=weight_lbs
+                )
+                overhead = route["total_fulfillment_overhead"]
+                
+                # Math: Wholesale Cost <= (AmzPrice * 0.85 - FBAFee - 2*Overhead) / 2
+                fba_fee = self.engine.estimate_fba_fee(weight_lbs)
+                net_ceiling = (amz_price * 0.85) - fba_fee - (2.0 * overhead)
+                max_allowable_cost = max(0.0, round(net_ceiling / 2.0, 2))
+
+                if max_allowable_cost < 3.0:
+                    continue
+
+                screened_leads.append({
                     "asin": asin,
                     "title": title,
                     "brand": brand,
                     "mpn": p.get("mpn", ""),
                     "amazon_price": amz_price,
-                    "cost": est_wholesale_cost,
-                    "sales_rank": stats.get("salesRankDrop30", 30000),
+                    "cost": max_allowable_cost,  # Evaluates at the 100% ROI ceiling
+                    "max_allowable_cost": max_allowable_cost,
+                    "fba_sellers": stats.get("totalOfferCountFBA", 0),
+                    "amazon_in_stock": False,
                     "sector": sector["name"],
-                    "package_weight_lbs": round(pkg_g / 453.6, 2) if pkg_g else 1.5,
+                    "package_weight_lbs": weight_lbs,
                     "max_dimension_inches": round(max(p.get("packageLength", 0), p.get("packageWidth", 0), p.get("packageHeight", 0)) / 25.4, 2)
                 })
 
-            return leads
+            return screened_leads
         except Exception as e:
-            logger.error(f"Error reading ASIN batch: {e}")
+            logger.error(f"Error hydrating ASIN batch: {e}")
             return []
 
-    def run_continuous_72h_cycle(self):
-        logger.info("Starting 72-Hour Rolling Catalog Cycler...")
-        sector_idx = 0
+    def run_phased_sourcing_loop(self):
+        """Continuously cycles through target sectors at 20 tokens/min."""
+        logger.info("Initializing Phased Sourcing Cycler...")
+        sectors_queue = self.PRIMARY_PHASE_1_SECTORS.copy()
+        current_idx = 0
 
         while True:
-            sector = self.SECTORS[sector_idx]
-            logger.info(f"[Day {sector['day']}] Scanning {sector['name']}...")
+            sector = sectors_queue[current_idx]
+            logger.info(f"[Phase {sector['phase']}] Scanning sector: {sector['name']}")
 
-            leads = self.scan_sector(sector)
-            if leads:
-                viable = self.engine.process_catalog(leads)
-                if viable:
-                    top_pick = viable[0]
-                    self.telegram.send_deal_card(top_pick)
-                    logger.info(f"Dispatched candidate: {top_pick['asin']} ({top_pick['title'][:35]})")
+            candidate_asins = self.scan_sector_vacuums(sector)
+            if candidate_asins:
+                leads = self.hydrate_and_screen_asins(candidate_asins, sector)
+                if leads:
+                    viable = self.engine.process_catalog(leads)
+                    if viable:
+                        top_pick = viable[0]
+                        self.telegram.send_deal_card(top_pick)
+                        logger.info(f"Dispatched Deal: {top_pick['brand']} | {top_pick['asin']} (MAC: ${top_pick['wholesale_cost']})")
 
-            sector_idx = (sector_idx + 1) % len(self.SECTORS)
-            logger.info("Resting 45 seconds for Keepa token regeneration...")
-            time.sleep(45)
+            current_idx += 1
+            # When Phase 1 sectors are fully traversed, append Phase 2 expansion
+            if current_idx >= len(sectors_queue):
+                current_idx = 0
+                if self.active_phase == 1:
+                    logger.info("Phase 1 sweep complete. Adding Phase 2 expansion sectors to rotation.")
+                    sectors_queue.extend(self.EXPANSION_PHASE_2_SECTORS)
+                    self.active_phase = 2
+
+            # Pace requests for Starter plan (20 tokens/min)
+            sleep_duration = 35
+            logger.info(f"Pacing loop: sleeping {sleep_duration}s for token regeneration...")
+            time.sleep(sleep_duration)
 
 
 if __name__ == "__main__":
     cycler = RollingCatalogCycler()
-    cycler.run_continuous_72h_cycle()
+    cycler.run_phased_sourcing_loop()
