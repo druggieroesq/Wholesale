@@ -10,6 +10,7 @@ import json
 import time
 import logging
 import threading
+import subprocess
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import schedule
@@ -68,7 +69,21 @@ def run_scheduler_daemon():
         schedule.run_pending()
         time.sleep(30)
 
-# 2. Native Telegram Webhook Request Handler
+# 2. Autonomous Catalog Scan & Ingestion Daemon
+def run_catalog_pipeline_daemon():
+    """Monitors incoming directory and triggers batch processing in the background."""
+    time.sleep(5)  # Allow HTTP server and webhook registration to stabilize
+    runner_script = PROJECT_ROOT / "run_all_catalogs.sh"
+    if runner_script.exists():
+        logger.info("Catalog pipeline daemon active: launching batch runner...")
+        try:
+            subprocess.run(["/bin/bash", str(runner_script)], check=False)
+        except Exception as e:
+            logger.error(f"Error executing catalog pipeline: {e}")
+    else:
+        logger.warning(f"Runner script not found at {runner_script}")
+
+# 3. Native Telegram Webhook Request Handler
 class TelegramWebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
@@ -102,7 +117,6 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        # Suppress routine health check console noise
         return
 
 def setup_telegram_webhook():
@@ -124,10 +138,14 @@ def main():
     scheduler_thread = threading.Thread(target=run_scheduler_daemon, daemon=True)
     scheduler_thread.start()
 
+    # Start catalog scanner daemon in background
+    pipeline_thread = threading.Thread(target=run_catalog_pipeline_daemon, daemon=True)
+    pipeline_thread.start()
+
     # Register webhook with Telegram
     setup_telegram_webhook()
 
-    # Bind HTTP listener to Railway's assigned port
+    # Bind HTTP listener to Railway assigned port
     port = int(os.getenv("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), TelegramWebhookHandler)
     logger.info(f"HTTP Webhook listener active on port {port}.")
