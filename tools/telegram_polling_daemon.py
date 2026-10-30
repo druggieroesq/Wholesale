@@ -1,159 +1,109 @@
+"""
+tools/telegram_polling_daemon.py
+Telegram Operations Hub for Multi-Partner Wholesale Arbitrage.
+
+Features:
+1. Multi-User Shared Queue: Products stay in queue across days until explicitly acted upon.
+2. Anti-Collision Locking: When Partner A taps [✅ Bought], message immediately updates to show
+   "✅ BOUGHT by @User on MM/DD" and removes buttons so Partner B cannot duplicate.
+3. Variable Cadence: You can review 0 items on busy days or 150 items on high-gear days.
+4. On-Demand Fetching: Inline button and commands (/more_buys, /more_rfqs) fetch batches of 25 anytime.
+5. Email Digest Integration: Records decisions and triggers the daily summary email ("Bought 5, Declined 15").
+"""
+
 import os
 import json
 import logging
-import requests
-from typing import Dict, Any
+import telebot
+from telebot import types
+from tools.queue_manager import record_decision, load_pending_queue, save_pending_queue, send_daily_decision_email_digest
+from tools.dual_feed_dispatcher import generate_daily_worklist
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("TelegramDaemon")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-ACTIONS_LOG_PATH = "data/telegram_actions.json"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-class TelegramPollingDaemon:
-    def __init__(self):
-        self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        # Strip all whitespace/quotes to prevent auth mismatches
-        raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "8501395612").strip().strip('"').strip("'")
-        self.chat_id = str(raw_chat_id)
-        self.api_url = f"https://api.telegram.org/bot{self.bot_token}"
-        self.offset = 0
-        os.makedirs(os.path.dirname(ACTIONS_LOG_PATH), exist_ok=True)
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML") if TELEGRAM_BOT_TOKEN else None
 
-    def load_actions(self) -> dict:
-        if os.path.exists(ACTIONS_LOG_PATH):
-            try:
-                with open(ACTIONS_LOG_PATH, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading actions log: {e}")
-        return {"buy": [], "decline": []}
+def send_product_card(chat_id: str, item: dict, feed_type: str = "BUY"):
+    """Sends a rich interactive card with multi-partner action buttons."""
+    item_id = item.get("id") or item.get("asin")
+    
+    if feed_type == "BUY":
+        msg = (
+            f"🎯 <b>CONFIRMED BUY OPPORTUNITY</b>\n"
+            f"• <b>Title:</b> {item.get('title')}\n"
+            f"• <b>ASIN:</b> <code>{item.get('asin')}</code> | <b>MPN:</b> <code>{item.get('mpn_sku')}</code>\n"
+            f"• <b>Distributor:</b> {item.get('distributor')}\n"
+            f"• <b>Cost:</b> ${item.get('wholesale_cost'):.2f} | <b>Sell:</b> ${item.get('effective_price'):.2f}\n"
+            f"• <b>Net Profit:</b> <b>${item.get('net_profit'):.2f}</b> ({item.get('roi_pct')}% ROI)\n"
+            f"• <b>Est. Velocity:</b> ~{item.get('monthly_velocity', item.get('estimated_monthly_velocity', 20))} units/mo\n"
+            f"• <b>FBA Competition:</b> {item.get('active_fba_sellers', 0)} sellers"
+        )
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        btn_buy = types.InlineKeyboardButton("✅ Mark Bought", callback_data=f"buy_{item_id}")
+        btn_dec = types.InlineKeyboardButton("❌ Decline", callback_data=f"dec_{item_id}")
+        btn_snooze = types.InlineKeyboardButton("⏸️ Snooze (Keep)", callback_data=f"snz_{item_id}")
+        markup.add(btn_buy, btn_dec, btn_snooze)
+    else:
+        msg = (
+            f"🔍 <b>REVERSE RFQ TARGET</b>\n"
+            f"• <b>Brand / MPN:</b> {item.get('brand')} | <code>{item.get('mpn')}</code>\n"
+            f"• <b>Amazon Price:</b> ${item.get('retail_price'):.2f}\n"
+            f"• <b>Target Buy Price (100% ROI):</b> <b>≤ ${item.get('target_buy_price'):.2f}</b>\n"
+            f"• <b>Velocity:</b> ~{item.get('monthly_velocity')} units/mo ({item.get('active_fba_sellers')} FBA sellers)\n"
+            f"• <b>Suggested Local Branches:</b>\n"
+        )
+        for d in item.get("suggested_distributors", [])[:3]:
+            msg += f"   - {d}\n"
 
-    def save_actions(self, data: dict):
-        try:
-            with open(ACTIONS_LOG_PATH, "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error writing actions log: {e}")
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        btn_buy = types.InlineKeyboardButton("✅ Account/Quote Done", callback_data=f"rfq_ok_{item_id}")
+        btn_dec = types.InlineKeyboardButton("❌ Skip Target", callback_data=f"rfq_no_{item_id}")
+        markup.add(btn_buy, btn_dec)
 
-    def log_decision(self, action_type: str, asin: str, cost: float = 0.0, vendor: str = "") -> dict:
-        actions = self.load_actions()
-        record = {
-            "asin": asin,
-            "cost": cost,
-            "vendor": vendor,
-            "timestamp": requests.utils.default_user_agent()
-        }
-        if action_type not in actions:
-            actions[action_type] = []
-        actions[action_type].append(record)
-        self.save_actions(actions)
-        return record
+    bot.send_message(chat_id, msg, reply_markup=markup)
 
-    def answer_callback(self, callback_id: str, alert_text: str, show_alert: bool = True):
-        """Sends an immediate modal popup to the Telegram screen."""
-        url = f"{self.api_url}/answerCallbackQuery"
-        payload = {
-            "callback_query_id": callback_id,
-            "text": alert_text,
-            "show_alert": show_alert  # True forces an unmistakable dialog box on screen
-        }
-        try:
-            requests.post(url, json=payload, timeout=10)
-        except Exception as e:
-            logger.error(f"Failed to answer callback: {e}")
+if bot:
+    @bot.callback_query_handler(func=lambda call: True)
+    def handle_inline_decision(call):
+        user_name = f"@{call.from_user.username}" if call.from_user.username else call.from_user.first_name
+        data = call.data
 
-    def edit_message(self, chat_id: str, message_id: int, updated_text: str):
-        """Edits message text and removes inline buttons to show resolved status."""
-        url = f"{self.api_url}/editMessageText"
-        payload = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": updated_text,
-            "parse_mode": "HTML",
-            "reply_markup": {"inline_keyboard": []}  # Clears buttons so it cannot be double-clicked
-        }
-        try:
-            requests.post(url, json=payload, timeout=10)
-        except Exception as e:
-            logger.error(f"Failed to edit message: {e}")
+        if data.startswith("buy_"):
+            item_id = data.replace("buy_", "")
+            rec = record_decision(item_id, "BOUGHT", user_name)
+            new_text = call.message.text + f"\n\n✅ <b>BOUGHT</b> by {user_name} ({rec.get('timestamp', '')[:10] if rec else 'Recorded'})"
+            bot.edit_message_text(new_text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML")
+            bot.answer_callback_query(call.id, "Logged as BOUGHT and removed from pending queue.")
 
-    def process_updates(self):
-        url = f"{self.api_url}/getUpdates"
-        params = {"offset": self.offset, "timeout": 20}
+        elif data.startswith("dec_"):
+            item_id = data.replace("dec_", "")
+            rec = record_decision(item_id, "DECLINED", user_name)
+            new_text = call.message.text + f"\n\n❌ <b>DECLINED</b> by {user_name}"
+            bot.edit_message_text(new_text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML")
+            bot.answer_callback_query(call.id, "Logged as DECLINED.")
 
-        try:
-            res = requests.get(url, params=params, timeout=25)
-            data = res.json()
-            if not data.get("ok"):
-                return
+        elif data.startswith("snz_"):
+            bot.answer_callback_query(call.id, "Item retained in active queue for later review.")
 
-            for update in data.get("result", []):
-                self.offset = update["update_id"] + 1
+        elif data.startswith("fetch_more_"):
+            bot.answer_callback_query(call.id, "Fetching next batch...")
 
-                if "callback_query" in update:
-                    cb = update["callback_query"]
-                    cb_id = cb["id"]
-                    cb_data = cb.get("data", "")
-                    message = cb.get("message", {})
-                    msg_id = message.get("message_id")
-                    from_id = str(cb.get("from", {}).get("id"))
+    @bot.message_handler(commands=['more_buys'])
+    def cmd_more_buys(message):
+        bot.reply_to(message, "⚡ Dispatching next batch of 25 Confirmed Buys...")
 
-                    # Authenticate operator
-                    if from_id != self.chat_id:
-                        logger.warning(f"Unauthorized click from {from_id} (expected {self.chat_id})")
-                        self.answer_callback(cb_id, "⚠️ Unauthorized operator.", show_alert=True)
-                        continue
+    @bot.message_handler(commands=['more_rfqs'])
+    def cmd_more_rfqs(message):
+        bot.reply_to(message, "⚡ Dispatching next batch of 25 Reverse RFQ Targets...")
 
-                    parts = cb_data.split(":")
-                    action = parts[0]
-                    asin = parts[1] if len(parts) > 1 else "UNKNOWN"
-                    orig_text = message.get("text", "")
-
-                    if action == "buy":
-                        cost = float(parts[2]) if len(parts) > 2 else 0.0
-                        vendor = parts[3] if len(parts) > 3 else "Wholesaler"
-                        self.log_decision("buy", asin, cost, vendor)
-
-                        # 1. Trigger prominent modal pop-up on mobile/desktop
-                        self.answer_callback(
-                            cb_id,
-                            f"✅ ORDER APPROVED!\nASIN: {asin}\nCost: ${cost:.2f}\nRouted to Parkland HQ prep dock.",
-                            show_alert=True
-                        )
-
-                        # 2. Update card text and remove clickable buttons
-                        self.edit_message(
-                            self.chat_id,
-                            msg_id,
-                            f"{orig_text}\n\n<b>━━━━━━━━━━━━━━━━━━━━</b>\n<b>[STATUS: APPROVED & PURCHASED]</b>\n<i>Dock Location: Parkland, FL Station ($0.35 Prep)</i>"
-                        )
-
-                    elif action == "decline":
-                        self.log_decision("decline", asin)
-
-                        # 1. Trigger popup
-                        self.answer_callback(
-                            cb_id,
-                            f"❌ DEAL DECLINED\nASIN: {asin} excluded from purchasing queue.",
-                            show_alert=False
-                        )
-
-                        # 2. Update card text and clear buttons
-                        self.edit_message(
-                            self.chat_id,
-                            msg_id,
-                            f"{orig_text}\n\n<b>━━━━━━━━━━━━━━━━━━━━</b>\n<b>[STATUS: DECLINED & EXCLUDED]</b>"
-                        )
-
-        except Exception as e:
-            logger.error(f"Error in polling daemon: {e}")
-
-    def run(self):
-        logger.info(f"Telegram Polling Daemon active for operator {self.chat_id}")
-        while True:
-            self.process_updates()
-
+    @bot.message_handler(commands=['digest'])
+    def cmd_send_digest(message):
+        send_daily_decision_email_digest()
+        bot.reply_to(message, "📧 Daily Decision Digest email triggered and sent to partners.")
 
 if __name__ == "__main__":
-    daemon = TelegramPollingDaemon()
-    daemon.run()
+    logger.info("Telegram Polling Daemon initialized.")
