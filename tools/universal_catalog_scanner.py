@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import sys
 import time
 import json
@@ -22,8 +23,12 @@ KEEPA_KEY = os.getenv("KEEPA_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MIN_ROI = float(os.getenv("MIN_ROI", 0.50))
+
 REPORTS_DIR = Path("/app/data/reports")
+CHECKPOINTS_DIR = Path("/app/data/checkpoints")
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def dispatch_telegram_alert(deal: dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -32,8 +37,9 @@ def dispatch_telegram_alert(deal: dict):
         f"🔥 *QUALIFIED DEAL FOUND*\n\n"
         f"📦 *Product:* {deal.get('title')}\n"
         f"🏷 *Distributor:* {deal.get('vendor')} | *SKU:* `{deal.get('sku')}`\n"
-        f"🆔 *ASIN:* `{deal.get('asin')}`\n\n"
-        f"💵 *Wholesale Cost:* ${deal.get('wholesale_cost'):.2f}\n"
+        f"🆔 *ASIN:* `{deal.get('asin')}`\n"
+        f"📦 *Pack Size:* {deal.get('pack_size')}\n\n"
+        f"💵 *Unit Cost:* ${deal.get('unit_cogs'):.2f} (Total COGS: ${deal.get('total_cogs'):.2f})\n"
         f"🛒 *Amazon Price:* ${deal.get('amazon_price'):.2f}\n"
         f"📈 *Net ROI:* *{deal.get('roi_pct'):.1f}%*\n"
         f"💰 *Net Profit:* *${deal.get('net_profit'):.2f}*\n"
@@ -45,6 +51,28 @@ def dispatch_telegram_alert(deal: dict):
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
         logger.error(f"Telegram dispatch failed: {e}")
+
+
+def extract_pack_size(keepa_product: dict) -> int:
+    """Extracts pack size from Keepa metadata and listing title to prevent multipack ROI inflation."""
+    pkg_qty = keepa_product.get("packageQuantity") or keepa_product.get("numberOfItems")
+    if isinstance(pkg_qty, (int, float)) and 1 < pkg_qty <= 144:
+        return int(pkg_qty)
+
+    title = keepa_product.get("title", "") or ""
+    patterns = [
+        r"(?:pack|count|ct|pk|case of|carton of)\s*(?:of)?\s*(\d+)",
+        r"(\d+)\s*-(?:pack|pk|count|ct)",
+        r"\((\d+)\s*(?:pack|count|pieces|pk)\)"
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, title, re.IGNORECASE)
+        if m:
+            qty = int(m.group(1))
+            if 1 < qty <= 144:
+                return qty
+    return 1
+
 
 def detect_file_and_read(file_path: str) -> pd.DataFrame:
     if file_path.endswith((".xlsx", ".xls")):
@@ -69,6 +97,7 @@ def detect_file_and_read(file_path: str) -> pd.DataFrame:
                 continue
         return pd.read_csv(file_path, dtype=str)
 
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     col_map = {}
     for col in df.columns:
@@ -90,6 +119,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         df_clean[standard_col] = df[orig_col]
     return df_clean
 
+
 def query_keepa_batch(upcs: list) -> tuple:
     codes = ",".join(upcs)
     url = f"https://api.keepa.com/product?key={KEEPA_KEY}&domain=1&code={codes}"
@@ -98,16 +128,17 @@ def query_keepa_batch(upcs: list) -> tuple:
             r = requests.get(url, timeout=30)
             data = r.json()
             if r.status_code == 429:
-                wait_sec = data.get("refillIn", 60000) / 1000.0
+                wait_sec = data.get("refillIn", 30000) / 1000.0
                 logger.warning(f"Keepa 429 (Tokens exhausted). Pausing {int(wait_sec)}s for refill...")
-                time.sleep(max(wait_sec, 45))
+                time.sleep(max(wait_sec, 20))
                 continue
             tokens_left = data.get("tokensLeft", 0)
             products = data.get("products") or []
             return products, tokens_left
         except Exception as e:
-            logger.error(f"Keepa network error: {e}. Retrying in 15s...")
-            time.sleep(15)
+            logger.error(f"Keepa network error: {e}. Retrying in 10s...")
+            time.sleep(10)
+
 
 def scan_catalog(input_path: str, distributor: str):
     logger.info(f"Loading {os.path.basename(input_path)} | Distributor: {distributor} | Min ROI: {MIN_ROI * 100}%")
@@ -118,7 +149,6 @@ def scan_catalog(input_path: str, distributor: str):
         logger.error(f"Missing essential 'upc' or 'cost' columns in {input_path}")
         return
 
-    # Clean numeric costs and pad UPCs
     df["clean_cost"] = pd.to_numeric(df["cost"].astype(str).str.replace(r"[$,]", "", regex=True), errors="coerce")
     df["clean_upc"] = df["upc"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     df = df[df["clean_cost"] > 0]
@@ -127,11 +157,25 @@ def scan_catalog(input_path: str, distributor: str):
 
     logger.info(f"Pre-filter complete: {len(valid_items)} SKUs queued.")
 
-    batch_size = 5
-    opportunities = []
+    checkpoint_file = CHECKPOINTS_DIR / f"{distributor.lower()}_checkpoint.json"
     report_file = REPORTS_DIR / f"{distributor.lower()}_qualified_opportunities.json"
 
-    for i in range(0, len(valid_items), batch_size):
+    start_idx = 0
+    opportunities = []
+
+    # Checkpoint recovery: Resume exactly where execution halted
+    if checkpoint_file.exists():
+        try:
+            cp_data = json.loads(checkpoint_file.read_text())
+            start_idx = cp_data.get("last_index", 0)
+            opportunities = cp_data.get("opportunities", [])
+            logger.info(f"🎯 Resuming {distributor} from SKU index {start_idx}/{len(valid_items)} (Preserved {len(opportunities)} found deals)")
+        except Exception as e:
+            logger.warning(f"Failed to read checkpoint: {e}. Starting fresh.")
+
+    batch_size = 5
+
+    for i in range(start_idx, len(valid_items), batch_size):
         batch = valid_items[i:i + batch_size]
         upc_list = [item["clean_upc"] for item in batch]
 
@@ -141,7 +185,6 @@ def scan_catalog(input_path: str, distributor: str):
             if not p or not isinstance(p, dict):
                 continue
 
-            # Hardened NoneType guards
             code_list = p.get("upcList") or []
             product_code = p.get("productCode") or ""
 
@@ -160,12 +203,16 @@ def scan_catalog(input_path: str, distributor: str):
                 continue
 
             amz_price = price_raw / 100.0
-            cost = float(matched_row["clean_cost"])
-            
-            # Simple Fee Estimation ($3.50 base FBA + 15% referral)
+            unit_cost = float(matched_row["clean_cost"])
+
+            # Multipack validation
+            pack_size = extract_pack_size(p)
+            total_cogs = unit_cost * pack_size
+
+            # Fee modeling: $3.50 standard FBA baseline + 15% referral fee
             est_fees = 3.50 + (amz_price * 0.15)
-            net_profit = amz_price - est_fees - cost
-            roi = (net_profit / cost) if cost > 0 else 0
+            net_profit = amz_price - est_fees - total_cogs
+            roi = (net_profit / total_cogs) if total_cogs > 0 else 0
 
             if roi >= MIN_ROI:
                 display_group = (p.get("salesRanks") or {}).get("displayGroup", "N/A")
@@ -174,8 +221,9 @@ def scan_catalog(input_path: str, distributor: str):
                     "title": matched_row.get("title") or p.get("title", "Unknown"),
                     "vendor": distributor.upper(),
                     "sku": matched_row.get("sku", "N/A"),
-                    "pack_size": 1,
-                    "wholesale_cost": round(cost, 2),
+                    "pack_size": pack_size,
+                    "unit_cogs": round(unit_cost, 2),
+                    "total_cogs": round(total_cogs, 2),
                     "amazon_price": round(amz_price, 2),
                     "roi_pct": round(roi * 100.0, 1),
                     "net_profit": round(net_profit, 2),
@@ -183,21 +231,31 @@ def scan_catalog(input_path: str, distributor: str):
                     "vendor_url": f"https://www.amazon.com/dp/{asin}"
                 }
                 opportunities.append(deal)
-                logger.info(f"🔥 Qualified Deal: {deal['title']} | ROI: {deal['roi_pct']}% | Net: ${deal['net_profit']}")
-                
-                # Append incrementally to report
-                report_file.write_text(json.dumps(opportunities, indent=2))
+                logger.info(f"🔥 Qualified Deal: {deal['title']} (Pack: {pack_size}) | ROI: {deal['roi_pct']}% | Net: ${deal['net_profit']}")
                 dispatch_telegram_alert(deal)
 
-        logger.info(f"Processed {min(i + batch_size, len(valid_items))}/{len(valid_items)} SKUs. Tokens left: {tokens_left}. Opportunities: {len(opportunities)}")
+        processed_count = min(i + batch_size, len(valid_items))
+        logger.info(f"Processed {processed_count}/{len(valid_items)} SKUs. Tokens left: {tokens_left}. Opportunities: {len(opportunities)}")
 
-        if tokens_left < 10:
-            logger.info("Tokens low. Pacing for refill (45s)...")
-            time.sleep(45)
+        # Atomic checkpoint save
+        checkpoint_data = {
+            "last_index": processed_count,
+            "opportunities": opportunities
+        }
+        checkpoint_file.write_text(json.dumps(checkpoint_data, indent=2))
+        report_file.write_text(json.dumps(opportunities, indent=2))
+
+        # Pacing: Smooth 4s drip; if exhausted, sleep 15s instead of stalling for 45s
+        if tokens_left <= 0:
+            logger.info("Tokens momentarily exhausted. Pausing 15s for refill...")
+            time.sleep(15)
         else:
-            time.sleep(3)
+            time.sleep(4)
 
     logger.info(f"Finished {distributor}. Found {len(opportunities)} qualified deals.")
+    if checkpoint_file.exists():
+        checkpoint_file.unlink()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
