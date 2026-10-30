@@ -37,7 +37,7 @@ logger = logging.getLogger("MasterFleet")
 
 from tools.queue_manager import send_daily_decision_email_digest
 from tools.dual_feed_dispatcher import generate_daily_worklist
-from tools.telegram_hub import bot
+from tools.catalog_bot import bot
 
 # 1. Background Schedulers
 def run_morning_dispatch_job():
