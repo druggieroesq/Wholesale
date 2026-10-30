@@ -3,17 +3,15 @@ FROM python:3.11-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    procps \
     curl \
-    git \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir gdown
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN chmod +x run_all_catalogs.sh
+RUN chmod +x /app/run_all_catalogs.sh
 
-CMD ["python3", "main.py"]
+CMD ["/app/run_all_catalogs.sh"]
