@@ -19,6 +19,11 @@ done
 
 echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Total catalogs ready for processing: ${#valid_catalogs[@]}"
 
+if [ ${#valid_catalogs[@]} -eq 0 ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] No catalogs found in $INCOMING_DIR. Exiting."
+    exit 1
+fi
+
 for cat in "${valid_catalogs[@]}"; do
     filename=$(basename "$cat")
     distributor="generic"
@@ -40,7 +45,7 @@ for cat in "${valid_catalogs[@]}"; do
         echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Successfully completed $filename. Archiving..."
         mv "$cat" "$PROCESSED_DIR/$filename"
     else
-        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ERROR] Scanner failed on $filename with exit code $status. Halting batch runner."
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ERROR] Scanner exited on $filename with code $status. Halting pipeline."
         exit 1
     fi
 done
