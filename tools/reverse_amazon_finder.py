@@ -1,101 +1,112 @@
+#!/usr/bin/env python3
+"""
+Reverse Amazon Finder (24/7 Background Hunter)
+Queries Keepa Product Finder for high-margin, low-competition MRO & multipack targets.
+"""
+
 import os
 import time
 import json
 import logging
 import requests
 from pathlib import Path
-from typing import Dict, Any, List
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger("ReverseFinder")
 
-KEEPA_KEY = os.getenv("KEEPA_API_KEY", "")
-MIN_ROI = float(os.getenv("MIN_ROI", "1.00"))
-MAX_FBA_SELLERS = int(os.getenv("MAX_FBA_SELLERS", "1"))
-MAX_BSR = int(os.getenv("MAX_BSR", "65000"))
+DATA_DIR = Path("/app/data")
+CANDIDATES_FILE = DATA_DIR / "discovered_candidates.json"
+ENV_FILE = Path("/app/.env")
 
-CANDIDATES_FILE = Path("/app/data/discovered_candidates.json")
 
-def query_keepa_product_finder() -> List[Dict[str, Any]]:
-    """Finds high-demand Amazon products with 0-1 FBA competition and strong sales rank."""
-    url = f"https://api.keepa.com/query?key={KEEPA_KEY}&domain=1&type=product"
+def load_env():
+    """Ensure KEEPA_API_KEY is loaded even in detached non-login subshells."""
+    if not os.getenv("KEEPA_API_KEY") and ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("KEEPA_API_KEY=") and not line.startswith("#"):
+                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                os.environ["KEEPA_API_KEY"] = key
+                break
+
+
+def query_keepa():
+    """Query Keepa Product Finder API for qualified high-margin ASINs."""
+    load_env()
+    api_key = os.getenv("KEEPA_API_KEY", "").strip()
+    if not api_key:
+        logger.error("KEEPA_API_KEY is missing from environment and /app/.env")
+        return []
+
+    # Keepa Product Finder: domain 1 = Amazon.com (US)
+    url = f"https://api.keepa.com/query?key={api_key}&domain=1&type=product"
     
-    # Query: Sub-65k BSR, BuyBox >= $22, Max 1 FBA seller, In Stock
+    # Query parameters: BSR <= 65k, Buy Box >= $22.00 (in cents), max 1 FBA seller, No Amazon retail
     payload = {
-        "current_SALES_lte": MAX_BSR,
+        "current_SALES_lte": 65000,
         "current_BUY_BOX_SHIPPING_gte": 2200,
-        "current_COUNT_REVIEWS_gte": 15,
-        "fba_seller_count_lte": MAX_FBA_SELLERS,
+        "fba_seller_count_lte": 1,
         "isAmazonOffer": False
     }
-    
+
     try:
         resp = requests.post(url, json=payload, timeout=45)
         if resp.status_code == 200:
-            asins = resp.json().get("asinList", [])
-            logger.info(f"Keepa Reverse Finder surfaced {len(asins)} high-velocity candidate ASINs.")
-            return asins[:50]  # Take top 50 per cycle to conserve tokens
-        logger.error(f"Keepa query failed: {resp.status_code}")
-    except Exception as e:
-        logger.error(f"Keepa query error: {e}")
+            data = resp.json()
+            asins = data.get("asinList", [])
+            tokens_left = data.get("tokensLeft", "N/A")
+            logger.info(f"Keepa query succeeded: {len(asins)} candidate ASINs surfaced. Tokens remaining: {tokens_left}")
+            return asins[:50]
+        else:
+            logger.error(f"Keepa query failed ({resp.status_code}): {resp.text[:160]}")
+    except requests.RequestException as e:
+        logger.error(f"Keepa connection error: {e}")
+
     return []
 
-def inspect_asin_variations(asins: List[str]):
-    """Pulls full variation families and inspects multipacks without discarding on single-pack margin."""
-    if not asins:
-        return
-        
-    url = f"https://api.keepa.com/product?key={KEEPA_KEY}&domain=1&asin={','.join(asins[:20])}&stats=90"
-    try:
-        resp = requests.get(url, timeout=45)
-        if resp.status_code != 200:
-            return
-            
-        data = resp.json().get("products", [])
-        candidates = []
-        if CANDIDATES_FILE.exists():
-            try:
-                candidates = json.loads(CANDIDATES_FILE.read_text())
-            except Exception:
-                candidates = []
-                
-        existing_asins = {c.get("asin") for c in candidates}
-        
-        for p in data:
-            asin = p.get("asin")
-            title = p.get("title", "")
-            brand = p.get("brand", "")
-            mpn = p.get("mpn", "")
-            parent_asin = p.get("parentAsin", asin)
-            variations = p.get("variations", [])
-            
-            # Skip if meltable keywords present
-            if any(kw in title.lower() for kw in ["chocolate", "gummy", "wax", "balm"]):
-                continue
-                
-            entry = {
+
+def update_candidate_pool(new_asins):
+    """Save new ASINs to persistent JSON storage with deduplication."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    existing = []
+    if CANDIDATES_FILE.exists():
+        try:
+            existing = json.loads(CANDIDATES_FILE.read_text())
+        except Exception:
+            existing = []
+
+    known_asins = {item.get("asin") for item in existing if isinstance(item, dict)}
+    added_count = 0
+    now = time.time()
+
+    for asin in new_asins:
+        if asin and asin not in known_asins:
+            existing.append({
                 "asin": asin,
-                "parent_asin": parent_asin,
-                "title": title,
-                "brand": brand,
-                "mpn": mpn,
-                "has_variations": len(variations) > 0,
-                "variation_count": len(variations),
-                "timestamp": time.time()
-            }
-            
-            if asin not in existing_asins:
-                candidates.append(entry)
-                existing_asins.add(asin)
-                
-        CANDIDATES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CANDIDATES_FILE.write_text(json.dumps(candidates, indent=2))
-        logger.info(f"Discovered candidates pool updated. Total pool: {len(candidates)} items.")
-    except Exception as e:
-        logger.error(f"Error inspecting variations: {e}")
+                "discovered_at": now,
+                "status": "UNMATCHED"
+            })
+            known_asins.add(asin)
+            added_count += 1
+
+    CANDIDATES_FILE.write_text(json.dumps(existing, indent=2))
+    logger.info(f"Candidate pool saved: +{added_count} new ASINs ({len(existing)} total in pool).")
+
+
+def main():
+    logger.info("Starting Reverse Amazon Finder 24/7 background loop...")
+    while True:
+        candidates = query_keepa()
+        if candidates:
+            update_candidate_pool(candidates)
+        
+        # Keepa token refill pacing (15-minute wait between cycles)
+        logger.info("Cycle complete. Sleeping 900s for token refill...")
+        time.sleep(900)
+
 
 if __name__ == "__main__":
-    logger.info("Starting background reverse finder loop...")
-    asins = query_keepa_product_finder()
-    if asins:
-        inspect_asin_variations(asins)
+    main()
