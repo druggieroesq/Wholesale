@@ -2,7 +2,8 @@
 # ==============================================================================
 # Master Wholesale Catalog Pipeline Daemon
 # Monitors /app/data/catalogs/incoming/ for incoming .xlsx/.csv files,
-# prioritizes distributor catalog scans, and archives processed sheets.
+# prioritizes distributor catalog scans, executes IP Guard pre-filtering,
+# and archives processed sheets.
 # ==============================================================================
 set -euo pipefail
 
@@ -13,7 +14,6 @@ LOG_DIR="${APP_ROOT}/data/logs"
 
 mkdir -p "$INCOMING_DIR" "$PROCESSED_DIR" "$LOG_DIR"
 
-# Source environment variables if .env exists
 if [ -f "${APP_ROOT}/.env" ]; then
   export $(grep -v '^#' "${APP_ROOT}/.env" | xargs)
 fi
@@ -39,18 +39,15 @@ while true; do
       if [[ "$lower_name" =~ "contour" ]]; then dist_key="contour"; fi
       if [[ "$lower_name" =~ "bci" ]]; then dist_key="bci"; fi
 
-      # Execute scanner
       python3 "${APP_ROOT}/tools/universal_catalog_scanner.py" \
         --input "$catalog_file" \
         --distributor "$dist_key"
 
-      # Archive processed file
       timestamp=$(date +%Y%m%d_%H%M%S)
       mv "$catalog_file" "${PROCESSED_DIR}/${timestamp}_${filename}"
       echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Archived $filename to processed directory."
     done
   fi
 
-  # Sleep 60 seconds before re-checking incoming queue
   sleep 60
 done
