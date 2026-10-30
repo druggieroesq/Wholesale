@@ -6,7 +6,8 @@ Orchestrates:
 1. Telegram Polling Daemon (Background Thread) with 409-conflict mitigation & anti-collision state.
 2. Scheduled Morning Scout Run (7:00 AM ET): Generates Feed A (Buys) & Feed B (Reverse RFQs).
 3. Scheduled Evening Digest (8:00 PM ET): Dispatches partner email digest.
-4. Healthcheck / Ping loop for hosting runtime (Railway / Docker).
+4. Interactive Bot Listener: Handles /more_buys, /more_rfqs, /digest, and inline button presses.
+5. Healthcheck / Ping loop for hosting runtime (Railway / Docker).
 """
 
 import os
@@ -29,19 +30,24 @@ from tools.dual_feed_dispatcher import generate_daily_worklist
 from tools.walmart_morning_scout import evaluate_walmart_wfs_gap, send_morning_scout_telegram
 
 def run_morning_dispatch_job():
-    """Triggers at 7:00 AM ET every morning."""
+    """Triggers at 7:00 AM ET every morning to push fresh queues."""
     logger.info("Executing 7:00 AM Morning Dispatch Routine...")
     try:
+        # Load active scan pools and generate Feed A & Feed B queues
         confirmed_buys = []
         reverse_rfqs = []
         
         worklist = generate_daily_worklist(confirmed_buys, reverse_rfqs, feed_a_limit=25, feed_b_limit=25)
-        logger.info(f"Daily worklist compiled: {len(worklist.get('feed_a_buys', []))} Buys, {len(worklist.get('feed_b_rfqs', []))} RFQs.")
+        logger.info(
+            f"Daily worklist compiled: "
+            f"{len(worklist.get('feed_a_buys', []))} Buys, "
+            f"{len(worklist.get('feed_b_rfqs', []))} RFQs."
+        )
     except Exception as e:
         logger.error(f"Error in morning dispatch job: {e}")
 
 def run_evening_digest_job():
-    """Triggers at 8:00 PM ET every evening."""
+    """Triggers at 8:00 PM ET every evening to email daily team decisions."""
     logger.info("Executing 8:00 PM Partner Email Digest Routine...")
     try:
         send_daily_decision_email_digest()
@@ -62,7 +68,6 @@ def start_telegram_daemon():
 
         logger.info("Purging old Telegram sessions / webhooks before starting listener...")
         try:
-            # Correct telebot syntax: delete_webhook accepts drop_pending_updates
             if hasattr(bot, "delete_webhook"):
                 bot.delete_webhook(drop_pending_updates=True)
             else:
@@ -81,7 +86,10 @@ def start_telegram_daemon():
                     logger_level=logging.WARNING
                 )
             except Exception as poll_err:
-                logger.error(f"Polling connection interrupted: {poll_err}. Retrying in 5 seconds...")
+                logger.error(
+                    f"Polling connection interrupted: {poll_err}. "
+                    f"Retrying in 5 seconds..."
+                )
                 time.sleep(5)
     except Exception as e:
         logger.error(f"Telegram polling thread terminated: {e}")
@@ -89,7 +97,7 @@ def start_telegram_daemon():
 def main():
     logger.info("Booting Wholesale MRO Engine v2.0...")
 
-    # 1. Start Telegram Bot in background daemon thread
+    # 1. Start Telegram Bot in background daemon thread for interactive callbacks
     tg_thread = threading.Thread(target=start_telegram_daemon, daemon=True)
     tg_thread.start()
 
@@ -98,6 +106,7 @@ def main():
     schedule.every().day.at("20:00").do(run_evening_digest_job)
 
     logger.info("Schedules initialized: 07:00 AM Morning Dispatch, 20:00 PM Evening Digest.")
+    logger.info("Background listener and scheduler active. Running main loop...")
 
     # 3. Main scheduler keep-alive loop
     while True:
