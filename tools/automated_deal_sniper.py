@@ -2,8 +2,8 @@
 tools/automated_deal_sniper.py
 Automated Deal Sniper:
 1. Scans Keepa and distributor queues for zero-supply inventory vacuums.
-2. Filters deals through MasterVacuumEngine (100% Net ROI floor, $0.06 prep baseline).
-3. Routes fulfillment and freight through LogisticsEngine (Will-Call, Freight Minimums, 3PL Nodes).
+2. Filters deals through MasterVacuumEngine (Dynamic .env MIN_ROI_FLOOR).
+3. Routes fulfillment and freight through LogisticsEngine.
 4. Resolves direct distributor ordering URLs.
 5. Dispatches formatted deal cards to Telegram and syncs state to Git.
 """
@@ -19,7 +19,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=True)
 
 from tools.keepa_scanner import KeepaScanner
 from tools.master_vacuum_engine import MasterVacuumEngine
@@ -35,15 +35,15 @@ logger = logging.getLogger("AutomatedDealSniper")
 class AutomatedDealSniper:
     def __init__(self):
         self.scanner = KeepaScanner()
-        # Initialized with updated $0.06 prep baseline (polybag + barcode label)
-        self.engine = MasterVacuumEngine(prep_override=0.06)
+        # Automatically loads MIN_ROI_FLOOR and PARKLAND_PREP_FEE_UNIT from .env
+        self.engine = MasterVacuumEngine()
         self.logistics = LogisticsEngine()
         self.resolver = SKUResolver()
         self.telegram = TelegramActionHandler()
         self.syncer = GitStateSync()
 
     def run_sniper_mission(self, max_alerts: int = 5) -> int:
-        logger.info("⚡ [SNIPER] Initializing 0-seller vacuum reconnaissance mission...")
+        logger.info(f"⚡ [SNIPER] Initializing reconnaissance (ROI Floor: {self.engine.min_roi_floor}%)...")
 
         # 1. Harvest raw vacuum leads
         raw_candidates = self.scanner.run_full_scan()
@@ -51,15 +51,15 @@ class AutomatedDealSniper:
             logger.warning("[SNIPER] No raw candidate leads detected from scanner.")
             return 0
 
-        # 2. Filter & evaluate margins through Master Vacuum Engine (100% Net ROI floor + IP Guard)
+        # 2. Filter & evaluate margins through Master Vacuum Engine
         viable_deals = self.engine.process_catalog(raw_candidates)
         if not viable_deals:
-            logger.info("[SNIPER] Zero items cleared the strict 100% Net ROI floor.")
+            logger.info(f"[SNIPER] Zero items cleared the {self.engine.min_roi_floor}% ROI floor threshold.")
             return 0
 
-        # 3. Enrich candidates with dynamic logistics routing and direct purchase URLs
+        # 3. Enrich candidates with dynamic logistics and distributor order links
         dispatched_count = 0
-        logger.info(f"[SNIPER] Verified {len(viable_deals)} high-margin vacuum targets. Preparing top {max_alerts}...")
+        logger.info(f"[SNIPER] Verified {len(viable_deals)} high-margin targets. Dispatching top {max_alerts}...")
 
         for deal in viable_deals[:max_alerts]:
             vendor_name = deal.get("vendor", "midland_metal")
@@ -69,7 +69,7 @@ class AutomatedDealSniper:
             wholesale_cost = float(deal.get("wholesale_cost", 0.0))
             weight_lbs = float(deal.get("package_weight_lbs", 1.5))
 
-            # Dynamic logistics routing (Calculates Will-Call vs Freight vs 3PL Node)
+            # Dynamic logistics routing
             route = self.logistics.route_purchase_order(
                 vendor_key=vendor_name,
                 unit_cost=wholesale_cost,
@@ -103,5 +103,5 @@ class AutomatedDealSniper:
 
 if __name__ == "__main__":
     sniper = AutomatedDealSniper()
-    max_deals = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    max_deals = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv("TELEGRAM_ALERT_LIMIT", 5))
     sniper.run_sniper_mission(max_alerts=max_deals)
