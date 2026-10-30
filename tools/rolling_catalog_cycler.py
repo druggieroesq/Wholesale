@@ -4,8 +4,7 @@ Phased Sourcing Cycler for Keepa API (Starter 20 Tokens/Min Compliant).
 - Phase 1: Deep scan across Industrial & Scientific and Tools & Hardware.
 - Phase 2: Cycles into Commercial Consumables, Safety, and Plumbing.
 - Enforces Supply Vacuums: Amazon OOS, FBA sellers <= 1, Buy Box >= $30.
-- No BSR rank caps — driven by verified demand and 100% Net ROI floor.
-- Integrated Layer 0 IP Guard (659+ protected brands).
+- No BSR rank caps — driven by verified demand and dynamic MIN_ROI_FLOOR.
 """
 
 import os
@@ -22,7 +21,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=True)
 
 from tools.master_vacuum_engine import MasterVacuumEngine
 from tools.telegram_action_handler import TelegramActionHandler
@@ -41,9 +40,6 @@ class RollingCatalogCycler:
     QUERY_API = "https://api.keepa.com/query"
     PRODUCT_API = "https://api.keepa.com/product"
 
-    # Phased Category Progression
-    # Phase 1: Deep Industrial, Scientific & Tool sectors
-    # Phase 2: Broader expansion after Phase 1 inventory is fully indexed
     PRIMARY_PHASE_1_SECTORS = [
         {"phase": 1, "name": "Industrial Hardware, Fasteners & Valves", "cat_id": "16310091", "max_weight_g": 6800},
         {"phase": 1, "name": "Industrial & Scientific Supplies (MRO)", "cat_id": "16310161", "max_weight_g": 9070},
@@ -62,19 +58,14 @@ class RollingCatalogCycler:
 
     def __init__(self):
         self.api_key = os.getenv("KEEPA_API_KEY", "").strip()
-        # Uses updated $0.06 prep baseline and 100% ROI floor
-        self.engine = MasterVacuumEngine(prep_override=0.06)
+        self.engine = MasterVacuumEngine()
         self.telegram = TelegramActionHandler()
         self.resolver = SKUResolver()
         self.logistics = LogisticsEngine()
-        self.safety_token_floor = 15
+        self.safety_token_floor = int(os.getenv("KEEPA_TOKEN_SAFETY_FLOOR", 15))
         self.active_phase = 1
 
     def scan_sector_vacuums(self, sector: Dict[str, Any]) -> List[str]:
-        """
-        Executes bulk /query to pull supply vacuums for ~10 tokens.
-        No BSR caps — isolates listings where Amazon is OOS and 3P FBA <= 1.
-        """
         if not self.api_key or self.api_key == "your_actual_keepa_key":
             logger.warning(f"[Dry Run] Keepa API Key not configured. Skipping live scan for {sector['name']}.")
             return []
@@ -91,7 +82,7 @@ class RollingCatalogCycler:
             "packageWidth_lte": MAX_FBA_DIMENSION_MM,
             "packageHeight_lte": MAX_FBA_DIMENSION_MM,
             "hasReviews": True,
-            "sort": [["current_SALES", "asc"]], # Priority by velocity, NO hard cutoff
+            "sort": [["current_SALES", "asc"]],
             "perPage": 25
         }
 
@@ -104,9 +95,8 @@ class RollingCatalogCycler:
             logger.info(f"Sector: {sector['name']} | Keepa Tokens Left: {tokens_left}")
 
             if tokens_left < self.safety_token_floor:
-                sleep_secs = 60
-                logger.warning(f"Tokens low ({tokens_left} < {self.safety_token_floor}). Pausing {sleep_secs}s to regenerate...")
-                time.sleep(sleep_secs)
+                logger.warning(f"Tokens low ({tokens_left}). Pausing 60s to regenerate...")
+                time.sleep(60)
 
             return data.get("asinList", [])[:15]
         except Exception as e:
@@ -114,7 +104,6 @@ class RollingCatalogCycler:
             return []
 
     def hydrate_and_screen_asins(self, asins: List[str], sector: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Hydrates product metrics and screens brands through Layer 0 IP Guard."""
         if not asins:
             return []
 
@@ -137,17 +126,14 @@ class RollingCatalogCycler:
                 brand = p.get("brand", "")
                 stats = p.get("stats", {}) or {}
 
-                # 1. Layer 0 IP Guard Filter
                 blocked, reason = is_brand_blocked(brand=brand, title=title)
                 if blocked:
-                    logger.debug(f"IP Dropped: {brand} ({reason})")
                     continue
 
                 pkg_g = p.get("packageWeight", 0)
                 if pkg_g > MAX_FBA_WEIGHT_GRAMS:
                     continue
 
-                # Pricing: Buy Box cents or fallback to New price
                 bb_cents = stats.get("buyBoxPrice", -1)
                 new_cents = stats.get("current", [None] * 2)[1] if stats.get("current") else -1
                 price_cents = bb_cents if bb_cents > 0 else new_cents
@@ -157,18 +143,18 @@ class RollingCatalogCycler:
                 amz_price = round(price_cents / 100.0, 2)
                 weight_lbs = round(pkg_g / 453.6, 2) if pkg_g else 1.5
 
-                # Calculate Maximum Allowable Cost (MAC) for 100% Net ROI
                 route = self.logistics.route_purchase_order(
                     vendor_key="regional_supplier",
                     unit_cost=amz_price * 0.35,
                     weight_lbs=weight_lbs
                 )
                 overhead = route["total_fulfillment_overhead"]
-                
-                # Math: Wholesale Cost <= (AmzPrice * 0.85 - FBAFee - 2*Overhead) / 2
+
+                # Target cost calculated against dynamic ROI floor
+                target_roi = self.engine.min_roi_floor / 100.0
                 fba_fee = self.engine.estimate_fba_fee(weight_lbs)
-                net_ceiling = (amz_price * 0.85) - fba_fee - (2.0 * overhead)
-                max_allowable_cost = max(0.0, round(net_ceiling / 2.0, 2))
+                net_ceiling = (amz_price * (1.0 - self.engine.AMAZON_REFERRAL_PCT)) - fba_fee - ((1.0 + target_roi) * overhead)
+                max_allowable_cost = max(0.0, round(net_ceiling / (1.0 + target_roi), 2))
 
                 if max_allowable_cost < 3.0:
                     continue
@@ -179,7 +165,7 @@ class RollingCatalogCycler:
                     "brand": brand,
                     "mpn": p.get("mpn", ""),
                     "amazon_price": amz_price,
-                    "cost": max_allowable_cost,  # Evaluates at the 100% ROI ceiling
+                    "cost": max_allowable_cost,
                     "max_allowable_cost": max_allowable_cost,
                     "fba_sellers": stats.get("totalOfferCountFBA", 0),
                     "amazon_in_stock": False,
@@ -194,7 +180,6 @@ class RollingCatalogCycler:
             return []
 
     def run_phased_sourcing_loop(self):
-        """Continuously cycles through target sectors at 20 tokens/min."""
         logger.info("Initializing Phased Sourcing Cycler...")
         sectors_queue = self.PRIMARY_PHASE_1_SECTORS.copy()
         current_idx = 0
@@ -214,15 +199,13 @@ class RollingCatalogCycler:
                         logger.info(f"Dispatched Deal: {top_pick['brand']} | {top_pick['asin']} (MAC: ${top_pick['wholesale_cost']})")
 
             current_idx += 1
-            # When Phase 1 sectors are fully traversed, append Phase 2 expansion
             if current_idx >= len(sectors_queue):
                 current_idx = 0
                 if self.active_phase == 1:
-                    logger.info("Phase 1 sweep complete. Adding Phase 2 expansion sectors to rotation.")
+                    logger.info("Phase 1 complete. Expanding to Phase 2 sectors.")
                     sectors_queue.extend(self.EXPANSION_PHASE_2_SECTORS)
                     self.active_phase = 2
 
-            # Pace requests for Starter plan (20 tokens/min)
             sleep_duration = 35
             logger.info(f"Pacing loop: sleeping {sleep_duration}s for token regeneration...")
             time.sleep(sleep_duration)
