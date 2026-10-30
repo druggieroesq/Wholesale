@@ -2,8 +2,8 @@
 tools/vacuum_demand_hunter.py
 Automated Supply-Vacuum Hunter.
 Cross-references live Amazon/Keepa inventory vacuums (0-1 FBA sellers, Amazon OOS)
-against active wholesale distributor catalogs (BCI, Midland, Grainger, South FL Will-Call).
-Enforces 100% Net ROI, $0.06 prep baseline, and Layer 0 IP Guard.
+against active wholesale distributor catalogs.
+Dynamically respects MIN_ROI_FLOOR and prep settings from .env.
 """
 
 import os
@@ -19,7 +19,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=True)
 
 from tools.master_vacuum_engine import MasterVacuumEngine
 from tools.sku_resolver import SKUResolver
@@ -32,21 +32,12 @@ KEEPA_API_KEY = os.getenv("KEEPA_API_KEY", "").strip()
 
 
 class VacuumDemandHunter:
-    """
-    Dedicated demand hunter for distributor catalog cross-referencing.
-    Hunts high-velocity zero-supply vacuums across prioritized categories.
-    """
-    def __init__(self, prep_fee: float = 0.06):
-        # Uses the updated $0.06 baseline
-        self.engine = MasterVacuumEngine(prep_override=prep_fee)
+    def __init__(self):
+        # Reads dynamic settings from .env via MasterVacuumEngine
+        self.engine = MasterVacuumEngine()
         self.resolver = SKUResolver()
 
     def fetch_keepa_supply_vacuums(self, category_id: int = 16310161) -> List[str]:
-        """
-        Uses Keepa /query to fetch up to 1,000 ASINs in high-demand, zero-supply states
-        (Amazon OOS, FBA sellers <= 1, Buy Box >= $30) for only ~10 tokens.
-        Default category: 16310161 (Industrial & Scientific).
-        """
         if not KEEPA_API_KEY or KEEPA_API_KEY == "your_actual_keepa_key":
             logger.warning("No live Keepa API key found. Skipping live Keepa vacuum harvest.")
             return []
@@ -76,9 +67,6 @@ class VacuumDemandHunter:
             return []
 
     def load_active_distributor_catalogs(self) -> List[Dict[str, Any]]:
-        """
-        Dynamically loads pre-filtered distributor queues from data/catalogs/.
-        """
         catalogs_dir = ROOT_DIR / "data" / "catalogs"
         all_candidates = []
 
@@ -114,7 +102,6 @@ class VacuumDemandHunter:
         logger.info("Hunting zero-supply opportunities across active wholesale catalogs...")
         raw_items = self.load_active_distributor_catalogs()
 
-        # If no local catalog files are present, fall back to benchmark verification items
         if not raw_items:
             logger.warning("No local catalog JSON files found in data/catalogs/. Using baseline benchmark items.")
             raw_items = [
@@ -130,23 +117,9 @@ class VacuumDemandHunter:
                     "fba_sellers": 0,
                     "amazon_in_stock": False,
                     "package_weight_lbs": 1.2
-                },
-                {
-                    "asin": "B079HEPA99",
-                    "upc": "729000654321",
-                    "mpn": "FILT-MRO-HVAC-4PK",
-                    "title": "Commercial Grade Pleated HVAC Air Filter MERV 11 4-Pack",
-                    "brand": "AirClean Pro",
-                    "vendor": "global_industrial",
-                    "cost": 21.00,
-                    "amz_price": 68.50,
-                    "fba_sellers": 1,
-                    "amazon_in_stock": False,
-                    "package_weight_lbs": 3.0
                 }
             ]
 
-        # Process through the updated MasterVacuumEngine (IP check, FBA <= 1, 100% ROI floor)
         viable_deals = self.engine.process_catalog(raw_items)
 
         for deal in viable_deals:
@@ -166,13 +139,4 @@ class VacuumDemandHunter:
 if __name__ == "__main__":
     hunter = VacuumDemandHunter()
     results = hunter.hunt_vacuums()
-    
-    print("\n" + "=" * 80)
-    print(f"  VACUUM DEMAND HUNTER: {len(results)} QUALIFIED DEALS DETECTED (PARKLAND PREP)")
-    print("=" * 80)
-    for r in results:
-        print(f"ASIN: {r['asin']} | {r['title'][:40]}")
-        print(f"Vendor: {r['vendor']} | Wholesale: ${r['wholesale_cost']} | AMZ Price: ${r['amazon_price']}")
-        print(f"Net Profit: ${r['net_profit']} | ROI: {r['roi_pct']}% | Quadrant: {r['quadrant']}")
-        print(f"Direct Link: {r['direct_order_url']}")
-        print("-" * 80)
+    print(f"\nDiscovered {len(results)} qualified deals.")
