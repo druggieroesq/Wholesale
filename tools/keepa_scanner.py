@@ -1,7 +1,7 @@
 """
 tools/keepa_scanner.py
-Production Keepa Scanner with Layer 0 IP Guard and Dynamic Cliff-Drop Detection.
-Enforces 100% Net ROI floor, $0.06 prep baseline, and drops restricted brands.
+Production Keepa Batch Scanner with Dynamic Self-Learning IP Quarantine.
+Enforces 100% Net ROI floor, $0.06 prep baseline, and permanent brand blacklisting.
 """
 
 import os
@@ -11,7 +11,7 @@ import time
 import logging
 import requests
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -31,54 +31,100 @@ from tools.ip_guard import is_brand_blocked, load_blocklist
 KEEPA_API_KEY = os.getenv("KEEPA_API_KEY", "").strip()
 KEEPA_DOMAIN_USA = 1  # 1 = Amazon.com (US)
 
-# Sourcing Constraints
-MIN_ROI = float(os.getenv("MIN_ROI", 100.0)) / 100.0  # 100% ROI floor (1.0)
-PREP_FEE = 0.06  # Materials only: polybags & 30-up labels
+# Sourcing Constraints & Cost Parameters
+MIN_ROI = float(os.getenv("MIN_ROI", 100.0)) / 100.0  # 100% Net ROI floor
+PREP_FEE = 0.06  # Polybag, hazard warning label & FNSKU barcode
 AMAZON_REFERRAL_RATE = 0.15
 ESTIMATED_FBA_FEE = 4.75
 
+BLOCKLIST_FILE = ROOT_DIR / "data" / "ip_blocklist.json"
 
-def dynamically_append_to_blocklist(brand_name: str, reason: str):
-    """Dynamically registers an IP-enforcing brand to data/ip_blocklist.json."""
-    if not brand_name or len(brand_name.strip()) <= 1:
+
+def quarantine_brand_globally(brand_name: str, asin: str, trigger_reason: str):
+    """
+    Permanently appends a detected IP-enforcing brand to data/ip_blocklist.json on disk.
+    Immediately locks out the brand across ALL catalogs and sourcing engines.
+    """
+    clean_brand = (brand_name or "").strip()
+    if not clean_brand or len(clean_brand) < 2:
         return
-        
-    blocklist_path = ROOT_DIR / "data" / "ip_blocklist.json"
+
     try:
         data = {"brands": []}
-        if blocklist_path.exists():
-            with open(blocklist_path, "r", encoding="utf-8") as f:
+        if BLOCKLIST_FILE.exists():
+            with open(BLOCKLIST_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-        brands_set = set(data.get("brands", []))
-        clean_brand = brand_name.strip()
-        if clean_brand not in brands_set:
-            brands_set.add(clean_brand)
-            data["total_brands"] = len(brands_set)
-            data["brands"] = sorted(list(brands_set), key=lambda s: s.upper())
-            with open(blocklist_path, "w", encoding="utf-8") as f:
+        existing_brands = {b.strip().upper() for b in data.get("brands", [])}
+
+        if clean_brand.upper() not in existing_brands:
+            data.setdefault("brands", []).append(clean_brand)
+            data["total_brands"] = len(data["brands"])
+            data["brands"] = sorted(list(set(data["brands"])), key=lambda s: s.upper())
+
+            with open(BLOCKLIST_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            logger.warning(f"🚨 Dynamically blacklisted '{clean_brand}' -> {reason}")
+
+            logger.warning(
+                f"🚨 [AUTO-IP QUARANTINE] ASIN {asin} triggered lockdown for '{clean_brand.upper()}'. "
+                f"Reason: {trigger_reason}. Master blocklist updated ({data['total_brands']} brands)."
+            )
+
+            # Instantly reload IP Guard memory cache
             load_blocklist()
+
     except Exception as e:
-        logger.error(f"Failed to dynamically append brand '{brand_name}': {e}")
+        logger.error(f"Failed to auto-quarantine brand '{clean_brand}': {e}")
 
 
-def detect_seller_cliff_drop(live_fba_count: int, history_csv_list: list) -> bool:
+def analyze_keepa_ip_signals(product: Dict) -> Tuple[bool, str]:
     """
-    Detects if 3P seller count plummeted abruptly over the last 30-90 days,
-    a hallmark signature of legal C&D / Brand Registry IP purges.
+    Inspects Keepa product metrics and historical offer trends for IP enforcement.
+    Returns: (is_ip_suspicious, reason_string)
     """
-    if live_fba_count <= 1:
-        return True
-    return False
+    stats = product.get("stats", {}) or {}
+    brand = (product.get("brand") or "").strip()
+    title = product.get("title") or ""
+    asin = product.get("asin") or ""
+
+    # Keepa stats arrays index 11 = COUNT_NEW (Offer count)
+    current_arr = stats.get("current", [])
+    avg90_arr = stats.get("avg90", [])
+    avg30_arr = stats.get("avg30", [])
+
+    current_sellers = current_arr[11] if len(current_arr) > 11 and current_arr[11] is not None else 0
+    avg_90_sellers = avg90_arr[11] if len(avg90_arr) > 11 and avg90_arr[11] is not None else 0
+    avg_30_sellers = avg30_arr[11] if len(avg30_arr) > 11 and avg30_arr[11] is not None else 0
+
+    # 1. Cliff Drop: Healthy seller pool collapsed to <= 1 (Brand Registry / C&D sweep)
+    if avg_90_sellers >= 5 and current_sellers <= 1:
+        reason = f"Seller Cliff Drop (avg90: {avg_90_sellers} sellers -> current: {current_sellers})"
+        quarantine_brand_globally(brand, asin, reason)
+        return True, reason
+
+    # 2. Private Label Lock: Sole seller historical dominance
+    if avg_90_sellers <= 1 and current_sellers <= 1:
+        if brand.upper() in title.upper() and len(brand) > 3:
+            reason = "Private Label Monopoly (sole seller over 90-day history)"
+            quarantine_brand_globally(brand, asin, reason)
+            return True, reason
+
+    # 3. Sudden 30-Day Purge: Offers collapsed by >70% recently
+    if avg_90_sellers >= 4 and avg_30_sellers <= 1:
+        reason = f"Recent 30-Day Offer Purge (avg90: {avg_90_sellers} -> avg30: {avg_30_sellers})"
+        quarantine_brand_globally(brand, asin, reason)
+        return True, reason
+
+    return False, ""
 
 
-def query_keepa_product(identifier: str, id_type: str = "asin") -> Optional[Dict]:
-    """Queries Keepa API for product metrics using either ASIN or UPC."""
+def query_keepa_batch(identifiers: List[str], id_type: str = "asin") -> List[Dict]:
+    """
+    Batch-queries up to 100 ASINs or UPCs in a single Keepa API call to conserve tokens.
+    """
     if not KEEPA_API_KEY or KEEPA_API_KEY == "your_actual_keepa_key":
         logger.error("Valid KEEPA_API_KEY is not configured in .env.")
-        return None
+        return []
 
     endpoint = "https://api.keepa.com/product"
     params = {
@@ -87,99 +133,152 @@ def query_keepa_product(identifier: str, id_type: str = "asin") -> Optional[Dict
         "stats": 90,
         "history": 1
     }
-    
+
     if id_type.lower() == "asin":
-        params["asin"] = identifier
+        params["asin"] = ",".join(identifiers)
     else:
-        params["code"] = identifier
+        params["code"] = ",".join(identifiers)
 
     try:
-        resp = requests.get(endpoint, params=params, timeout=15)
+        resp = requests.get(endpoint, params=params, timeout=30)
         if resp.status_code == 200:
             data = resp.json()
-            products = data.get("products", [])
-            return products[0] if products else None
+            tokens_left = data.get("tokensLeft", "N/A")
+            logger.info(f"Keepa query successful. Tokens remaining: {tokens_left}")
+            return data.get("products", [])
         else:
-            logger.warning(f"Keepa query failed with status code {resp.status_code}")
-            return None
+            logger.error(f"Keepa query failed with HTTP {resp.status_code}: {resp.text}")
+            return []
     except Exception as e:
-        logger.error(f"Error querying Keepa: {e}")
-        return None
+        logger.error(f"Exception during Keepa batch request: {e}")
+        return []
 
 
-def evaluate_sku_viability(sku_record: Dict) -> Optional[Dict]:
+def process_candidate_batch(sku_records: List[Dict]) -> List[Dict]:
     """
-    Executes full waterfall evaluation:
-    1. Layer 0 IP Guard check
-    2. Keepa metric hydration
-    3. Cliff-drop / private-label IP detection
-    4. 100% Net ROI math
+    Processes a list of raw distributor records through the complete multi-tier pipeline:
+    1. Layer 0 IP Guard check against the 659-brand blocklist (0 tokens spent)
+    2. Keepa batch hydration (up to 100 items per request)
+    3. Live Keepa IP heuristic analysis + auto-quarantine
+    4. 100% Net ROI floor math
     """
-    brand = sku_record.get("brand", "")
-    title = sku_record.get("title", "") or sku_record.get("description", "")
-    cost = float(sku_record.get("wholesale_cost", 0.0))
-    upc = sku_record.get("upc", "")
-    asin = sku_record.get("asin", "")
+    viable_deals = []
 
-    # 1. Layer 0 IP Firewall Check (Zero token cost)
-    blocked, reason = is_brand_blocked(brand=brand, title=title)
-    if blocked:
-        logger.info(f"Skipping {brand} ({title[:30]}...): {reason}")
-        return None
+    # 1. Pre-filter against static blocklist
+    pre_screened = []
+    for item in sku_records:
+        brand = item.get("brand", "")
+        title = item.get("title", "")
+        vendor = item.get("vendor", "")
 
-    # 2. Query Keepa
-    identifier = asin if asin else upc
-    id_type = "asin" if asin else "code"
-    if not identifier:
-        return None
+        blocked, reason = is_brand_blocked(brand=brand, title=title, vendor=vendor)
+        if blocked:
+            continue
+        pre_screened.append(item)
 
-    product_data = query_keepa_product(identifier, id_type=id_type)
-    if not product_data:
-        return None
+    if not pre_screened:
+        logger.info("All candidates in this batch were filtered by Layer 0 IP Guard.")
+        return []
 
-    brand_keepa = product_data.get("brand", "") or brand
-    stats = product_data.get("stats", {}) or {}
+    logger.info(f"Pre-screened {len(pre_screened)}/{len(sku_records)} safe items for Keepa scan.")
 
-    # Layer 0 re-check on Keepa's canonical brand name
-    blocked_k, reason_k = is_brand_blocked(brand=brand_keepa, title=title)
-    if blocked_k:
-        logger.info(f"Skipping Keepa brand {brand_keepa}: {reason_k}")
-        return None
+    # 2. Batch in chunks of 50 to prevent URI length limits
+    chunk_size = 50
+    for i in range(0, len(pre_screened), chunk_size):
+        chunk = pre_screened[i : i + chunk_size]
+        
+        # Determine identifier strategy (ASIN vs UPC)
+        asins = [c.get("asin") for c in chunk if c.get("asin")]
+        upcs = [c.get("upc") for c in chunk if not c.get("asin") and c.get("upc")]
 
-    # 3. Dynamic IP Detection (Cliff Drop & Sole Brand Seller)
-    live_fba_sellers = stats.get("totalOfferCountFBA", 0)
-    current_sellers = stats.get("current", [0]*30)[11] if len(stats.get("current", [])) > 11 else live_fba_sellers
+        products = []
+        if asins:
+            products.extend(query_keepa_batch(asins, id_type="asin"))
+        if upcs:
+            products.extend(query_keepa_batch(upcs, id_type="code"))
 
-    if current_sellers <= 1 and (brand_keepa.upper() in title.upper() or not brand_keepa):
-        dynamically_append_to_blocklist(brand_keepa, "Single seller / Private label IP risk")
-        return None
+        # Map Keepa response back by ASIN and UPC
+        keepa_map = {}
+        for p in products:
+            if p.get("asin"):
+                keepa_map[p["asin"]] = p
+            upc_list = p.get("upcList", [])
+            for u in upc_list:
+                keepa_map[u.zfill(12)] = p
 
-    # 4. Price & ROI Evaluation (Keepa prices are multiplied by 100)
-    buybox_price_raw = stats.get("buyBoxPrice", 0)
-    if buybox_price_raw <= 0:
-        buybox_price_raw = stats.get("avg90", [0]*30)[18] if len(stats.get("avg90", [])) > 18 else 0
+        # 3. Analyze viable candidates
+        for item in chunk:
+            lookup_key = item.get("asin") or item.get("upc", "").zfill(12)
+            k_data = keepa_map.get(lookup_key)
+            if not k_data:
+                continue
 
-    buybox = buybox_price_raw / 100.0
-    if buybox <= 0 or cost <= 0:
-        return None
+            k_brand = k_data.get("brand", "") or item.get("brand", "")
+            k_title = k_data.get("title", "") or item.get("title", "")
+            cost = float(item.get("wholesale_cost", 0.0))
 
-    # Net Proceeds = BuyBox - Referral Fee (15%) - FBA Fee - $0.06 Prep
-    net_proceeds = (buybox * (1.0 - AMAZON_REFERRAL_RATE)) - ESTIMATED_FBA_FEE - PREP_FEE
-    net_profit = net_proceeds - cost
-    roi = net_profit / cost
+            # Post-lookup IP check against Keepa's canonical brand name
+            blocked, reason = is_brand_blocked(brand=k_brand, title=k_title)
+            if blocked:
+                continue
 
-    if roi < MIN_ROI:
-        return None
+            # Live heuristic scan & dynamic quarantine
+            is_ip, ip_reason = analyze_keepa_ip_signals(k_data)
+            if is_ip:
+                continue
 
-    return {
-        "asin": product_data.get("asin"),
-        "upc": upc,
-        "title": product_data.get("title", title),
-        "brand": brand_keepa,
-        "wholesale_cost": round(cost, 2),
-        "buybox_price": round(buybox, 2),
-        "net_profit": round(net_profit, 2),
-        "roi_pct": round(roi * 100, 1),
-        "fba_sellers": live_fba_sellers,
-        "sales_rank": stats.get("current", [0])[3] if stats.get("current") else None
-    }
+            # Extract pricing: Keepa prices are integers in cents ($29.99 = 2999)
+            stats = k_data.get("stats", {}) or {}
+            buybox_cents = stats.get("buyBoxPrice", 0)
+            
+            # Fall back to 90-day Buy Box average if current is suppressed
+            if buybox_cents <= 0:
+                avg90_arr = stats.get("avg90", [])
+                buybox_cents = avg90_arr[18] if len(avg90_arr) > 18 and avg90_arr[18] is not None else 0
+
+            buybox = buybox_cents / 100.0 if buybox_cents > 0 else 0.0
+            if buybox <= 0 or cost <= 0:
+                continue
+
+            # Financial waterfall: Net Profit >= Wholesale Cost (100% Net ROI)
+            net_proceeds = (buybox * (1.0 - AMAZON_REFERRAL_RATE)) - ESTIMATED_FBA_FEE - PREP_FEE
+            net_profit = net_proceeds - cost
+            roi = net_profit / cost
+
+            if roi >= MIN_ROI:
+                deal = {
+                    "distributor": item.get("distributor", "Unknown"),
+                    "item_number": item.get("item_number", ""),
+                    "asin": k_data.get("asin"),
+                    "upc": item.get("upc", ""),
+                    "brand": k_brand,
+                    "title": k_title,
+                    "wholesale_cost": round(cost, 2),
+                    "buybox_price": round(buybox, 2),
+                    "net_profit": round(net_profit, 2),
+                    "roi_pct": round(roi * 100, 1),
+                    "fba_sellers": stats.get("totalOfferCountFBA", 0),
+                    "sales_rank": stats.get("current", [0]*5)[3] if len(stats.get("current", [])) > 3 else None
+                }
+                viable_deals.append(deal)
+                logger.info(
+                    f"🎯 [MATCHED DEAL] {deal['brand']} | Cost: ${deal['wholesale_cost']} | "
+                    f"BB: ${deal['buybox_price']} | Profit: ${deal['net_profit']} | ROI: {deal['roi_pct']}%"
+                )
+
+        time.sleep(1.0)  # Rate limiting between Keepa requests
+
+    return viable_deals
+
+
+if __name__ == "__main__":
+    # Test batch execution against prepared BCI queue if present
+    bci_queue_path = ROOT_DIR / "data" / "catalogs" / "bci_ready_for_keepa.json"
+    if bci_queue_path.exists():
+        with open(bci_queue_path, "r", encoding="utf-8") as f:
+            candidates = json.load(f)
+        logger.info(f"Loaded {len(candidates)} items from {bci_queue_path.name}")
+        results = process_candidate_batch(candidates[:10])
+        print(f"\nDiscovered {len(results)} deals meeting the 100% ROI floor.")
+    else:
+        print("Prepare a scan queue or run tools/bci_catalog_parser.py first.")
