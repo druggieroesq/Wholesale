@@ -2,7 +2,7 @@
 # ==============================================================================
 # Master Wholesale Catalog Pipeline Daemon
 # Monitors /app/data/catalogs/incoming/ for incoming .xlsx/.csv files,
-# prioritizes distributor scans, and runs the Keepa finder during idle windows.
+# prioritizes distributor catalog scans, and archives processed sheets.
 # ==============================================================================
 set -euo pipefail
 
@@ -21,7 +21,6 @@ fi
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] === Master Wholesale Daemon Initialized ==="
 
 while true; do
-  # Find any Excel or CSV catalog files staged in incoming
   QUEUE=()
   while IFS= read -r -d $'\0' file; do
     QUEUE+=("$file")
@@ -35,30 +34,23 @@ while true; do
       lower_name=$(echo "$filename" | tr '[:upper:]' '[:lower:]')
       echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Starting processing for: $filename"
 
-      # Determine distributor profile
       dist_key="general"
       if [[ "$lower_name" =~ "frontier" ]]; then dist_key="frontier"; fi
       if [[ "$lower_name" =~ "contour" ]]; then dist_key="contour"; fi
       if [[ "$lower_name" =~ "bci" ]]; then dist_key="bci"; fi
 
-      # Execute universal catalog scanner with fees and multipack logic
+      # Execute scanner
       python3 "${APP_ROOT}/tools/universal_catalog_scanner.py" \
         --input "$catalog_file" \
         --distributor "$dist_key"
 
-      # Archive processed catalog
+      # Archive processed file
       timestamp=$(date +%Y%m%d_%H%M%S)
       mv "$catalog_file" "${PROCESSED_DIR}/${timestamp}_${filename}"
-      echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Finished $filename. Archived to processed directory."
+      echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Archived $filename to processed directory."
     done
-
-  else
-    # Queue is idle: Run one single pass of the reverse finder
-    echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] No pending catalogs. Running reverse finder check..."
-    python3 "${APP_ROOT}/tools/reverse_amazon_finder.py" --single-pass 2>/dev/null || true
   fi
 
-  # Sleep 15 minutes before the next poll loop
-  echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Pipeline idle. Sleeping 900s..."
-  sleep 900
+  # Sleep 60 seconds before re-checking incoming queue
+  sleep 60
 done
