@@ -1,0 +1,86 @@
+{
+  "version": "1.0",
+  "active_default_hub": "PARKLAND_HQ",
+  "nodes": [
+    {
+      "id": "PARKLAND_HQ",
+      "name": "Parkland Self-Prep & Inbound Station",
+      "region": "SOUTH_FLORIDA",
+      "state": "FL",
+      "zip": "33076",
+      "capabilities": ["STANDARD_FBA", "HAZMAT_LIMITED", "WILL_CALL_PICKUP", "MULTIPACK"],
+      "pricing": {
+        "receiving_fee_unit": 0.00,
+        "base_prep_unit": 0.06,
+        "multipack_addon_unit": 0.10,
+        "carton_forward_fee": 0.00
+      },
+      "constraints": {
+        "max_weight_per_unit_lbs": 45.0,
+        "max_dimensions_inches": [24.0, 24.0, 24.0],
+        "requires_pallet_dock": false,
+        "accepts_hazmat": true
+      }
+    },
+    {
+      "id": "APEX_PREP_NORTHEAST",
+      "name": "Apex Fulfillment Northeast",
+      "region": "NORTHEAST",
+      "state": "PA",
+      "zip": "19001",
+      "capabilities": ["STANDARD_FBA", "PALLET_RECEIVING", "OVERSIZED", "MULTIPACK"],
+      "pricing": {
+        "receiving_fee_unit": 0.25,
+        "base_prep_unit": 1.25,
+        "multipack_addon_unit": 0.35,
+        "carton_forward_fee": 2.50
+      },
+      "constraints": {
+        "max_weight_per_unit_lbs": 70.0,
+        "max_dimensions_inches": [36.0, 36.0, 36.0],
+        "requires_pallet_dock": true,
+        "accepts_hazmat": false
+      }
+    },
+    {
+      "id": "MIDWEST_MRO_LOGISTICS",
+      "name": "Midwest MRO Logistics Hub",
+      "region": "MIDWEST",
+      "state": "OH",
+      "zip": "43215",
+      "capabilities": ["STANDARD_FBA", "PALLET_RECEIVING", "HEAVY_MRO", "MULTIPACK"],
+      "pricing": {
+        "receiving_fee_unit": 0.30,
+        "base_prep_unit": 1.35,
+        "multipack_addon_unit": 0.40,
+        "carton_forward_fee": 3.00
+      },
+      "constraints": {
+        "max_weight_per_unit_lbs": 100.0,
+        "max_dimensions_inches": [48.0, 40.0, 48.0],
+        "requires_pallet_dock": true,
+        "accepts_hazmat": true
+      }
+    },
+    {
+      "id": "PACIFIC_SPEED_PREP",
+      "name": "Pacific Speed Prep West",
+      "region": "WEST_COAST",
+      "state": "CA",
+      "zip": "91761",
+      "capabilities": ["STANDARD_FBA", "HIGH_VELOCITY", "MULTIPACK"],
+      "pricing": {
+        "receiving_fee_unit": 0.35,
+        "base_prep_unit": 1.50,
+        "multipack_addon_unit": 0.45,
+        "carton_forward_fee": 3.50
+      },
+      "constraints": {
+        "max_weight_per_unit_lbs": 50.0,
+        "max_dimensions_inches": [24.0, 24.0, 24.0],
+        "requires_pallet_dock": true,
+        "accepts_hazmat": false
+      }
+    }
+  ]
+}
