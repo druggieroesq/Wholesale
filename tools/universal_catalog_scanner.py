@@ -2,7 +2,7 @@
 """
 tools/universal_catalog_scanner.py
 Universal Distributor Catalog Scanner with robust header auto-detection,
-multipack awareness, Keepa rate-pacing, and zero-token IP Shield filtering.
+proper pandas Series matching, token-bucket 429 backoff, and 50% ROI gate.
 """
 
 import os
@@ -43,7 +43,7 @@ def find_and_load_table(file_path: Path) -> pd.DataFrame:
     """Auto-detects header row offset across different distributor templates."""
     if file_path.suffix.lower() == ".csv":
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = [f.readline() for _ in range(20)]
+            lines = [f.readline() for _ in range(25)]
         
         header_row = 0
         for idx, line in enumerate(lines):
@@ -57,37 +57,37 @@ def find_and_load_table(file_path: Path) -> pd.DataFrame:
     elif file_path.suffix.lower() in [".xlsx", ".xls"]:
         xl = pd.ExcelFile(file_path)
         sheet_name = xl.sheet_names[0]
-        preview = xl.parse(sheet_name, nrows=20, header=None)
+        preview = pd.read_excel(xl, sheet_name=sheet_name, nrows=25, header=None)
 
         header_row = 0
         for idx, row in preview.iterrows():
             row_str = " ".join([str(val).lower() for val in row if pd.notna(val)])
-            if any(k in row_str for k in ["upc", "sku", "item #", "item no", "part number", "whls price", "cost", "price"]):
+            if any(k in row_str for k in ["upc", "sku", "item #", "item no", "part number", "whls price", "cost", "price", "dealerprice"]):
                 header_row = idx
                 break
 
         logger.info(f"Excel header detected at row {header_row} for {file_path.name}")
-        return xl.parse(sheet_name, skiprows=header_row, dtype=str)
+        return pd.read_excel(xl, sheet_name=sheet_name, skiprows=header_row, dtype=str)
 
     raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalizes arbitrary column names to canonical schema."""
+    """Normalizes vendor columns to canonical names."""
     df.columns = [str(c).strip() for c in df.columns]
     mapping = {}
 
     for c in df.columns:
         cl = c.lower()
-        if not mapping.get("upc") and any(k in cl for k in ["upc_a", "upc", "barcode", "ean"]):
+        if not mapping.get("upc") and any(k in cl for k in ["upc12", "upc_a", "upc", "barcode", "ean"]):
             mapping["upc"] = c
-        elif not mapping.get("sku") and any(k in cl for k in ["distributor sku", "item #", "item no", "part #", "sku", "mpn", "code"]):
+        elif not mapping.get("sku") and any(k in cl for k in ["activerecordcode", "distributor sku", "item #", "item no", "part #", "sku", "mpn", "code"]):
             mapping["sku"] = c
-        elif not mapping.get("cost") and any(k in cl for k in ["whls price", "wholesale", "cost", "unit price", "price", "dealer price"]):
+        elif not mapping.get("cost") and any(k in cl for k in ["dealerprice", "whls price", "wholesale", "cost", "unit price", "price"]):
             mapping["cost"] = c
-        elif not mapping.get("title") and any(k in cl for k in ["description", "title", "item description", "product name"]):
+        elif not mapping.get("title") and any(k in cl for k in ["description50", "description", "title", "item description", "product name"]):
             mapping["title"] = c
-        elif not mapping.get("brand") and any(k in cl for k in ["brand", "mfg", "manufacturer"]):
+        elif not mapping.get("brand") and any(k in cl for k in ["mfgnumber", "brand", "mfg", "manufacturer"]):
             mapping["brand"] = c
 
     logger.info(f"Column normalization mapping: {mapping}")
@@ -125,17 +125,34 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def query_keepa_batch(upcs: List[str]) -> Dict[str, Any]:
+    """Queries Keepa API by UPC batch and handles 429 token-bucket throttling."""
     if not KEEPA_API_KEY:
         return {}
     url = f"https://api.keepa.com/product?key={KEEPA_API_KEY}&domain=1&code={','.join(upcs)}"
-    try:
-        res = requests.get(url, timeout=30)
-        if res.status_code == 200:
-            return res.json()
-        logger.error(f"Keepa API HTTP {res.status_code}: {res.text[:200]}")
-    except Exception as e:
-        logger.error(f"Keepa query failure: {e}")
-    return {}
+    
+    while True:
+        try:
+            res = requests.get(url, timeout=30)
+            if res.status_code == 200:
+                return res.json()
+            elif res.status_code == 429:
+                err_data = {}
+                try:
+                    err_data = res.json()
+                except Exception:
+                    pass
+                refill_ms = err_data.get("refillIn", 60000)
+                wait_sec = max(5, int(refill_ms / 1000) + 2)
+                logger.warning(f"Keepa 429 (Tokens exhausted). Pausing {wait_sec}s for token refill...")
+                time.sleep(wait_sec)
+                continue
+            else:
+                logger.error(f"Keepa API HTTP {res.status_code}: {res.text[:200]}")
+                return {}
+        except Exception as e:
+            logger.error(f"Keepa query connection error: {e}")
+            time.sleep(5)
+            return {}
 
 
 def scan_catalog(file_path: str, distributor: str):
@@ -194,8 +211,9 @@ def scan_catalog(file_path: str, distributor: str):
 
             amz_price = buybox / 100.0
 
+            # Safe None check for pandas Series
             matched_row = next((r for r in batch if r["clean_upc"] in code_list or r["clean_upc"] == p.get("productCode")), None)
-            if not matched_row:
+            if matched_row is None:
                 continue
 
             cogs = matched_row["clean_cost"]
@@ -223,12 +241,13 @@ def scan_catalog(file_path: str, distributor: str):
                 if send_deal_card:
                     send_deal_card(deal)
 
-        tokens_left = keepa_data.get("tokensLeft", 300)
-        logger.info(f"Processed {min(i+batch_size, len(valid_rows))}/{len(valid_rows)} SKUs. Tokens: {tokens_left}. Found: {len(opportunities)}")
+        tokens_left = keepa_data.get("tokensLeft", 0)
+        logger.info(f"Processed {min(i+batch_size, len(valid_rows))}/{len(valid_rows)} SKUs. Tokens left: {tokens_left}. Opportunities: {len(opportunities)}")
 
-        if tokens_left < 30:
-            logger.info("Keepa token floor reached. Pausing 60s...")
-            time.sleep(60)
+        # Respect Starter plan token limit (refills ~20 tokens/minute)
+        if tokens_left < 25:
+            logger.info("Tokens low. Pacing for refill (45s)...")
+            time.sleep(45)
         else:
             time.sleep(2.5)
 
