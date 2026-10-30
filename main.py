@@ -3,7 +3,7 @@ main.py
 Master Production Runner for Wholesale MRO Arbitrage Fleet.
 
 Orchestrates:
-1. Telegram Polling Daemon (Background Thread) with anti-collision multi-user state.
+1. Telegram Polling Daemon (Background Thread) with 409-conflict mitigation & anti-collision state.
 2. Scheduled Morning Scout Run (7:00 AM ET): Generates Feed A (Buys) & Feed B (Reverse RFQs).
 3. Scheduled Evening Digest (8:00 PM ET): Dispatches partner email digest.
 4. Healthcheck / Ping loop for hosting runtime (Railway / Docker).
@@ -32,7 +32,6 @@ def run_morning_dispatch_job():
     """Triggers at 7:00 AM ET every morning."""
     logger.info("Executing 7:00 AM Morning Dispatch Routine...")
     try:
-        # Load active scan pools and generate Feed A & Feed B queues
         confirmed_buys = []
         reverse_rfqs = []
         
@@ -51,16 +50,37 @@ def run_evening_digest_job():
         logger.error(f"Error sending evening digest: {e}")
 
 def start_telegram_daemon():
-    """Runs Telegram listener thread."""
+    """
+    Runs Telegram listener thread safely after clearing pending connections
+    and handles automatic retry if an ephemeral 409 conflict occurs during deploy overlap.
+    """
     try:
         from tools.telegram_polling_daemon import bot
-        if bot:
-            logger.info("Starting Telegram Bot Polling thread...")
-            bot.infinity_polling(timeout=20, long_polling_timeout=10)
-        else:
+        if not bot:
             logger.warning("TELEGRAM_BOT_TOKEN not configured. Telegram bot daemon skipped.")
+            return
+
+        logger.info("Purging old Telegram sessions / webhooks before starting listener...")
+        try:
+            bot.remove_webhook(drop_pending_updates=True)
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"Webhook reset notice: {e}")
+
+        logger.info("Starting Telegram Bot Polling thread...")
+        while True:
+            try:
+                bot.infinity_polling(
+                    timeout=20,
+                    long_polling_timeout=10,
+                    skip_pending=True,
+                    logger_level=logging.WARNING
+                )
+            except Exception as poll_err:
+                logger.error(f"Polling connection interrupted: {poll_err}. Retrying in 5 seconds...")
+                time.sleep(5)
     except Exception as e:
-        logger.error(f"Telegram polling crashed: {e}")
+        logger.error(f"Telegram polling thread terminated: {e}")
 
 def main():
     logger.info("Booting Wholesale MRO Engine v2.0...")
