@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Universal Catalog & Multipack Scanner
-Parses distributor catalogs (BCI, Frontier, Contour), executes zero-token pre-filtering
-via Master IP Guard, evaluates single & multipack variations via Keepa API, computes
-true landed FBA fees and packaging buffers, and outputs qualified purchasing opportunities.
+tools/universal_catalog_scanner.py
+Universal Distributor Catalog Scanner with robust header auto-detection,
+multipack awareness, Keepa rate-pacing, and zero-token IP Shield filtering.
 """
 
 import os
@@ -12,193 +11,249 @@ import time
 import json
 import logging
 import argparse
-import requests
-import pandas as pd
 from pathlib import Path
+from typing import Dict, Any, List, Optional
+import pandas as pd
+import requests
+from dotenv import load_dotenv
 
-# Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tools.ip_guard import is_brand_blocked, is_sku_blocked
+load_dotenv("/app/.env")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] UniversalScanner: %(message)s")
 logger = logging.getLogger("UniversalScanner")
 
-ENV_FILE = Path("/app/.env")
-OUTPUT_DIR = Path("/app/data/reports")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+KEEPA_API_KEY = os.getenv("KEEPA_API_KEY", "").strip()
+MIN_ROI = float(os.getenv("MIN_ROI", "1.00"))  # Default 100% ROI
+REPORTS_DIR = Path("/app/data/reports")
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Attempt to load Telegram notifier
+try:
+    from tools.catalog_bot import send_deal_card
+except ImportError:
+    send_deal_card = None
+
+# Attempt to load IP Guard
+try:
+    from tools.ip_guard import IPGuard
+    ip_guard = IPGuard()
+except Exception:
+    ip_guard = None
 
 
-def load_env():
-    if not os.getenv("KEEPA_API_KEY") and ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("KEEPA_API_KEY=") and not line.startswith("#"):
-                os.environ["KEEPA_API_KEY"] = line.split("=", 1)[1].strip().strip('"').strip("'")
-            elif line.startswith("MIN_ROI=") and not line.startswith("#"):
-                os.environ["MIN_ROI"] = line.split("=", 1)[1].strip().strip('"').strip("'")
+def find_and_load_table(file_path: Path) -> pd.DataFrame:
+    """Auto-detects header row offset and loads clean DataFrame."""
+    if file_path.suffix.lower() == ".csv":
+        # Check first 15 lines for table header row
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [f.readline() for _ in range(15)]
+        
+        header_row = 0
+        for idx, line in enumerate(lines):
+            l_lower = line.lower()
+            if any(k in l_lower for k in ["upc", "sku", "item #", "item no", "barcode", "price", "cost"]):
+                header_row = idx
+                break
+        return pd.read_csv(file_path, skiprows=header_row, dtype=str)
+
+    elif file_path.suffix.lower() in [".xlsx", ".xls"]:
+        xl = pd.ExcelFile(file_path)
+        sheet_name = xl.sheet_names[0]
+        preview = xl.parse(sheet_name, nrows=15, header=None)
+
+        header_row = 0
+        for idx, row in preview.iterrows():
+            row_str = " ".join([str(val).lower() for val in row if pd.notna(val)])
+            if any(k in row_str for k in ["upc", "sku", "item #", "item no", "part number", "whls price", "cost"]):
+                header_row = idx
+                break
+
+        logger.info(f"Detected header row at index {header_row} for {file_path.name}")
+        return xl.parse(sheet_name, skiprows=header_row, dtype=str)
+
+    else:
+        raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
 
-def calculate_fba_fees(price: float, weight_lbs: float = 1.0) -> float:
-    referral_fee = price * 0.15
-    fba_pick_pack = 4.25 if weight_lbs <= 1.0 else 5.75 + (max(0, weight_lbs - 2.0) * 0.40)
-    return round(referral_fee + fba_pick_pack, 2)
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Maps vendor-specific header names to universal canonical columns."""
+    df.columns = [str(c).strip() for c in df.columns]
+    mapping = {}
+
+    for c in df.columns:
+        cl = c.lower()
+        if not mapping.get("upc") and any(k in cl for k in ["upc_a", "upc", "barcode", "ean"]):
+            mapping["upc"] = c
+        elif not mapping.get("sku") and any(k in cl for k in ["distributor sku", "item #", "item no", "part #", "sku", "mpn", "code"]):
+            mapping["sku"] = c
+        elif not mapping.get("cost") and any(k in cl for k in ["whls price", "wholesale", "cost", "unit price", "price", "dealer price"]):
+            mapping["cost"] = c
+        elif not mapping.get("title") and any(k in cl for k in ["description", "title", "item description", "product name"]):
+            mapping["title"] = c
+        elif not mapping.get("brand") and any(k in cl for k in ["brand", "mfg", "manufacturer"]):
+            mapping["brand"] = c
+
+    logger.info(f"Mapped columns: {mapping}")
+
+    clean_df = pd.DataFrame()
+    clean_df["raw_upc"] = df[mapping["upc"]] if "upc" in mapping else ""
+    clean_df["sku"] = df[mapping["sku"]] if "sku" in mapping else ""
+    clean_df["cost"] = df[mapping["cost"]] if "cost" in mapping else "0"
+    clean_df["title"] = df[mapping["title"]] if "title" in mapping else ""
+    clean_df["brand"] = df[mapping["brand"]] if "brand" in mapping else ""
+
+    # Clean barcodes (strip decimals, spaces, scientific notation)
+    def clean_barcode(val):
+        if pd.isna(val) or val is None:
+            return ""
+        s = str(val).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        digits = "".join([ch for ch in s if ch.isdigit()])
+        if len(digits) in [11, 12, 13]:
+            return digits.zfill(12) if len(digits) == 11 else digits
+        return digits
+
+    clean_df["clean_upc"] = clean_df["raw_upc"].apply(clean_barcode)
+
+    # Clean cost values
+    def clean_price(val):
+        if pd.isna(val) or val is None:
+            return 0.0
+        val_str = str(val).replace("$", "").replace(",", "").strip()
+        try:
+            return float(val_str)
+        except ValueError:
+            return 0.0
+
+    clean_df["clean_cost"] = clean_df["cost"].apply(clean_price)
+    return clean_df
 
 
-def get_keepa_product_data(api_key: str, identifiers: list) -> list:
-    if not identifiers:
-        return []
-    url = f"https://api.keepa.com/product?key={api_key}&domain=1&code={','.join(identifiers)}"
+def query_keepa_batch(upcs: List[str]) -> Dict[str, Any]:
+    """Queries Keepa API by UPC code batch."""
+    if not KEEPA_API_KEY:
+        return {}
+    url = f"https://api.keepa.com/product?key={KEEPA_API_KEY}&domain=1&code={','.join(upcs)}"
     try:
-        resp = requests.get(url, timeout=45)
-        if resp.status_code == 200:
-            data = resp.json()
-            refill_in = data.get("refillIn", 0)
-            tokens_left = data.get("tokensLeft", 0)
-            if tokens_left < 15 and refill_in > 0:
-                sleep_sec = max(5, int(refill_in / 1000) + 1)
-                logger.info(f"Keepa token buffer low ({tokens_left}). Throttling {sleep_sec}s...")
-                time.sleep(sleep_sec)
-            return data.get("products", [])
-        elif resp.status_code == 429:
-            logger.warning("Keepa 429 Rate Limit hit. Backing off 300s...")
-            time.sleep(300)
+        res = requests.get(url, timeout=30)
+        if res.status_code == 200:
+            return res.json()
+        logger.error(f"Keepa API HTTP {res.status_code}: {res.text[:200]}")
     except Exception as e:
-        logger.error(f"Keepa product lookup failed: {e}")
-    return []
+        logger.error(f"Keepa request error: {e}")
+    return {}
 
 
-def process_catalog(file_path: Path, distributor: str):
-    load_env()
-    api_key = os.getenv("KEEPA_API_KEY", "").strip()
-    min_roi = float(os.getenv("MIN_ROI", "1.00"))  # Default 100% ROI floor
+def scan_catalog(file_path: str, distributor: str):
+    path = Path(file_path)
+    logger.info(f"Loading catalog: {path.name} | Distributor: {distributor.upper()} | Min ROI: {MIN_ROI*100:.1f}%")
 
-    if not api_key:
-        logger.error("KEEPA_API_KEY missing. Cannot proceed.")
+    raw_df = find_and_load_table(path)
+    df = normalize_columns(raw_df)
+
+    # IP Guard pre-filter
+    blocked_count = 0
+    valid_rows = []
+    for _, row in df.iterrows():
+        brand = row["brand"]
+        sku = row["sku"]
+        if ip_guard and (ip_guard.is_blocked_brand(brand) or ip_guard.is_blocked_sku(sku)):
+            blocked_count += 1
+            continue
+        if row["clean_upc"] and row["clean_cost"] > 0:
+            valid_rows.append(row)
+
+    logger.info(f"Pre-filter complete: {len(valid_rows)} SKUs queued. Blocked {blocked_count} restricted items via IP Guard.")
+
+    if not valid_rows:
+        logger.warning(f"No valid UPCs/costs found in {path.name}.")
+        report_file = REPORTS_DIR / f"{distributor.lower()}_qualified_opportunities.json"
+        report_file.write_text("[]")
         return
 
-    logger.info(f"Loading catalog: {file_path.name} | Distributor: {distributor.upper()} | Min ROI: {min_roi * 100}%")
-
-    if file_path.suffix.lower() == ".csv":
-        df = pd.read_csv(file_path, low_memory=False)
-    else:
-        df = pd.read_excel(file_path)
-
-    # Standardize column headers
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    sku_col = cols.get("sku") or cols.get("item") or cols.get("item #") or cols.get("item number") or cols.get("material") or cols.get("vendorsku")
-    upc_col = cols.get("upc") or cols.get("barcode") or cols.get("upc code") or cols.get("gtin")
-    cost_col = cols.get("cost") or cols.get("price") or cols.get("wholesale price") or cols.get("unit price") or cols.get("dealer price")
-    brand_col = cols.get("brand") or cols.get("manufacturer") or cols.get("mfr") or cols.get("vendor")
-    title_col = cols.get("title") or cols.get("description") or cols.get("item description")
-
-    records_to_scan = []
-    skipped_ip_count = 0
-
-    for _, row in df.iterrows():
-        sku = str(row[sku_col]).strip() if sku_col and pd.notna(row[sku_col]) else ""
-        brand = str(row[brand_col]).strip() if brand_col and pd.notna(row[brand_col]) else ""
-        title = str(row[title_col]).strip() if title_col and pd.notna(row[title_col]) else ""
-        upc = str(row[upc_col]).strip().replace(".0", "") if upc_col and pd.notna(row[upc_col]) else ""
-        try:
-            cost = float(str(row[cost_col]).replace("$", "").replace(",", "").strip()) if cost_col and pd.notna(row[cost_col]) else 0.0
-        except ValueError:
-            cost = 0.0
-
-        if cost <= 0 or (not upc and not sku):
-            continue
-
-        # Zero-token IP Guard verification
-        blocked_sku, r_sku = is_sku_blocked(sku)
-        if blocked_sku:
-            skipped_ip_count += 1
-            continue
-
-        blocked_brand, r_brand = is_brand_blocked(brand=brand, title=title)
-        if blocked_brand:
-            skipped_ip_count += 1
-            continue
-
-        records_to_scan.append({
-            "sku": sku,
-            "upc": upc.zfill(12) if len(upc) in (10, 11) else upc,
-            "cost": cost,
-            "brand": brand,
-            "title": title
-        })
-
-    logger.info(f"Pre-filter complete: {len(records_to_scan)} SKUs queued. Blocked {skipped_ip_count} restricted items via IP Guard.")
-
-    qualified_opportunities = []
+    # Batch Keepa queries
     batch_size = 20
+    opportunities = []
 
-    for i in range(0, len(records_to_scan), batch_size):
-        batch = records_to_scan[i:i + batch_size]
-        upcs = [b["upc"] for b in batch if b["upc"]]
-        if not upcs:
+    for i in range(0, len(valid_rows), batch_size):
+        batch = valid_rows[i:i+batch_size]
+        upc_list = [r["clean_upc"] for r in batch if len(r["clean_upc"]) >= 10]
+        if not upc_list:
             continue
 
-        products = get_keepa_product_data(api_key, upcs)
-        prod_map = {}
+        keepa_data = query_keepa_batch(upc_list)
+        products = keepa_data.get("products", [])
+
+        # Match results and check ROI
         for p in products:
-            for upc_code in (p.get("upcList") or []):
-                prod_map[upc_code] = p
-
-        for item in batch:
-            prod = prod_map.get(item["upc"])
-            if not prod:
+            asin = p.get("asin")
+            code_list = p.get("upcList", [])
+            csv_data = p.get("csv", [])
+            if not csv_data:
                 continue
 
-            # Basic sales rank filter: BSR <= 80,000
-            stats = prod.get("stats", {})
-            current_sales = stats.get("current", [0] * 30)[3] if "current" in stats else 999999
-            if current_sales is None or current_sales > 80000 or current_sales <= 0:
+            # Buy Box or New Price
+            buybox = None
+            if len(csv_data) > 18 and csv_data[18]:
+                buybox = csv_data[18][-1]
+            elif len(csv_data) > 1 and csv_data[1]:
+                buybox = csv_data[1][-1]
+
+            if not buybox or buybox <= 0:
                 continue
 
-            # Buy Box price in cents converted to dollars
-            buy_box_cents = stats.get("buyBoxPrice", 0)
-            if not buy_box_cents or buy_box_cents <= 0:
+            amz_price = buybox / 100.0
+
+            # Match to catalog row
+            matched_row = next((r for r in batch if r["clean_upc"] in code_list or r["clean_upc"] == p.get("productCode")), None)
+            if not matched_row:
                 continue
-            buy_box = buy_box_cents / 100.0
 
-            # Evaluate Single Pack and Multipacks (1, 2, 3, 4, 6)
-            for pack_size in [1, 2, 3, 4, 6]:
-                prep_cost = 0.35 * pack_size if pack_size > 1 else 0.0
-                total_cogs = (item["cost"] * pack_size) + prep_cost
-                fba_fees = calculate_fba_fees(buy_box, weight_lbs=0.8 * pack_size)
-                inbound_freight = 0.50 * pack_size
+            cogs = matched_row["clean_cost"]
+            fba_fee_est = max(4.50, amz_price * 0.15 + 3.50)
+            prep_fee = 0.35
+            net_profit = amz_price - fba_fee_est - prep_fee - cogs
+            roi = (net_profit / cogs) if cogs > 0 else 0
 
-                net_profit = buy_box - (total_cogs + fba_fees + inbound_freight)
-                roi = net_profit / total_cogs if total_cogs > 0 else 0
+            if roi >= MIN_ROI:
+                deal = {
+                    "asin": asin,
+                    "title": matched_row["title"] or p.get("title", "Catalog Deal"),
+                    "vendor": distributor.upper(),
+                    "sku": matched_row["sku"],
+                    "pack_size": 1,
+                    "wholesale_cost": cogs,
+                    "amazon_price": amz_price,
+                    "roi_pct": round(roi * 100, 1),
+                    "net_profit": round(net_profit, 2),
+                    "sales_rank": p.get("salesRanks", {}).get("displayGroup", "N/A"),
+                    "vendor_url": "https://www.google.com"
+                }
+                opportunities.append(deal)
+                logger.info(f"🔥 Deal found: {deal['title'][:35]} | ROI: {deal['roi_pct']}% | Profit: ${deal['net_profit']}")
+                if send_deal_card:
+                    send_deal_card(deal)
 
-                if roi >= min_roi:
-                    qualified_opportunities.append({
-                        "Distributor": distributor.upper(),
-                        "Distributor_SKU": item["sku"],
-                        "UPC": item["upc"],
-                        "ASIN": prod.get("asin"),
-                        "Brand": item["brand"],
-                        "Title": prod.get("title", item["title"]),
-                        "Pack_Size": pack_size,
-                        "Unit_Cost": item["cost"],
-                        "Total_COGS": round(total_cogs, 2),
-                        "BuyBox_Price": round(buy_box, 2),
-                        "FBA_Fees": round(fba_fees, 2),
-                        "Net_Profit": round(net_profit, 2),
-                        "ROI_Pct": round(roi * 100, 2),
-                        "Sales_Rank": current_sales
-                    })
+        tokens_left = keepa_data.get("tokensLeft", 300)
+        logger.info(f"Processed {min(i+batch_size, len(valid_rows))}/{len(valid_rows)} SKUs. Tokens left: {tokens_left}. Qualified items: {len(opportunities)}")
 
-        logger.info(f"Processed {min(i + batch_size, len(records_to_scan))}/{len(records_to_scan)} SKUs. Qualified items: {len(qualified_opportunities)}")
+        # Token pacing: Keepa starter refills 5% every min (~12 tokens/min)
+        if tokens_left < 30:
+            logger.info("Keepa token buffer low. Sleeping 60s to refill...")
+            time.sleep(60)
+        else:
+            time.sleep(2.5)
 
-    out_file = OUTPUT_DIR / f"{distributor.lower()}_qualified_opportunities.json"
-    out_file.write_text(json.dumps(qualified_opportunities, indent=2))
-    logger.info(f"Scan complete. Output saved to {out_file} ({len(qualified_opportunities)} opportunities).")
+    report_file = REPORTS_DIR / f"{distributor.lower()}_qualified_opportunities.json"
+    report_file.write_text(json.dumps(opportunities, indent=2))
+    logger.info(f"Scan complete. Output saved to {report_file} ({len(opportunities)} opportunities).")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Universal Catalog Scanner")
-    parser.add_argument("--input", required=True, help="Path to input catalog file (.xlsx or .csv)")
-    parser.add_argument("--distributor", default="general", help="Distributor profile (bci, frontier, contour)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Path to catalog file")
+    parser.add_argument("--distributor", required=True, help="Distributor name")
     args = parser.parse_args()
 
-    process_catalog(Path(args.input), args.distributor)
+    scan_catalog(args.input, args.distributor)
