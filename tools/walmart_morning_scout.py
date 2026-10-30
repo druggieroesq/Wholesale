@@ -1,17 +1,16 @@
 """
 tools/walmart_morning_scout.py
-Dual-Channel Morning Scout: Cross-References Amazon FBA Viability with Walmart WFS Gaps.
-Features:
-- Primary Gate: 100% Net ROI on Amazon FBA (Active Selling Channel).
-- Secondary Multiplier: Walmart WFS Ghost Gap (0 WFS sellers, FBM presence).
-- Enforces Layer 0 IP Guard (659+ protected brands).
-- Sends actionable dual-channel lead cards to Telegram.
+Walmart Reverse Distributor Discovery Scout.
+Finds high-demand, zero-WFS products on Walmart, calculates the target wholesale
+cost for 100% Net ROI, checks the 659-brand IP firewall, and generates direct
+distributor search leads for outreach.
 """
 
 import os
 import sys
 import json
 import logging
+import urllib.parse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -19,132 +18,113 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+
 from tools.ip_guard import is_brand_blocked
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] WalmartScout: %(message)s")
+logger = logging.getLogger("WalmartScout")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DENIED_SUPPLIERS_FILE = ROOT_DIR / "data" / "denied_suppliers.json"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 PREP_FEE = 0.06
-AMAZON_REFERRAL_PCT = 0.15
 WALMART_REFERRAL_PCT = 0.15
-
-
-def load_denied_suppliers() -> List[str]:
-    if DENIED_SUPPLIERS_FILE.exists():
-        try:
-            with open(DENIED_SUPPLIERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-
-def estimate_fba_fee(weight_lbs: float) -> float:
-    if weight_lbs <= 1.0:
-        return 3.86
-    elif weight_lbs <= 2.0:
-        return 5.40
-    elif weight_lbs <= 3.0:
-        return 6.10
-    return round(6.10 + (weight_lbs - 3.0) * 0.45, 2)
+TARGET_MIN_ROI = 1.00  # 100% Net ROI floor
 
 
 def estimate_wfs_fee(weight_lbs: float) -> float:
-    """Walmart standard fulfillment fee tiers (2026 schedule)."""
+    """Estimated Walmart WFS tiered fulfillment fee."""
     if weight_lbs <= 1.0:
         return 3.45
     elif weight_lbs <= 2.0:
         return 4.95
     elif weight_lbs <= 3.0:
         return 5.45
-    return round(5.75 + (weight_lbs - 4.0) * 0.40, 2)
+    return round(5.75 + max(0.0, weight_lbs - 4.0) * 0.40, 2)
 
 
-def evaluate_dual_channel_opportunity(
-    item: Dict[str, Any],
-    min_roi_floor: float = 1.00
-) -> Optional[Dict[str, Any]]:
+def calculate_max_allowable_cost(retail_price: float, weight_lbs: float) -> float:
     """
-    Evaluates item viability on BOTH channels:
-    1. Layer 0 IP Guard check.
-    2. Amazon FBA: Must meet 100% Net ROI floor (immediate active sales).
-    3. Walmart WFS: Flags 0-WFS gap for secondary scale.
+    Calculates Maximum Allowable Wholesale Cost (MAC) to achieve 100% Net ROI:
+    Net Profit = Retail - (15% Referral) - WFS Fee - Inbound Freight - Prep ($0.06) - Cost
+    Target: Net Profit >= Total Landed Cost (Cost + Freight + Prep)
+    => Retail - Referral - WFS Fee >= 2 * Cost + 2 * (Freight + Prep)
+    => Max Cost = (Retail - Referral - WFS Fee - 2 * (Freight + Prep)) / 2
     """
-    brand = item.get("brand", "")
-    title = item.get("title", "")
-    vendor = item.get("vendor", "")
-
-    # 1. Layer 0 IP Guard Check
-    blocked, reason = is_brand_blocked(brand=brand, title=title, vendor=vendor)
-    if blocked:
-        logger.debug(f"Skipping {brand}: {reason}")
-        return None
-
-    cost = float(item.get("wholesale_cost", 0.0))
-    amz_price = float(item.get("amz_price", item.get("amazon_price", 0.0)))
-    walmart_price = float(item.get("walmart_price", amz_price))
-    weight_lbs = float(item.get("weight_lbs", 1.5))
-
-    if cost <= 0 or amz_price <= 0:
-        return None
-
-    # Inbound freight + prep
     inbound_freight = round(max(0.65, weight_lbs * 0.40), 2)
-    landed_cost = cost + inbound_freight + PREP_FEE
+    prep_and_freight = PREP_FEE + inbound_freight
+    walmart_deductions = (retail_price * WALMART_REFERRAL_PCT) + estimate_wfs_fee(weight_lbs)
+    
+    net_before_cost = retail_price - walmart_deductions
+    max_cost = (net_before_cost - (2 * prep_and_freight)) / 2.0
+    return max(0.0, round(max_cost, 2))
 
-    # 2. Primary Gate: Amazon FBA Financials
-    amz_fees = (amz_price * AMAZON_REFERRAL_PCT) + estimate_fba_fee(weight_lbs)
-    amz_net_profit = amz_price - amz_fees - landed_cost
-    amz_roi = (amz_net_profit / landed_cost) if landed_cost > 0 else 0.0
 
-    # Strict Amazon 100% Net ROI floor
-    if amz_roi < min_roi_floor or amz_net_profit < 5.00:
+def evaluate_walmart_lead(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Evaluates a candidate product found on Walmart:
+    1. Runs Layer 0 IP Guard (drops chronic enforcers).
+    2. Verifies zero WFS competition.
+    3. Calculates target wholesale buy price for 100% Net ROI.
+    """
+    brand = item.get("brand", "").strip()
+    title = item.get("title", "").strip()
+    mpn = item.get("mpn", item.get("model", "")).strip()
+
+    # 1. Layer 0 IP Firewall Check (659+ Brands)
+    blocked, reason = is_brand_blocked(brand=brand, title=title)
+    if blocked:
+        logger.debug(f"Skipping brand '{brand}': {reason}")
         return None
 
-    # 3. Secondary Gate: Walmart WFS Gap Analysis
+    retail_price = float(item.get("price", 0.0))
+    monthly_sales = int(item.get("monthly_sales_est", 0))
     wfs_sellers = int(item.get("wfs_sellers", 0))
     merchant_sellers = int(item.get("merchant_sellers", 0))
-    
-    # Calculate projected Walmart financials
-    wfs_fees = (walmart_price * WALMART_REFERRAL_PCT) + estimate_wfs_fee(weight_lbs)
-    wm_net_profit = walmart_price - wfs_fees - landed_cost
-    wm_roi = (wm_net_profit / landed_cost) if landed_cost > 0 else 0.0
+    weight_lbs = float(item.get("weight_lbs", 1.5))
 
-    has_wfs_ghost_gap = (wfs_sellers == 0 and merchant_sellers > 0)
+    # Gating: High velocity, no WFS sellers, commercial retail price
+    if retail_price < 25.0 or monthly_sales < 15 or wfs_sellers > 0:
+        return None
+
+    target_buy_cost = calculate_max_allowable_cost(retail_price, weight_lbs)
+    if target_buy_cost < 5.0:
+        return None
+
+    # Projected payout metrics if purchased at target cost
+    inbound_freight = round(max(0.65, weight_lbs * 0.40), 2)
+    landed_cost = target_buy_cost + inbound_freight + PREP_FEE
+    fees = (retail_price * WALMART_REFERRAL_PCT) + estimate_wfs_fee(weight_lbs)
+    projected_net_profit = round(retail_price - fees - landed_cost, 2)
+    projected_roi = round((projected_net_profit / landed_cost) * 100, 1) if landed_cost > 0 else 0.0
+
+    # Build direct search query for B2B supplier outreach
+    query_str = f'"{brand}" wholesale distributor OR "authorized dealer" USA'
+    search_url = f"https://www.google.com/search?q={urllib.parse.quote(query_str)}"
 
     return {
-        "item_id": item.get("item_id", item.get("asin", "")),
-        "asin": item.get("asin", ""),
-        "upc": item.get("upc", ""),
+        "item_id": item.get("item_id", ""),
         "title": title,
         "brand": brand,
-        "vendor": vendor,
-        "wholesale_cost": cost,
-        "landed_cost": round(landed_cost, 2),
-        "weight_lbs": weight_lbs,
-        # Amazon Metrics (Active Execution)
-        "amz_price": amz_price,
-        "amz_net_profit": round(amz_net_profit, 2),
-        "amz_roi_pct": round(amz_roi * 100, 1),
-        # Walmart Metrics (Expansion Horizon)
-        "walmart_price": walmart_price,
-        "wm_net_profit": round(wm_net_profit, 2),
-        "wm_roi_pct": round(wm_roi * 100, 1),
-        "wfs_sellers": wfs_sellers,
+        "mpn": mpn,
+        "upc": item.get("upc", ""),
+        "retail_price": retail_price,
+        "target_buy_cost": target_buy_cost,
+        "projected_net_profit": projected_net_profit,
+        "projected_roi": projected_roi,
+        "monthly_velocity": monthly_sales,
         "merchant_sellers": merchant_sellers,
-        "has_wfs_ghost_gap": has_wfs_ghost_gap,
-        "lead_type": "DUAL_CHANNEL_AMZ_PROVEN_WFS_GAP" if has_wfs_ghost_gap else "AMZ_ACTIVE_ONLY"
+        "weight_lbs": weight_lbs,
+        "search_url": search_url
     }
 
 
-def send_morning_scout_telegram(deals: List[Dict[str, Any]]):
-    """Sends formatted dual-channel scout cards to Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not deals:
-        logger.warning("Telegram credentials missing or no deals found.")
+def send_distributor_leads_telegram(leads: List[Dict[str, Any]]):
+    """Dispatches actionable distributor hunter cards to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not leads:
+        logger.warning("Telegram credentials missing or no leads to send.")
         return
 
     import telebot
@@ -153,31 +133,62 @@ def send_morning_scout_telegram(deals: List[Dict[str, Any]]):
     bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
     bot.send_message(
         TELEGRAM_CHAT_ID,
-        f"☀️ <b>DUAL-CHANNEL MORNING SCOUT REPORT</b>\n"
-        f"Discovered <b>{len(deals)}</b> safe wholesale items today.\n"
-        f"<i>100%+ Net ROI verified on Amazon FBA with ready WFS expansion upside.</i>"
+        f"🎯 <b>WALMART REVERSE DISTRIBUTOR DISCOVERY</b>\n"
+        f"Identified <b>{len(leads)}</b> velocity products with <b>0 WFS competition</b>.\n"
+        f"<i>Target costs calibrated for 100%+ Net ROI and safe against the IP blocklist.</i>"
     )
 
-    for d in deals[:10]:
-        wfs_badge = "🔥 <b>0 WFS SELLERS (Monopoly Ready)</b>" if d["has_wfs_ghost_gap"] else "Standard Competition"
-        msg = (
-            f"🎯 <b>{d.get('title', 'Wholesale Item')[:45]}</b>\n"
-            f"• Brand: <code>{d.get('brand', 'N/A')}</code> | Vendor: <code>{d.get('vendor', 'N/A')}</code>\n"
-            f"• Landed Cost: ${d['landed_cost']:.2f} (Cost: ${d['wholesale_cost']:.2f})\n\n"
-            f"📦 <b>Amazon FBA (Live Channel):</b>\n"
-            f"  Retail: ${d['amz_price']:.2f} | Net: <b>${d['amz_net_profit']:.2f}</b> (<b>{d['amz_roi_pct']}% ROI</b>)\n\n"
-            f"🏪 <b>Walmart WFS Projection:</b>\n"
-            f"  Retail: ${d['walmart_price']:.2f} | Net: ${d['wm_net_profit']:.2f} ({d['wm_roi_pct']}% ROI)\n"
-            f"  Status: {wfs_badge}\n"
-            f"• Strategy: <code>{d['lead_type']}</code>"
+    for lead in leads[:8]:
+        card = (
+            f"📦 <b>{lead['brand'].upper()}</b> — {lead['title'][:55]}...\n"
+            f"• MPN / Model: <code>{lead['mpn'] or 'See Title'}</code> | UPC: <code>{lead['upc'] or 'N/A'}</code>\n"
+            f"• Walmart Retail Price: <b>${lead['retail_price']:.2f}</b>\n"
+            f"• <b>Target Wholesale Cost: &le; ${lead['target_buy_cost']:.2f}</b> (For 100% ROI)\n"
+            f"• Estimated Demand: <b>~{lead['monthly_velocity']} units/month</b>\n"
+            f"• Competition: <b>0 WFS Sellers</b> ({lead['merchant_sellers']} Merchant/FBM)\n"
+            f"• Projected Profit: <b>${lead['projected_net_profit']:.2f} / unit</b> ({lead['projected_roi']}% ROI)"
         )
+
         markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("✅ Review Lead", callback_data=f"lead_ok_{d.get('item_id', '1')}"),
-            types.InlineKeyboardButton("🚫 Deny Supplier", callback_data=f"lead_deny_{d.get('vendor', '1')}")
+        markup.row(
+            types.InlineKeyboardButton("🔍 Find Distributors", url=lead["search_url"]),
+            types.InlineKeyboardButton("🚫 Deny Brand", callback_data=f"block_brand_{lead['brand'][:15]}")
         )
-        bot.send_message(TELEGRAM_CHAT_ID, msg, reply_markup=markup)
+
+        bot.send_message(TELEGRAM_CHAT_ID, card, reply_markup=markup, disable_web_page_preview=True)
 
 
 if __name__ == "__main__":
-    logger.info("Dual-Channel Morning Scout initialized.")
+    logger.info("Testing Walmart Reverse Distributor Discovery Scout...")
+    # Representative test items
+    test_items = [
+        {
+            "item_id": "WM-90214",
+            "title": "Commercial Brass Dual Female Check Valve 3/4 Inch",
+            "brand": "ProFlow Valves",
+            "mpn": "PF-CV-75",
+            "upc": "840192837465",
+            "price": 49.99,
+            "monthly_sales_est": 38,
+            "wfs_sellers": 0,
+            "merchant_sellers": 3,
+            "weight_lbs": 1.4
+        },
+        {
+            "item_id": "WM-BLOCKED",
+            "title": "Industrial High Velocity Heavy Floor Fan",
+            "brand": "3M",  # Should be dropped by IP Guard
+            "mpn": "FAN-3M-IND",
+            "price": 120.00,
+            "monthly_sales_est": 50,
+            "wfs_sellers": 0,
+            "merchant_sellers": 2,
+            "weight_lbs": 12.0
+        }
+    ]
+
+    qualified = [lead for item in test_items if (lead := evaluate_walmart_lead(item))]
+    logger.info(f"Qualified reverse leads: {len(qualified)}")
+    for q in qualified:
+        print(f"\nBrand: {q['brand']} | Retail: ${q['retail_price']} | Target Wholesale Buy Price: <= ${q['target_buy_cost']}")
+        print(f"Distributor Search Query URL: {q['search_url']}")
