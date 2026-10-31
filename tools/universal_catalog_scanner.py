@@ -19,6 +19,11 @@ import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Ensure /app root directory is available on sys.path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from core.ip_guard import is_ip_blocked
 
 load_dotenv("/app/.env")
