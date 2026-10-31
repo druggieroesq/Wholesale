@@ -4,6 +4,7 @@ Universal Wholesale Catalog Forward Scanner ($10+ Profit Per Sale & 75%+ ROI)
 -----------------------------------------------------------------------------
 - Fully self-contained: Zero external module dependencies (No 'core' import crashes)
 - Direct live reload from /app/data/ip_blocklist.json
+- CLI argument compatibility: accepts --input and --distributor flags from Railway entrypoint
 - Strict 75% Net ROI hurdle AND $10.00 minimum net profit PER ORDER/SALE
 - Multipack/bundle aware: multiplies piece cost by bundle quantity
 - Shared Keepa token reserve manager: prevents negative token starvation
@@ -18,6 +19,7 @@ import time
 import json
 import re
 import logging
+import argparse
 import requests
 import pandas as pd
 from pathlib import Path
@@ -159,8 +161,10 @@ def dispatch_catalog_alert(deal: dict):
         logger.error(f"Telegram dispatch failed: {e}")
 
 
-def scan_catalog_file(file_path: Path):
-    logger.info(f"Starting catalog scan on: {file_path.name} (Hurdles: MIN_ROI={MIN_ROI * 100}%, MIN_PROFIT_PER_SALE=${MIN_PROFIT_PER_SALE:.2f})")
+def scan_catalog_file(file_path: Path, distributor_override: str = None):
+    vendor_name = distributor_override.upper() if distributor_override else file_path.stem.replace("_Catalog", "").upper()
+    logger.info(f"Starting catalog scan on: {file_path.name} | Vendor: {vendor_name} (Hurdles: MIN_ROI={MIN_ROI * 100}%, MIN_PROFIT_PER_SALE=${MIN_PROFIT_PER_SALE:.2f})")
+    
     try:
         if file_path.suffix.lower() in [".xlsx", ".xls"]:
             df = pd.read_excel(file_path)
@@ -171,7 +175,7 @@ def scan_catalog_file(file_path: Path):
         return
 
     upc_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["UPC", "BARCODE", "EAN"])), None)
-    cost_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["PRICE", "COST", "DEALER"])), None)
+    cost_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["PRICE", "COST", "DEALER", "WHLS"])), None)
     sku_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["ITEM", "SKU", "CODE"])), None)
     brand_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["BRAND", "MFR", "MANUFACTURER"])), None)
     desc_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["DESC", "DESCRIPTION", "NAME"])), None)
@@ -180,7 +184,6 @@ def scan_catalog_file(file_path: Path):
         logger.warning(f"Could not map UPC and Cost columns in {file_path.name}. Skipping.")
         return
 
-    vendor_name = file_path.stem.replace("_Catalog", "").upper()
     items_to_query = []
 
     for _, row in df.iterrows():
@@ -202,9 +205,9 @@ def scan_catalog_file(file_path: Path):
     batch_size = 20
     for i in range(0, len(items_to_query), batch_size):
         tokens_left, refill_rate = get_keepa_tokens()
-        # Reserve buffer elevated to 40 tokens so both engines can operate without going negative
-        if tokens_left < 40:
-            sleep_time = max(3.0, round(float(40 - tokens_left) / (refill_rate / 60.0), 2))
+        # Elevated buffer to coordinate with concurrent Reverse Hunter execution
+        if tokens_left < 30:
+            sleep_time = max(3.0, round(float(30 - tokens_left) / (refill_rate / 60.0), 2))
             logger.info(f"Token reserve buffer active ({tokens_left} tokens). Sleeping {sleep_time}s...")
             time.sleep(sleep_time)
 
@@ -288,8 +291,13 @@ def scan_catalog_file(file_path: Path):
         time.sleep(max(1.0, round(3.0 / (refill_rate / 20.0), 2)))
 
 
-def run_catalog_scanner_daemon():
+def run_catalog_scanner_daemon(single_file: Path = None, distributor_name: str = None):
     logger.info(f"Universal Catalog Scanner Daemon online (Min ROI: {MIN_ROI * 100}%, Min Profit per Sale: ${MIN_PROFIT_PER_SALE:.2f}).")
+    
+    if single_file and single_file.exists():
+        scan_catalog_file(single_file, distributor_override=distributor_name)
+        return
+
     while True:
         catalog_files = [f for f in INCOMING_DIR.glob("*.*") if f.suffix.lower() in [".xlsx", ".xls", ".csv"]]
         if catalog_files:
@@ -300,4 +308,16 @@ def run_catalog_scanner_daemon():
 
 
 if __name__ == "__main__":
-    run_catalog_scanner_daemon()
+    parser = argparse.ArgumentParser(description="Universal Wholesale Catalog Scanner")
+    parser.add_argument("--input", type=str, default=None, help="Path to specific catalog file to scan")
+    parser.add_argument("--distributor", type=str, default=None, help="Distributor name override")
+    parser.add_argument("--min-rank", type=int, default=1, help="Min BSR rank (Railway compatibility)")
+    parser.add_argument("--max-rank", type=int, default=250000, help="Max BSR rank (Railway compatibility)")
+    parser.add_argument("--min-fbm-price", type=float, default=22.0, help="Min FBM retail price floor")
+    parser.add_argument("--min-tokens", type=int, default=50, help="Min token reserve (Railway compatibility)")
+    parser.add_argument("--max-weight", type=float, default=8.0)
+    parser.add_argument("--max-dim", type=float, default=16.0)
+    args = parser.parse_args()
+
+    target_file = Path(args.input) if args.input else None
+    run_catalog_scanner_daemon(single_file=target_file, distributor_name=args.distributor)
