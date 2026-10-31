@@ -1,102 +1,66 @@
 #!/usr/bin/env bash
+# run_all_catalogs.sh - Complete Pipeline Orchestrator with Max-FBA 2 & Dynamic Allocation
+set -e
 
-INCOMING_DIR="/app/data/catalogs/incoming"
-PROCESSED_DIR="/app/data/catalogs/processed"
-LOGS_DIR="/app/data/logs"
-CHECKPOINTS_DIR="/app/data/checkpoints"
-REPORTS_DIR="/app/data/reports"
+DATA_DIR="/app/data"
+INCOMING_DIR="${DATA_DIR}/catalogs/incoming"
+LOGS_DIR="${DATA_DIR}/logs"
+REPORTS_DIR="${DATA_DIR}/reports"
+CHECKPOINTS_DIR="${DATA_DIR}/checkpoints"
 
-mkdir -p "$INCOMING_DIR" "$PROCESSED_DIR" "$LOGS_DIR" "$CHECKPOINTS_DIR" "$REPORTS_DIR"
+mkdir -p "${INCOMING_DIR}" "${LOGS_DIR}" "${REPORTS_DIR}" "${CHECKPOINTS_DIR}"
 
 echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] === Initializing Autonomous 50/50 Dual Pipeline ==="
 
-# -------------------------------------------------------------------
-# 0. Sync IP Blocklist across persistent volume mount
-# -------------------------------------------------------------------
-if [ -f "/app/data/ip_blocklist.json" ]; then
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] IP Blocklist confirmed at /app/data/ip_blocklist.json."
-elif [ -f "/app/ip_blocklist.json" ]; then
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Copying /app/ip_blocklist.json to /app/data/ip_blocklist.json..."
-    cp /app/ip_blocklist.json /app/data/ip_blocklist.json
-fi
-
-# -------------------------------------------------------------------
-# 1. Launch 24/7 Reverse Hunter Immediately in Background (50% tokens)
-# -------------------------------------------------------------------
-if ! pgrep -f "reverse_amazon_finder.py" > /dev/null; then
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Starting Reverse Amazon Hunter (0-FBA Prime targets)..."
-    nohup python3 /app/tools/reverse_amazon_finder.py \
-        --min-rank 1 \
-        --max-rank 80000 \
-        --max-fba 0 \
-        --min-fbm-price 25.0 \
-        > "$LOGS_DIR/reverse_hunter.log" 2>&1 &
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Reverse Hunter running (PID: $!). Streaming to Telegram."
-fi
-
-# -------------------------------------------------------------------
-# 2. Auto-download Catalog Sheets if Missing in Incoming
-# -------------------------------------------------------------------
-if [ ! -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ]; then
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Frontier Catalog..."
-    curl -sL "https://docs.google.com/spreadsheets/d/122YeUPONFQuwy5UfoE3pz8RNK1pdb9l0/export?format=xlsx" -o "$INCOMING_DIR/Frontier_Catalog.xlsx"
-fi
-
-if [ ! -f "$INCOMING_DIR/Contour_Catalog.csv" ]; then
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Contour Catalog..."
-    curl -sL "https://drive.google.com/uc?export=download&id=1-YRPv_YSM82L38E7TnUNDdfSxRDWK0sA" -o "$INCOMING_DIR/Contour_Catalog.csv"
-fi
-
-if [ ! -f "$INCOMING_DIR/BCI_Catalog.xlsx" ]; then
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching BCI Catalog..."
-    curl -sL "https://docs.google.com/spreadsheets/d/1D1hUS38LK-8XsQIdIOeluUM1XKUu-n8-/export?format=xlsx" -o "$INCOMING_DIR/BCI_Catalog.xlsx"
-fi
-
-# -------------------------------------------------------------------
-# 3. Prioritized Catalog Queue: Frontier First, then Contour, then BCI
-# -------------------------------------------------------------------
-queue=()
-
-[[ -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ]] && queue+=("$INCOMING_DIR/Frontier_Catalog.xlsx")
-[[ -f "$INCOMING_DIR/Contour_Catalog.csv" ]]    && queue+=("$INCOMING_DIR/Contour_Catalog.csv")
-[[ -f "$INCOMING_DIR/BCI_Catalog.xlsx" ]]       && queue+=("$INCOMING_DIR/BCI_Catalog.xlsx")
-
-for cat in "$INCOMING_DIR"/*; do
-    if [[ -f "$cat" && ("$cat" == *.xlsx || "$cat" == *.xls || "$cat" == *.csv) ]]; then
-        if [[ ! " ${queue[*]} " =~ " ${cat} " ]]; then
-            queue+=("$cat")
-        fi
+# 1. Guarantee IP blocklist exists in persistent /app/data
+if [ ! -f "${DATA_DIR}/ip_blocklist.json" ]; then
+    if [ -f "/app/ip_blocklist.json.bak" ]; then
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Mirroring /app/ip_blocklist.json.bak to ${DATA_DIR}/ip_blocklist.json"
+        cp /app/ip_blocklist.json.bak "${DATA_DIR}/ip_blocklist.json"
+    elif [ -f "/app/ip_blocklist.json" ]; then
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Mirroring /app/ip_blocklist.json to ${DATA_DIR}/ip_blocklist.json"
+        cp /app/ip_blocklist.json "${DATA_DIR}/ip_blocklist.json"
     fi
-done
+else
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] IP Blocklist confirmed at ${DATA_DIR}/ip_blocklist.json."
+fi
 
-echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Total catalogs ready for processing: ${#queue[@]}"
+# 2. Launch Reverse Amazon Hunter with --max-fba 2 in background
+pkill -f "reverse_amazon_finder.py" || true
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Starting Reverse Amazon Hunter (0-2 FBA targets)..."
+python3 /app/tools/reverse_amazon_finder.py \
+    --min-rank 1 \
+    --max-rank 120000 \
+    --max-fba 2 \
+    --min-fbm-price 25.0 \
+    > "${LOGS_DIR}/reverse_hunter.log" 2>&1 &
+REVERSE_PID=$!
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Reverse Hunter running (PID: ${REVERSE_PID}). Streaming to Telegram."
 
-# -------------------------------------------------------------------
-# 4. Process Forward Catalogs
-# -------------------------------------------------------------------
-for cat in "${queue[@]}"; do
-    filename=$(basename "$cat")
-    distributor="generic"
+# 3. Process Distributor Catalogs in sequence
+CATALOG_COUNT=$(find "${INCOMING_DIR}" -maxdepth 1 -type f \( -iname "*.xlsx" -o -iname "*.xls" -o -iname "*.csv" \) | wc -l)
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Total catalogs ready for processing: ${CATALOG_COUNT}"
 
-    if [[ "$filename" =~ [Ff]rontier ]]; then
-        distributor="frontier"
-    elif [[ "$filename" =~ [Cc]ontour ]]; then
-        distributor="contour"
-    elif [[ "$filename" =~ [Bb][Cc][Ii] ]]; then
-        distributor="bci"
-    fi
+process_distributor() {
+    local file_pattern="$1"
+    local distributor_name="$2"
+    local catalog_file
+    catalog_file=$(find "${INCOMING_DIR}" -maxdepth 1 -type f -iname "*${file_pattern}*" | head -n 1)
 
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Starting $distributor processing: $filename"
-    python3 /app/tools/universal_catalog_scanner.py --input "$cat" --distributor "$distributor"
-    status=$?
-
-    if [ $status -eq 0 ]; then
-        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Completed $filename. Archiving..."
-        mv "$cat" "$PROCESSED_DIR/$filename"
+    if [ -n "${catalog_file}" ] && [ -f "${catalog_file}" ]; then
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Starting ${distributor_name} processing: $(basename "${catalog_file}")"
+        python3 /app/tools/universal_catalog_scanner.py \
+            --input "${catalog_file}" \
+            --distributor "${distributor_name}"
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] <<< Finished ${distributor_name} processing."
     else
-        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [WARNING] Scanner exited on $filename with code $status. Continuing pipeline..."
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [SKIP] No file matching '*${file_pattern}*' in ${INCOMING_DIR}"
     fi
-done
+}
 
-echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] All initial catalog queues processed. Continuous hunting remains active at 100% capacity."
-wait
+process_distributor "Frontier" "frontier"
+process_distributor "Contour" "contour"
+process_distributor "BCI" "bci"
+
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] === Forward catalog passes complete. Reverse Hunter maintaining 100% token allocation ==="
+wait "${REVERSE_PID}"
