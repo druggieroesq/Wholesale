@@ -24,10 +24,49 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MIN_ROI = float(os.getenv("MIN_ROI", 0.50))
 
-REPORTS_DIR = Path("/app/data/reports")
-CHECKPOINTS_DIR = Path("/app/data/checkpoints")
+DATA_DIR = Path("/app/data")
+REPORTS_DIR = DATA_DIR / "reports"
+CHECKPOINTS_DIR = DATA_DIR / "checkpoints"
+IP_BLOCKLIST_PATH = DATA_DIR / "ip_blocklist.json"
+
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_ip_blocklist():
+    """Loads brands and ASINs from /app/data/ip_blocklist.json supporting lists or dicts."""
+    blocked_brands = set()
+    blocked_asins = set()
+    if not IP_BLOCKLIST_PATH.exists():
+        logger.warning(f"No IP blocklist found at {IP_BLOCKLIST_PATH}. Proceeding without IP filter.")
+        return blocked_brands, blocked_asins
+
+    try:
+        raw = json.loads(IP_BLOCKLIST_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            for item in raw:
+                item_str = str(item).strip()
+                if item_str.startswith("B0") and len(item_str) == 10:
+                    blocked_asins.add(item_str.upper())
+                else:
+                    blocked_brands.add(item_str.lower())
+        elif isinstance(raw, dict):
+            for b in raw.get("brands", []):
+                blocked_brands.add(str(b).strip().lower())
+            for a in raw.get("asins", []):
+                blocked_asins.add(str(a).strip().upper())
+            # Support generic key/value mappings
+            for key, val in raw.items():
+                if key not in ["brands", "asins"] and isinstance(val, (str, list)):
+                    blocked_brands.add(str(key).strip().lower())
+        logger.info(f"Loaded IP Blocklist: {len(blocked_brands)} brands, {len(blocked_asins)} ASINs protected.")
+    except Exception as e:
+        logger.error(f"Failed to read {IP_BLOCKLIST_PATH}: {e}")
+
+    return blocked_brands, blocked_asins
+
+
+BLOCKED_BRANDS, BLOCKED_ASINS = load_ip_blocklist()
 
 
 def dispatch_telegram_alert(deal: dict):
@@ -150,6 +189,16 @@ def scan_catalog(input_path: str, distributor: str):
     df["clean_cost"] = pd.to_numeric(df["cost"].astype(str).str.replace(r"[$,]", "", regex=True), errors="coerce")
     df["clean_upc"] = df["upc"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     df = df[(df["clean_cost"] > 0) & (df["clean_upc"].str.len() >= 8)]
+
+    # PRE-FILTER: Discard SKUs whose distributor brand matches the IP blocklist before spending Keepa tokens
+    if "brand" in df.columns and BLOCKED_BRANDS:
+        initial_count = len(df)
+        df["brand_clean"] = df["brand"].astype(str).str.strip().str.lower()
+        df = df[~df["brand_clean"].isin(BLOCKED_BRANDS)]
+        dropped = initial_count - len(df)
+        if dropped > 0:
+            logger.info(f"🛡 Pre-filtered {dropped} SKUs matching IP Blocklist brands (0 tokens wasted).")
+
     valid_items = df.to_dict("records")
     logger.info(f"Pre-filter complete: {len(valid_items)} SKUs queued.")
 
@@ -175,13 +224,21 @@ def scan_catalog(input_path: str, distributor: str):
         for p in products:
             if not p or not isinstance(p, dict):
                 continue
+
+            asin = (p.get("asin") or "").strip().upper()
+            keepa_brand = (p.get("brand") or "").strip().lower()
+
+            # POST-FILTER: Check Keepa's identified brand and ASIN against IP blocklist
+            if asin in BLOCKED_ASINS or keepa_brand in BLOCKED_BRANDS:
+                logger.info(f"🛡 Skipping {asin} ('{keepa_brand}'): Match in IP Blocklist.")
+                continue
+
             upcs = p.get("upcList") or []
             pcode = p.get("productCode") or ""
             row = next((r for r in batch if r["clean_upc"] in upcs or r["clean_upc"] == pcode), None)
             if row is None:
                 continue
 
-            asin = p.get("asin")
             stats = p.get("stats") or {}
             cp = stats.get("current") or []
             bbx = cp[18] if len(cp) > 18 else -1
@@ -212,6 +269,7 @@ def scan_catalog(input_path: str, distributor: str):
                 deal = {
                     "asin": asin,
                     "title": row.get("title") or p.get("title", "Unknown"),
+                    "brand": p.get("brand", "Unknown"),
                     "vendor": distributor.upper(),
                     "sku": row.get("sku", "N/A"),
                     "pack_size": pk,
@@ -234,7 +292,6 @@ def scan_catalog(input_path: str, distributor: str):
         cp_file.write_text(json.dumps({"last_index": processed, "opportunities": opportunities}, indent=2))
         rp_file.write_text(json.dumps(opportunities, indent=2))
 
-        # Balanced pacing for 50/50 token sharing
         if tokens <= 0:
             logger.info("Tokens momentarily exhausted. Pausing 20s...")
             time.sleep(20)
