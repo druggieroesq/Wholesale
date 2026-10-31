@@ -26,20 +26,30 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DATA_DIR = Path("/app/data")
 REPORTS_DIR = DATA_DIR / "reports"
 CATALOGS_DIR = DATA_DIR / "catalogs" / "incoming"
-IP_BLOCKLIST_PATH = DATA_DIR / "ip_blocklist.json"
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_ip_blocklist():
+    """Checks mounted volume first, then repo root fallbacks."""
+    candidate_paths = [
+        Path("/app/data/ip_blocklist.json"),
+        Path("/app/ip_blocklist.json"),
+        Path("data/ip_blocklist.json"),
+        Path("ip_blocklist.json")
+    ]
+    target_path = next((p for p in candidate_paths if p.exists()), None)
+
     blocked_brands = set()
     blocked_asins = set()
-    if not IP_BLOCKLIST_PATH.exists():
-        logger.warning(f"No IP blocklist found at {IP_BLOCKLIST_PATH}. Running without IP blocklist.")
+
+    if not target_path:
+        logger.warning("No IP blocklist found at /app/data or root. Running without IP blocklist.")
         return blocked_brands, blocked_asins
 
     try:
-        raw = json.loads(IP_BLOCKLIST_PATH.read_text(encoding="utf-8"))
+        logger.info(f"Loading IP blocklist from: {target_path}")
+        raw = json.loads(target_path.read_text(encoding="utf-8"))
         if isinstance(raw, list):
             for item in raw:
                 item_str = str(item).strip()
@@ -55,9 +65,9 @@ def load_ip_blocklist():
             for key, val in raw.items():
                 if key not in ["brands", "asins"] and isinstance(val, (str, list, dict)):
                     blocked_brands.add(str(key).strip().lower())
-        logger.info(f"Loaded IP Blocklist: {len(blocked_brands)} brands, {len(blocked_asins)} ASINs protected.")
+        logger.info(f"Loaded IP Blocklist: {len(blocked_brands)} brands, {len(blocked_asins)} ASINs.")
     except Exception as e:
-        logger.error(f"Failed to read {IP_BLOCKLIST_PATH}: {e}")
+        logger.error(f"Failed to read {target_path}: {e}")
 
     return blocked_brands, blocked_asins
 
@@ -230,7 +240,7 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
                 title = p.get("title") or "Unknown"
 
                 if asin in BLOCKED_ASINS or brand in BLOCKED_BRANDS:
-                    logger.info(f"🛡 [IP BLOCKED] Skipping {asin} ('{brand}')")
+                    logger.info(f"Skipping blocked item: {asin} ('{brand}')")
                     seen_asins.add(asin)
                     continue
 
@@ -288,12 +298,12 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
 
                 leads.append(lead)
                 seen_asins.add(asin)
-                logger.info(f"🎯 [PRIME TARGET] {title[:45]} | BSR: {sales_rank} | FBM Floor: ${fbm_price:.2f} | Brand: {lead['brand']}")
+                logger.info(f"Prime target identified: {title[:45]} | BSR: {sales_rank} | FBM Floor: ${fbm_price:.2f} | Brand: {lead['brand']}")
                 dispatch_telegram_reverse_alert(lead)
 
             results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
 
-            # Dynamic pacing: 50% split if catalog scanner is running, 100% capacity when it is finished
+            # Dynamic pacing: 50% split if catalog scanner is running, 100% capacity when complete
             if is_catalog_scanner_running():
                 sleep_delay = 20 if tokens <= 0 else 15
             else:
