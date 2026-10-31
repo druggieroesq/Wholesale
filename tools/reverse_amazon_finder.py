@@ -48,6 +48,14 @@ def load_ip_blocklist():
         return blocked_brands, blocked_asins
 
     try:
+        dest_path = Path("/app/data/ip_blocklist.json")
+        if target_path != dest_path and not dest_path.exists():
+            try:
+                dest_path.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
+                logger.info(f"Mirrored {target_path} -> {dest_path} for persistent storage.")
+            except Exception as e:
+                logger.warning(f"Could not mirror blocklist to /app/data: {e}")
+
         logger.info(f"Loading IP blocklist from: {target_path}")
         raw = json.loads(target_path.read_text(encoding="utf-8"))
         if isinstance(raw, list):
@@ -207,8 +215,18 @@ def fetch_products_detail(asins: list):
         return [], 0
 
 
-def run_reverse_hunter(min_rank=1, max_rank=80000, max_fba=2, min_fbm_price=25.0):
-    logger.info(f"Starting Reverse Infill Hunter | BSR: {min_rank}-{max_rank} | Max FBA: {max_fba} | Min Price: ${min_fbm_price:.2f}")
+def run_reverse_hunter(min_rank=1, max_rank=100000, max_fba=2, min_fbm_price=25.0):
+    bsr_windows = [
+        (1, 5000),
+        (5001, 15000),
+        (15001, 30000),
+        (30001, 50000),
+        (50001, 75000),
+        (75001, 100000)
+    ]
+    window_idx = 0
+
+    logger.info(f"Starting Reverse Infill Hunter | Tiers: 1-100k BSR | Max FBA: {max_fba} | Min Price: ${min_fbm_price:.2f}")
 
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
     leads = []
@@ -223,21 +241,26 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, max_fba=2, min_fbm_price=25.0
     while True:
         catalog_busy = is_catalog_scanner_running()
         mode_label = "50/50 Dual Allocation Mode" if catalog_busy else "100% Full-Throttle Mode"
-        logger.info(f"Keepa Product Finder sweep (Max FBA: {max_fba}) [{mode_label}]...")
+
+        cur_min, cur_max = bsr_windows[window_idx]
+        logger.info(f"Keepa Product Finder sweep [BSR {cur_min:,}-{cur_max:,}] (Max FBA: {max_fba}) [{mode_label}]...")
 
         asin_candidates, tokens = query_keepa_product_finder(
-            min_rank=min_rank,
-            max_rank=max_rank,
+            min_rank=cur_min,
+            max_rank=cur_max,
             max_fba=max_fba,
             min_price=min_fbm_price,
             per_page=50
         )
-        logger.info(f"Retrieved {len(asin_candidates)} ASIN candidates. Tokens remaining: {tokens}")
+        logger.info(f"Retrieved {len(asin_candidates)} ASIN candidates from BSR {cur_min:,}-{cur_max:,}. Tokens remaining: {tokens}")
+
+        # Step to next BSR tier for subsequent loop
+        window_idx = (window_idx + 1) % len(bsr_windows)
 
         fresh_asins = [a for a in asin_candidates if a not in seen_asins]
         if not fresh_asins:
-            logger.info("No new ASIN candidates in this cycle. Sleeping 60s before next sweep...")
-            time.sleep(60)
+            logger.info("No un-evaluated ASINs in this BSR tier. Moving to next window...")
+            time.sleep(10)
             continue
 
         batch_size = 10
@@ -267,18 +290,15 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, max_fba=2, min_fbm_price=25.0
                 fba_price_raw = current[10] if len(current) > 10 else -1
                 buy_box_raw = current[18] if len(current) > 18 else -1
 
-                # Disqualify if Amazon Retail is on listing
                 if amazon_price > 0:
                     seen_asins.add(asin)
                     continue
 
-                # Enforce active FBA seller count
                 fba_count = stats.get("fbaOfferCount", 0)
                 if fba_count > max_fba:
                     seen_asins.add(asin)
                     continue
 
-                # Determine pricing strategy & target price
                 target_prime_price = 0.0
                 baseline_price = 0.0
                 pricing_strategy = "Unknown"
@@ -354,14 +374,14 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, max_fba=2, min_fbm_price=25.0
 
             time.sleep(sleep_delay)
 
-        logger.info("Batch cycle complete. Pausing 30s before next sweep...")
-        time.sleep(30)
+        logger.info("Batch cycle complete. Pausing 20s before next tier...")
+        time.sleep(20)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-rank", type=int, default=1)
-    parser.add_argument("--max-rank", type=int, default=80000)
+    parser.add_argument("--max-rank", type=int, default=100000)
     parser.add_argument("--max-fba", type=int, default=2)
     parser.add_argument("--min-fbm-price", type=float, default=25.0)
     args = parser.parse_args()
