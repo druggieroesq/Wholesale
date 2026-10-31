@@ -234,11 +234,12 @@ def scan_catalog(input_path: str, distributor: str):
         cp_file.write_text(json.dumps({"last_index": processed, "opportunities": opportunities}, indent=2))
         rp_file.write_text(json.dumps(opportunities, indent=2))
 
+        # Balanced pacing for 50/50 token sharing
         if tokens <= 0:
-            logger.info("Tokens momentarily exhausted. Pausing 15s...")
-            time.sleep(15)
+            logger.info("Tokens momentarily exhausted. Pausing 20s...")
+            time.sleep(20)
         else:
-            time.sleep(4)
+            time.sleep(10)
 
     logger.info(f"Finished {distributor}. Found {len(opportunities)} qualified deals.")
     if cp_file.exists():
