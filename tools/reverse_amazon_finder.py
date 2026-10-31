@@ -125,20 +125,24 @@ CATALOG_INDEX = build_local_catalog_index()
 def dispatch_telegram_reverse_alert(deal: dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+
+    fba_tag = "0 FBA MONOPOLY" if deal.get("fba_count", 0) == 0 else f"LOW FBA COMPETITION ({deal.get('fba_count')} FBA)"
+
     matched_text = (
         f"🏷 *Internal Match:* `{deal.get('matched_vendor')}` (SKU: `{deal.get('matched_sku')}` | Cost: ${deal.get('matched_cost'):.2f})\n"
-        f"📈 *Estimated ROI:* *{deal.get('est_roi'):.1f}%*\n"
+        f"📈 *Estimated Net ROI:* *{deal.get('est_roi'):.1f}%*\n"
+        f"💰 *Estimated Net Profit:* *${deal.get('est_net_profit'):.2f}*\n"
     ) if deal.get("matched_vendor") else "🔍 *Internal Match:* None (Distributor Hunt Opportunity)\n"
 
     text = (
-        f"🎯 *PRIME MONOPOLIST TARGET (0 FBA)*\n\n"
+        f"🎯 *OPPORTUNITY TARGET [{fba_tag}]*\n\n"
         f"📦 *Product:* {deal.get('title')}\n"
         f"🏷 *Brand:* `{deal.get('brand')}`\n"
         f"🆔 *ASIN:* `{deal.get('asin')}`\n"
         f"📊 *Sales Rank (BSR):* {deal.get('sales_rank'):,}\n"
-        f"🛒 *FBM Floor Price:* ${deal.get('fbm_price'):.2f}\n"
-        f"🎯 *Target Prime Price (+10%):* ${deal.get('target_prime_price'):.2f}\n"
-        f"👥 *Active Sellers:* {deal.get('seller_count')} (FBA: 0 | FBM: {deal.get('seller_count')})\n\n"
+        f"🛒 *Floor / Baseline Price:* ${deal.get('baseline_price'):.2f}\n"
+        f"🎯 *Target Selling Price:* ${deal.get('target_prime_price'):.2f} ({deal.get('pricing_strategy')})\n"
+        f"👥 *Competition:* Total Sellers: {deal.get('seller_count')} | FBA Sellers: {deal.get('fba_count')}\n\n"
         f"{matched_text}\n"
         f"🔗 [Amazon Listing](https://www.amazon.com/dp/{deal.get('asin')}) | "
         f"[Google Sourcing Search](https://www.google.com/search?q={deal.get('upc_or_title_query')})"
@@ -150,17 +154,21 @@ def dispatch_telegram_reverse_alert(deal: dict):
         logger.error(f"Telegram alert dispatch failed: {e}")
 
 
-def query_keepa_product_finder(min_rank=1, max_rank=80000, min_fbm_price=25.0, per_page=50):
+def query_keepa_product_finder(min_rank=1, max_rank=80000, max_fba=2, min_price=25.0, per_page=50):
     query_payload = {
         "current_SALES_gte": min_rank,
         "current_SALES_lte": max_rank,
-        "current_NEW_gte": int(min_fbm_price * 100),
+        "current_NEW_gte": int(min_price * 100),
         "outOfStock_AMAZON": True,
-        "outOfStock_FBA": True,
         "productType": [0, 1, 2],
         "sort": [["current_SALES", "asc"]],
         "perPage": per_page
     }
+
+    if max_fba == 0:
+        query_payload["outOfStock_FBA"] = True
+    else:
+        query_payload["fbaOfferCount_lte"] = max_fba
 
     try:
         url = f"https://api.keepa.com/query?key={KEEPA_KEY}&domain=1"
@@ -199,8 +207,8 @@ def fetch_products_detail(asins: list):
         return [], 0
 
 
-def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=25.0):
-    logger.info(f"Starting Reverse Infill Hunter | BSR: {min_rank}-{max_rank} | Max FBA: 0 | Min Price: ${min_fbm_price:.2f}")
+def run_reverse_hunter(min_rank=1, max_rank=80000, max_fba=2, min_fbm_price=25.0):
+    logger.info(f"Starting Reverse Infill Hunter | BSR: {min_rank}-{max_rank} | Max FBA: {max_fba} | Min Price: ${min_fbm_price:.2f}")
 
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
     leads = []
@@ -215,12 +223,13 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=25.0):
     while True:
         catalog_busy = is_catalog_scanner_running()
         mode_label = "50/50 Dual Allocation Mode" if catalog_busy else "100% Full-Throttle Mode"
-        logger.info(f"Keepa 0-FBA Product Finder sweep [{mode_label}]...")
+        logger.info(f"Keepa Product Finder sweep (Max FBA: {max_fba}) [{mode_label}]...")
 
         asin_candidates, tokens = query_keepa_product_finder(
             min_rank=min_rank,
             max_rank=max_rank,
-            min_fbm_price=min_fbm_price,
+            max_fba=max_fba,
+            min_price=min_fbm_price,
             per_page=50
         )
         logger.info(f"Retrieved {len(asin_candidates)} ASIN candidates. Tokens remaining: {tokens}")
@@ -255,20 +264,43 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=25.0):
                 amazon_price = current[0] if len(current) > 0 else -1
                 fbm_price_raw = current[1] if len(current) > 1 else -1
                 sales_rank = current[3] if len(current) > 3 else -1
-                fba_price = current[10] if len(current) > 10 else -1
+                fba_price_raw = current[10] if len(current) > 10 else -1
+                buy_box_raw = current[18] if len(current) > 18 else -1
 
-                if amazon_price > 0 or fba_price > 0 or fbm_price_raw <= 0:
+                # Disqualify if Amazon Retail is on listing
+                if amazon_price > 0:
                     seen_asins.add(asin)
                     continue
 
-                fbm_price = fbm_price_raw / 100.0
-                if fbm_price < min_fbm_price:
+                # Enforce active FBA seller count
+                fba_count = stats.get("fbaOfferCount", 0)
+                if fba_count > max_fba:
                     seen_asins.add(asin)
                     continue
 
-                target_prime_price = round(fbm_price * 1.10, 2)
+                # Determine pricing strategy & target price
+                target_prime_price = 0.0
+                baseline_price = 0.0
+                pricing_strategy = "Unknown"
+
+                if fba_price_raw > 0 or buy_box_raw > 0:
+                    benchmark_raw = buy_box_raw if buy_box_raw > 0 else fba_price_raw
+                    baseline_price = benchmark_raw / 100.0
+                    target_prime_price = round(baseline_price, 2)
+                    pricing_strategy = f"Match FBA Buy Box ({fba_count} FBA competitor{'s' if fba_count != 1 else ''})"
+                elif fbm_price_raw > 0:
+                    baseline_price = fbm_price_raw / 100.0
+                    target_prime_price = round(baseline_price * 1.10, 2)
+                    pricing_strategy = "Prime Monopoly (+10% over FBM floor)"
+                else:
+                    seen_asins.add(asin)
+                    continue
+
+                if target_prime_price < min_fbm_price:
+                    seen_asins.add(asin)
+                    continue
+
                 upcs = p.get("upcList") or []
-
                 matched_distributor = None
                 for upc in upcs:
                     clean_upc = str(upc).strip()
@@ -277,6 +309,7 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=25.0):
                         break
 
                 est_roi = 0.0
+                net_profit = 0.0
                 if matched_distributor:
                     unit_cogs = matched_distributor["cost"]
                     est_fees = 3.50 + (target_prime_price * 0.15)
@@ -290,20 +323,26 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=25.0):
                     "title": title,
                     "brand": p.get("brand", "Unknown"),
                     "sales_rank": sales_rank,
-                    "fbm_price": round(fbm_price, 2),
+                    "baseline_price": round(baseline_price, 2),
                     "target_prime_price": target_prime_price,
+                    "pricing_strategy": pricing_strategy,
                     "seller_count": stats.get("totalOfferCount", 1),
+                    "fba_count": fba_count,
                     "upcs": upcs,
                     "matched_vendor": matched_distributor["vendor"] if matched_distributor else None,
                     "matched_sku": matched_distributor["sku"] if matched_distributor else None,
                     "matched_cost": matched_distributor["cost"] if matched_distributor else None,
                     "est_roi": round(est_roi, 1),
+                    "est_net_profit": round(net_profit, 2),
                     "upc_or_title_query": search_query
                 }
 
                 leads.append(lead)
                 seen_asins.add(asin)
-                logger.info(f"Prime target identified: {title[:45]} | BSR: {sales_rank} | FBM Floor: ${fbm_price:.2f} | Brand: {lead['brand']}")
+                logger.info(
+                    f"Target identified: {title[:40]} | BSR: {sales_rank} | "
+                    f"Target: ${target_prime_price:.2f} ({pricing_strategy}) | Brand: {lead['brand']}"
+                )
                 dispatch_telegram_reverse_alert(lead)
 
             results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
@@ -323,12 +362,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-rank", type=int, default=1)
     parser.add_argument("--max-rank", type=int, default=80000)
-    parser.add_argument("--max-fba", type=int, default=0)
+    parser.add_argument("--max-fba", type=int, default=2)
     parser.add_argument("--min-fbm-price", type=float, default=25.0)
     args = parser.parse_args()
 
     run_reverse_hunter(
         min_rank=args.min_rank,
         max_rank=args.max_rank,
+        max_fba=args.max_fba,
         min_fbm_price=args.min_fbm_price
     )
