@@ -11,6 +11,16 @@ mkdir -p "$INCOMING_DIR" "$PROCESSED_DIR" "$LOGS_DIR" "$CHECKPOINTS_DIR" "$REPOR
 echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] === Initializing Autonomous 50/50 Dual Pipeline ==="
 
 # -------------------------------------------------------------------
+# 0. Sync IP Blocklist across persistent volume mount
+# -------------------------------------------------------------------
+if [ -f "/app/data/ip_blocklist.json" ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] IP Blocklist confirmed at /app/data/ip_blocklist.json."
+elif [ -f "/app/ip_blocklist.json" ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Copying /app/ip_blocklist.json to /app/data/ip_blocklist.json..."
+    cp /app/ip_blocklist.json /app/data/ip_blocklist.json
+fi
+
+# -------------------------------------------------------------------
 # 1. Launch 24/7 Reverse Hunter Immediately in Background (50% tokens)
 # -------------------------------------------------------------------
 if ! pgrep -f "reverse_amazon_finder.py" > /dev/null; then
@@ -51,7 +61,6 @@ queue=()
 [[ -f "$INCOMING_DIR/Contour_Catalog.csv" ]]    && queue+=("$INCOMING_DIR/Contour_Catalog.csv")
 [[ -f "$INCOMING_DIR/BCI_Catalog.xlsx" ]]       && queue+=("$INCOMING_DIR/BCI_Catalog.xlsx")
 
-# Pick up any additional manual uploads
 for cat in "$INCOMING_DIR"/*; do
     if [[ -f "$cat" && ("$cat" == *.xlsx || "$cat" == *.xls || "$cat" == *.csv) ]]; then
         if [[ ! " ${queue[*]} " =~ " ${cat} " ]]; then
@@ -89,5 +98,5 @@ for cat in "${queue[@]}"; do
     fi
 done
 
-echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] All initial catalog queues processed. Continuous hunting remains active."
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] All initial catalog queues processed. Continuous hunting remains active at 100% capacity."
 wait
