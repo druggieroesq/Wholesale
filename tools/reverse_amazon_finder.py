@@ -2,14 +2,12 @@
 """
 Reverse Amazon Infill Hunter
 ---------------------------
-Continuously scans Keepa's product catalog across sliding BSR slices
-to discover low-competition listings (0-2 FBA sellers), matches them
-against indexed distributor catalogs (UPC lookup), and dispatches
-real-time sourcing alerts to Telegram.
+Continuously sweeps Keepa across sliding BSR slices to identify low-competition
+listings (0-2 FBA sellers), matches against local distributor catalogs, and
+dispatches lead alerts. Includes strict Keepa token reserve guardrails.
 """
 
 import os
-import re
 import sys
 import time
 import json
@@ -39,8 +37,16 @@ CATALOGS_DIR = DATA_DIR / "catalogs" / "incoming"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def get_token_balance() -> int:
+    try:
+        r = requests.get(f"https://api.keepa.com/token?key={KEEPA_KEY}", timeout=10).json()
+        return int(r.get("tokensLeft", 0))
+    except Exception as e:
+        logger.warning(f"Failed to query Keepa token endpoint: {e}")
+        return 0
+
+
 def load_ip_blocklist():
-    """Locates and loads brand/ASIN blocklist from persistent or fallback paths."""
     candidate_paths = [
         Path("/app/data/ip_blocklist.json"),
         Path("/app/ip_blocklist.json.bak"),
@@ -53,19 +59,14 @@ def load_ip_blocklist():
     blocked_asins = set()
 
     if not target_path:
-        logger.warning("No IP blocklist found at /app/data or root. Running without IP blocklist.")
+        logger.warning("No IP blocklist found at /app/data or root.")
         return blocked_brands, blocked_asins
 
     try:
         dest_path = Path("/app/data/ip_blocklist.json")
         if target_path != dest_path and not dest_path.exists():
-            try:
-                dest_path.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
-                logger.info(f"Mirrored {target_path} -> {dest_path} for persistent storage.")
-            except Exception as e:
-                logger.warning(f"Could not mirror blocklist to /app/data: {e}")
+            dest_path.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
 
-        logger.info(f"Loading IP blocklist from: {target_path}")
         raw = json.loads(target_path.read_text(encoding="utf-8"))
         if isinstance(raw, list):
             for item in raw:
@@ -92,17 +93,7 @@ def load_ip_blocklist():
 BLOCKED_BRANDS, BLOCKED_ASINS = load_ip_blocklist()
 
 
-def is_catalog_scanner_running() -> bool:
-    """Checks if universal_catalog_scanner is actively executing to govern token sharing."""
-    try:
-        res = os.popen("pgrep -f universal_catalog_scanner.py").read().strip()
-        return bool(res)
-    except Exception:
-        return False
-
-
 def build_local_catalog_index():
-    """Indexes all UPCs and dealer costs from incoming distributor catalogs into memory."""
     catalog_index = {}
     if not CATALOGS_DIR.exists():
         return catalog_index
@@ -142,11 +133,10 @@ CATALOG_INDEX = build_local_catalog_index()
 
 
 def dispatch_telegram_reverse_alert(deal: dict):
-    """Sends immediate formatted lead card to Telegram channel."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    fba_tag = "0 FBA MONOPOLY" if deal.get("fba_count", 0) == 0 else f"LOW FBA COMPETITION ({deal.get('fba_count')} FBA)"
+    fba_tag = "0 FBA MONOPOLY" if deal.get("fba_count", 0) == 0 else f"LOW FBA ({deal.get('fba_count')} FBA)"
     matched_text = (
         f"🏷 *Internal Match:* `{deal.get('matched_vendor')}` (SKU: `{deal.get('matched_sku')}` | Cost: ${deal.get('matched_cost'):.2f})\n"
         f"📈 *Estimated Net ROI:* *{deal.get('est_roi'):.1f}%*\n"
@@ -163,54 +153,37 @@ def dispatch_telegram_reverse_alert(deal: dict):
         f"🎯 *Target Selling Price:* ${deal.get('target_prime_price'):.2f} ({deal.get('pricing_strategy')})\n"
         f"👥 *Competition:* Total Sellers: {deal.get('seller_count')} | FBA Sellers: {deal.get('fba_count')}\n\n"
         f"{matched_text}\n"
-        f"🔗 [Amazon Listing](https://www.amazon.com/dp/{deal.get('asin')}) | "
-        f"[Google Sourcing Search](https://www.google.com/search?q={deal.get('upc_or_title_query')})"
+        f"🔗 [Amazon Listing](https://www.amazon.com/dp/{deal.get('asin')})"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
-        logger.error(f"Telegram alert dispatch failed: {e}")
+        logger.error(f"Telegram dispatch failed: {e}")
 
 
-def query_keepa_product_finder(min_rank=1, max_rank=50000, max_fba=2, min_price=25.0, per_page=50):
-    """Executes Keepa Product Finder query for a distinct BSR slice."""
-    query_payload = {
+def query_keepa_product_finder(min_rank: int, max_rank: int, min_price: float, per_page: int = 50):
+    payload = {
+        "rootCategory": 16310091,
         "current_SALES_gte": min_rank,
         "current_SALES_lte": max_rank,
         "current_NEW_gte": int(min_price * 100),
-        "outOfStock_AMAZON": True,
         "productType": [0, 1, 2],
         "sort": [["current_SALES", "asc"]],
         "perPage": per_page
     }
 
-    if max_fba == 0:
-        query_payload["outOfStock_FBA"] = True
-    else:
-        query_payload["fbaOfferCount_lte"] = max_fba
-
     try:
         url = f"https://api.keepa.com/query?key={KEEPA_KEY}&domain=1"
-        r = requests.post(url, json={"selection": json.dumps(query_payload)}, timeout=40)
-        if r.status_code == 429:
-            data = r.json()
-            refill = data.get("refillIn", 30000) / 1000.0
-            logger.warning(f"Keepa 429 received. Pausing {int(refill)}s...")
-            time.sleep(max(refill, 20))
-            return [], 0
-
+        r = requests.post(url, json={"selection": json.dumps(payload)}, timeout=40)
         data = r.json()
-        asin_list = data.get("asinList", [])
-        tokens_left = data.get("tokensLeft", 0)
-        return asin_list, tokens_left
+        return data.get("asinList", []) or [], data.get("tokensLeft", 0)
     except Exception as e:
-        logger.error(f"Keepa Product Finder request failed: {e}")
+        logger.error(f"Keepa query failed: {e}")
         return [], 0
 
 
 def fetch_products_detail(asins: list):
-    """Fetches full 90-day stats and offer metadata for candidates."""
     if not asins:
         return [], 0
     codes = ",".join(asins)
@@ -220,14 +193,12 @@ def fetch_products_detail(asins: list):
         data = r.json()
         return data.get("products", []) or [], data.get("tokensLeft", 0)
     except Exception as e:
-        logger.error(f"Keepa product fetch failed: {e}")
+        logger.error(f"Keepa product details fetch failed: {e}")
         return [], 0
 
 
-def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.0):
-    """Main continuous loop with dynamic BSR stepping."""
-    logger.info(f"Starting Reverse Infill Hunter | Dynamic BSR Step Engine | Max FBA: {max_fba} | Min Price: ${min_fbm_price:.2f}")
-
+def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.0, min_tokens=50):
+    logger.info(f"Reverse Hunter Active | Min Tokens Required: {min_tokens} | Max FBA: {max_fba}")
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
     leads = []
     if results_file.exists():
@@ -241,38 +212,42 @@ def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.
     current_min_rank = min_rank
 
     while True:
-        catalog_busy = is_catalog_scanner_running()
-        mode_label = "50/50 Dual Allocation Mode" if catalog_busy else "100% Full-Throttle Mode"
+        # TOKEN GUARD: Ensure catalog scanner has adequate tokens
+        available_tokens = get_token_balance()
+        if available_tokens < min_tokens:
+            logger.info(f"Keepa token reserves at {available_tokens}/300. Pausing 45s to let bucket recharge...")
+            time.sleep(45)
+            continue
 
         current_max_rank = min(current_min_rank + step_size, max_rank)
-        logger.info(f"Keepa sweep [BSR {current_min_rank:,}-{current_max_rank:,}] (Max FBA: {max_fba}) [{mode_label}]...")
+        logger.info(f"Keepa sweep [BSR {current_min_rank:,}-{current_max_rank:,}] (Tokens: {available_tokens})...")
 
-        asin_candidates, tokens = query_keepa_product_finder(
+        asin_candidates, tokens_after = query_keepa_product_finder(
             min_rank=current_min_rank,
             max_rank=current_max_rank,
-            max_fba=max_fba,
             min_price=min_fbm_price,
             per_page=50
         )
-        logger.info(f"Retrieved {len(asin_candidates)} candidates [BSR {current_min_rank:,}-{current_max_rank:,}]. Tokens: {tokens}")
 
-        fresh_asins = [a for a in asin_candidates if a not in seen_asins]
-
-        # Advance window horizon
         current_min_rank += step_size
         if current_min_rank >= max_rank:
-            logger.info(f"Reached BSR ceiling ({max_rank:,}). Resetting back to BSR {min_rank}...")
+            logger.info(f"Reached BSR ceiling ({max_rank:,}). Cycling back to rank {min_rank}...")
             current_min_rank = min_rank
 
+        fresh_asins = [a for a in asin_candidates if a not in seen_asins]
         if not fresh_asins:
-            logger.info("No un-evaluated ASINs in this slice. Stepping to next slice...")
-            time.sleep(4)
+            time.sleep(10)
             continue
 
         batch_size = 10
         for i in range(0, len(fresh_asins), batch_size):
+            if get_token_balance() < 40:
+                logger.info("Tokens dipped below 40 during detail batch. Pausing sweep...")
+                time.sleep(45)
+                break
+
             batch = fresh_asins[i:i + batch_size]
-            products, tokens = fetch_products_detail(batch)
+            products, _ = fetch_products_detail(batch)
 
             for p in products:
                 if not p or not isinstance(p, dict):
@@ -283,7 +258,6 @@ def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.
                 title = p.get("title") or "Unknown"
 
                 if asin in BLOCKED_ASINS or brand in BLOCKED_BRANDS:
-                    logger.info(f"Filtered (IP Blocklist): {asin} ('{brand}')")
                     seen_asins.add(asin)
                     continue
 
@@ -296,12 +270,10 @@ def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.
                 fba_price_raw = current[10] if len(current) > 10 else -1
                 buy_box_raw = current[18] if len(current) > 18 else -1
 
-                # Disqualify if direct Amazon Retail is active
                 if amazon_price > 0:
                     seen_asins.add(asin)
                     continue
 
-                # Enforce active FBA seller ceiling
                 fba_count = stats.get("fbaOfferCount", 0)
                 if fba_count > max_fba:
                     seen_asins.add(asin)
@@ -344,8 +316,6 @@ def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.
                     net_profit = target_prime_price - est_fees - unit_cogs
                     est_roi = (net_profit / unit_cogs) * 100.0 if unit_cogs > 0 else 0.0
 
-                search_query = requests.utils.quote(f"{p.get('brand', '')} {title[:40]} wholesale")
-
                 lead = {
                     "asin": asin,
                     "title": title,
@@ -361,42 +331,33 @@ def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.
                     "matched_sku": matched_distributor["sku"] if matched_distributor else None,
                     "matched_cost": matched_distributor["cost"] if matched_distributor else None,
                     "est_roi": round(est_roi, 1),
-                    "est_net_profit": round(net_profit, 2),
-                    "upc_or_title_query": search_query
+                    "est_net_profit": round(net_profit, 2)
                 }
 
                 leads.append(lead)
                 seen_asins.add(asin)
-                logger.info(
-                    f"Target identified: {title[:40]} | BSR: {sales_rank} | "
-                    f"Target: ${target_prime_price:.2f} ({pricing_strategy}) | Brand: {lead['brand']}"
-                )
+                logger.info(f"Target banked: {asin} | {title[:35]} | Target: ${target_prime_price:.2f} | FBA: {fba_count}")
                 dispatch_telegram_reverse_alert(lead)
 
             results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
+            time.sleep(12)
 
-            if is_catalog_scanner_running():
-                sleep_delay = 18 if tokens <= 100 else 12
-            else:
-                sleep_delay = 10 if tokens <= 100 else 4
-
-            time.sleep(sleep_delay)
-
-        logger.info("Batch cycle complete. Pausing 10s before next slice...")
-        time.sleep(10)
+        time.sleep(15)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Reverse Amazon Infill Hunter")
-    parser.add_argument("--min-rank", type=int, default=1, help="Starting BSR rank floor")
-    parser.add_argument("--max-rank", type=int, default=120000, help="Maximum BSR rank ceiling")
-    parser.add_argument("--max-fba", type=int, default=2, help="Maximum number of competing FBA sellers (0, 1, or 2)")
-    parser.add_argument("--min-fbm-price", type=float, default=25.0, help="Minimum selling price floor in USD")
+    parser.add_argument("--min-rank", type=int, default=1)
+    parser.add_argument("--max-rank", type=int, default=120000)
+    parser.add_argument("--max-fba", type=int, default=2)
+    parser.add_argument("--min-fbm-price", type=float, default=25.0)
+    parser.add_argument("--min-tokens", type=int, default=50)
     args = parser.parse_args()
 
     run_reverse_hunter(
         min_rank=args.min_rank,
         max_rank=args.max_rank,
         max_fba=args.max_fba,
-        min_fbm_price=args.min_fbm_price
+        min_fbm_price=args.min_fbm_price,
+        min_tokens=args.min_tokens
     )
