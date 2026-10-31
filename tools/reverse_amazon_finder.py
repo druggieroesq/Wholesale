@@ -1,144 +1,94 @@
-#!/usr/bin/env python3
-"""
-Reverse Amazon Finder (24/7 Background Loop)
-Continuously queries Keepa's Product Finder API for sub-65k BSR, >= $22 Buy Box,
-low-competition FBA opportunities. Enforces zero-token IP Guard verification on all
-surfaced ASINs, automatically refills tokens on a 900s interval, and logs qualified items.
-"""
+#!/usr/bin/env bash
 
-import os
-import sys
-import time
-import json
-import logging
-import requests
-from pathlib import Path
+INCOMING_DIR="/app/data/catalogs/incoming"
+PROCESSED_DIR="/app/data/catalogs/processed"
+LOGS_DIR="/app/data/logs"
+CHECKPOINTS_DIR="/app/data/checkpoints"
+REPORTS_DIR="/app/data/reports"
 
-# Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tools.ip_guard import is_brand_blocked
+mkdir -p "$INCOMING_DIR" "$PROCESSED_DIR" "$LOGS_DIR" "$CHECKPOINTS_DIR" "$REPORTS_DIR"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("ReverseFinder")
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] === Initializing Autonomous 50/50 Dual Pipeline ==="
 
-DATA_DIR = Path("/app/data")
-CANDIDATES_FILE = DATA_DIR / "discovered_candidates.json"
-ENV_FILE = Path("/app/.env")
+# -------------------------------------------------------------------
+# 1. Launch 24/7 Reverse Hunter Immediately in Background (50% tokens)
+# -------------------------------------------------------------------
+if ! pgrep -f "reverse_amazon_finder.py" > /dev/null; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Starting Reverse Amazon Hunter (0-FBA Prime targets)..."
+    nohup python3 /app/tools/reverse_amazon_finder.py \
+        --min-rank 1 \
+        --max-rank 80000 \
+        --max-fba 0 \
+        --min-fbm-price 25.0 \
+        > "$LOGS_DIR/reverse_hunter.log" 2>&1 &
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Reverse Hunter running (PID: $!). Streaming to Telegram."
+fi
 
+# -------------------------------------------------------------------
+# 2. Auto-download Catalog Sheets if Missing
+# -------------------------------------------------------------------
+if [ ! -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ] && [ ! -f "$PROCESSED_DIR/Frontier_Catalog.xlsx" ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Frontier Catalog..."
+    curl -sL "https://docs.google.com/spreadsheets/d/122YeUPONFQuwy5UfoE3pz8RNK1pdb9l0/export?format=xlsx" -o "$INCOMING_DIR/Frontier_Catalog.xlsx"
+fi
 
-def load_env():
-    if not os.getenv("KEEPA_API_KEY") and ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("KEEPA_API_KEY=") and not line.startswith("#"):
-                key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                os.environ["KEEPA_API_KEY"] = key
-                break
+if [ ! -f "$INCOMING_DIR/BCI_Catalog.xlsx" ] && [ ! -f "$PROCESSED_DIR/BCI_Catalog.xlsx" ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching BCI Catalog..."
+    curl -sL "https://docs.google.com/spreadsheets/d/1D1hUS38LK-8XsQIdIOeluUM1XKUu-n8-/export?format=xlsx" -o "$INCOMING_DIR/BCI_Catalog.xlsx"
+fi
 
+if [ ! -f "$INCOMING_DIR/Contour_Catalog.csv" ] && [ ! -f "$PROCESSED_DIR/Contour_Catalog.csv" ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Contour Catalog..."
+    curl -sL "https://drive.google.com/uc?export=download&id=1-YRPv_YSM82L38E7TnUNDdfSxRDWK0sA" -o "$INCOMING_DIR/Contour_Catalog.csv"
+fi
 
-def query_keepa():
-    load_env()
-    api_key = os.getenv("KEEPA_API_KEY", "").strip()
-    if not api_key:
-        logger.error("KEEPA_API_KEY missing from environment and /app/.env")
-        return []
+# -------------------------------------------------------------------
+# 3. Prioritized Catalog Queue: Frontier First, then Contour, then BCI
+# -------------------------------------------------------------------
+queue=()
 
-    url = f"https://api.keepa.com/query?key={api_key}&domain=1&type=product"
-    payload = {
-        "current_SALES_lte": 65000,
-        "current_BUY_BOX_SHIPPING_gte": 2200,
-        "fba_seller_count_lte": 1,
-        "isAmazonOffer": False
-    }
+# Prioritize high-velocity consumer catalogs first
+[[ -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ]] && queue+=("$INCOMING_DIR/Frontier_Catalog.xlsx")
+[[ -f "$INCOMING_DIR/Contour_Catalog.csv" ]]    && queue+=("$INCOMING_DIR/Contour_Catalog.csv")
+[[ -f "$INCOMING_DIR/BCI_Catalog.xlsx" ]]       && queue+=("$INCOMING_DIR/BCI_Catalog.xlsx")
 
-    try:
-        resp = requests.post(url, json=payload, timeout=45)
-        if resp.status_code == 200:
-            data = resp.json()
-            asins = data.get("asinList", [])
-            tokens_left = data.get("tokensLeft", "N/A")
-            logger.info(f"Keepa query succeeded: {len(asins)} candidate ASINs surfaced. Tokens remaining: {tokens_left}")
-            return asins[:50]
-        else:
-            logger.error(f"Keepa query failed ({resp.status_code}): {resp.text[:160]}")
-    except requests.RequestException as e:
-        logger.error(f"Keepa connection error: {e}")
+# Add any additional user-uploaded files
+for cat in "$INCOMING_DIR"/*; do
+    if [[ -f "$cat" && ("$cat" == *.xlsx || "$cat" == *.xls || "$cat" == *.csv) ]]; then
+        if [[ ! " ${queue[*]} " =~ " ${cat} " ]]; then
+            queue+=("$cat")
+        fi
+    fi
+done
 
-    return []
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Total catalogs ready for processing: ${#queue[@]}"
 
+# -------------------------------------------------------------------
+# 4. Process Forward Catalogs
+# -------------------------------------------------------------------
+for cat in "${queue[@]}"; do
+    filename=$(basename "$cat")
+    distributor="generic"
 
-def hydrate_and_verify_asins(api_key: str, asins: list) -> list:
-    if not asins:
-        return []
+    if [[ "$filename" =~ [Ff]rontier ]]; then
+        distributor="frontier"
+    elif [[ "$filename" =~ [Cc]ontour ]]; then
+        distributor="contour"
+    elif [[ "$filename" =~ [Bb][Cc][Ii] ]]; then
+        distributor="bci"
+    fi
 
-    url = f"https://api.keepa.com/product?key={api_key}&domain=1&asin={','.join(asins)}&stats=0"
-    verified_candidates = []
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Starting $distributor processing: $filename"
+    python3 /app/tools/universal_catalog_scanner.py --input "$cat" --distributor "$distributor"
+    status=$?
 
-    try:
-        resp = requests.get(url, timeout=45)
-        if resp.status_code == 200:
-            products = resp.json().get("products", [])
-            for p in products:
-                asin = p.get("asin")
-                brand = p.get("brand", "")
-                title = p.get("title", "")
+    if [ $status -eq 0 ]; then
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Completed $filename. Archiving..."
+        mv "$cat" "$PROCESSED_DIR/$filename"
+    else
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [WARNING] Scanner exited on $filename with code $status. Continuing pipeline..."
+    fi
+done
 
-                blocked, reason = is_brand_blocked(brand=brand, title=title)
-                if blocked:
-                    logger.info(f"IP Shield: Rejected ASIN {asin} ({reason})")
-                    continue
-
-                verified_candidates.append({
-                    "asin": asin,
-                    "brand": brand,
-                    "title": title,
-                    "discovered_at": time.time(),
-                    "status": "QUALIFIED_UNMATCHED"
-                })
-        else:
-            logger.error(f"Keepa hydration failed ({resp.status_code})")
-    except Exception as e:
-        logger.error(f"Keepa verification error: {e}")
-
-    return verified_candidates
-
-
-def update_candidate_pool(new_items):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    existing = []
-    if CANDIDATES_FILE.exists():
-        try:
-            existing = json.loads(CANDIDATES_FILE.read_text())
-        except Exception:
-            existing = []
-
-    known_asins = {item.get("asin") for item in existing if isinstance(item, dict)}
-    added_count = 0
-
-    for item in new_items:
-        asin = item.get("asin")
-        if asin and asin not in known_asins:
-            existing.append(item)
-            known_asins.add(asin)
-            added_count += 1
-
-    CANDIDATES_FILE.write_text(json.dumps(existing, indent=2))
-    logger.info(f"Candidate pool saved: +{added_count} verified ASINs ({len(existing)} total in pool).")
-
-
-def main():
-    logger.info("Starting Reverse Amazon Finder 24/7 background loop with IP Guard verification...")
-    while True:
-        raw_asins = query_keepa()
-        if raw_asins:
-            api_key = os.getenv("KEEPA_API_KEY", "").strip()
-            verified = hydrate_and_verify_asins(api_key, raw_asins)
-            if verified:
-                update_candidate_pool(verified)
-
-        logger.info("Cycle complete. Sleeping 900s for token replenishment...")
-        time.sleep(900)
-
-
-if __name__ == "__main__":
-    main()
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] All initial catalog queues processed. Continuous hunting remains active."
+wait
