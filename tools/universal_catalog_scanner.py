@@ -38,9 +38,10 @@ def dispatch_telegram_alert(deal: dict):
         f"📦 *Product:* {deal.get('title')}\n"
         f"🏷 *Distributor:* {deal.get('vendor')} | *SKU:* `{deal.get('sku')}`\n"
         f"🆔 *ASIN:* `{deal.get('asin')}`\n"
-        f"📦 *Pack Size:* {deal.get('pack_size')}\n\n"
+        f"📦 *Pack Size:* {deal.get('pack_size')}\n"
+        f"🏷 *Offer Type:* `{deal.get('pricing_source')}`\n\n"
         f"💵 *Unit Cost:* ${deal.get('unit_cogs'):.2f} (Total COGS: ${deal.get('total_cogs'):.2f})\n"
-        f"🛒 *Amazon Price:* ${deal.get('amazon_price'):.2f}\n"
+        f"🛒 *Effective Amazon Price:* ${deal.get('amazon_price'):.2f}\n"
         f"📈 *Net ROI:* *{deal.get('roi_pct'):.1f}%*\n"
         f"💰 *Net Profit:* *${deal.get('net_profit'):.2f}*\n"
         f"📊 *Sales Rank:* {deal.get('sales_rank')}\n\n"
@@ -54,7 +55,7 @@ def dispatch_telegram_alert(deal: dict):
 
 
 def extract_pack_size(keepa_product: dict) -> int:
-    """Extracts pack size from Keepa metadata and listing title to prevent multipack ROI inflation."""
+    """Extracts pack size from Keepa metadata and title to avoid multipack ROI inflation."""
     pkg_qty = keepa_product.get("packageQuantity") or keepa_product.get("numberOfItems")
     if isinstance(pkg_qty, (int, float)) and 1 < pkg_qty <= 144:
         return int(pkg_qty)
@@ -122,7 +123,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def query_keepa_batch(upcs: list) -> tuple:
     codes = ",".join(upcs)
-    url = f"https://api.keepa.com/product?key={KEEPA_KEY}&domain=1&code={codes}"
+    url = f"https://api.keepa.com/product?key={KEEPA_KEY}&domain=1&code={codes}&stats=90"
     while True:
         try:
             r = requests.get(url, timeout=30)
@@ -163,7 +164,7 @@ def scan_catalog(input_path: str, distributor: str):
     start_idx = 0
     opportunities = []
 
-    # Checkpoint recovery: Resume exactly where execution halted
+    # Checkpoint recovery: Resume exactly where execution left off
     if checkpoint_file.exists():
         try:
             cp_data = json.loads(checkpoint_file.read_text())
@@ -195,10 +196,30 @@ def scan_catalog(input_path: str, distributor: str):
             asin = p.get("asin")
             stats = p.get("stats") or {}
             current_prices = stats.get("current") or []
-            buybox_price = current_prices[18] if len(current_prices) > 18 else -1
-            new_price = current_prices[1] if len(current_prices) > 1 else -1
 
-            price_raw = buybox_price if buybox_price > 0 else new_price
+            # ---------------------------------------------------------
+            # Enhanced Price Extraction (Captures Suppressed Buy Boxes)
+            # Index 18 = Active Buy Box
+            # Index 10 = FBA / Prime 3rd-Party offer
+            # Index 1  = New 3rd-Party merchant offer
+            # ---------------------------------------------------------
+            buybox_price = current_prices[18] if len(current_prices) > 18 else -1
+            fba_price    = current_prices[10] if len(current_prices) > 10 else -1
+            new_price    = current_prices[1]  if len(current_prices) > 1  else -1
+
+            price_raw = -1
+            pricing_source = "None"
+
+            if buybox_price > 0:
+                price_raw = buybox_price
+                pricing_source = "Active Buy Box"
+            elif fba_price > 0:
+                price_raw = fba_price
+                pricing_source = "Suppressed Buy Box (Prime Offer)"
+            elif new_price > 0:
+                price_raw = new_price
+                pricing_source = "Lowest New Offer"
+
             if price_raw <= 0:
                 continue
 
@@ -214,14 +235,19 @@ def scan_catalog(input_path: str, distributor: str):
             net_profit = amz_price - est_fees - total_cogs
             roi = (net_profit / total_cogs) if total_cogs > 0 else 0
 
+            # Current sales rank
+            current_rank = current_prices[3] if len(current_prices) > 3 else -1
+            sales_ranks = p.get("salesRanks") or {}
+            display_group = next(iter(sales_ranks.values()), current_rank) if sales_ranks else current_rank
+
             if roi >= MIN_ROI:
-                display_group = (p.get("salesRanks") or {}).get("displayGroup", "N/A")
                 deal = {
                     "asin": asin,
                     "title": matched_row.get("title") or p.get("title", "Unknown"),
                     "vendor": distributor.upper(),
                     "sku": matched_row.get("sku", "N/A"),
                     "pack_size": pack_size,
+                    "pricing_source": pricing_source,
                     "unit_cogs": round(unit_cost, 2),
                     "total_cogs": round(total_cogs, 2),
                     "amazon_price": round(amz_price, 2),
@@ -231,7 +257,7 @@ def scan_catalog(input_path: str, distributor: str):
                     "vendor_url": f"https://www.amazon.com/dp/{asin}"
                 }
                 opportunities.append(deal)
-                logger.info(f"🔥 Qualified Deal: {deal['title']} (Pack: {pack_size}) | ROI: {deal['roi_pct']}% | Net: ${deal['net_profit']}")
+                logger.info(f"🔥 Qualified Deal: {deal['title']} [{pricing_source}] (Pack: {pack_size}) | ROI: {deal['roi_pct']}% | Net: ${deal['net_profit']}")
                 dispatch_telegram_alert(deal)
 
         processed_count = min(i + batch_size, len(valid_items))
