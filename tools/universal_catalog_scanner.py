@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Universal Wholesale Catalog Forward Scanner (Production)
----------------------------------------------------------
+Universal Wholesale Catalog Forward Scanner ($10+ Profit Per Sale & 75%+ ROI)
+-----------------------------------------------------------------------------
+- Strict 75% Net ROI hurdle AND $10.00 minimum net profit PER ORDER/SALE
+- Multipack/bundle aware: multiplies piece cost by bundle quantity
 - Pre-flight & post-lookup IP verification via core.ip_guard
-- Ingests distributor spreadsheets from /app/data/catalogs/incoming/
 - Matches items via Keepa product UPC lookup
 - Calculates dimensional fees, prep buffers, case pack rounding, and Net ROI
 - Sends verified high-margin alerts directly to Telegram
@@ -13,13 +14,14 @@ import os
 import sys
 import time
 import json
+import re
 import logging
 import requests
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Ensure /app root directory is available on sys.path
+# Ensure project root is available on sys.path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -37,7 +39,10 @@ logger = logging.getLogger("CatalogScanner")
 KEEPA_KEY = os.getenv("KEEPA_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MIN_ROI = float(os.getenv("MIN_ROI", 0.30))
+
+# Thresholds: 75% Net ROI and $10.00 Net Profit per order/sale
+MIN_ROI = float(os.getenv("MIN_ROI", 0.75))
+MIN_PROFIT_PER_SALE = float(os.getenv("MIN_PROFIT", 10.00))
 
 DATA_DIR = Path("/app/data")
 INCOMING_DIR = DATA_DIR / "catalogs" / "incoming"
@@ -56,21 +61,49 @@ def get_keepa_tokens():
         return 0, 20
 
 
+def extract_package_quantity(title: str, package_quantity_field: int = 1) -> int:
+    """Extracts true pack count from title or Keepa specs (e.g., 'Pack of 2', '2-Pack')."""
+    if package_quantity_field and int(package_quantity_field) > 1:
+        return int(package_quantity_field)
+    
+    t_lower = (title or "").lower()
+    match = re.search(r'\b(?:pack of|pack|pk|count of|ct|case of)\s*([0-9]{1,3})\b', t_lower)
+    if match:
+        try:
+            qty = int(match.group(1))
+            if 1 < qty <= 100:
+                return qty
+        except Exception:
+            pass
+
+    match2 = re.search(r'\b([0-9]{1,3})[\s-]*(?:pack|pk|count|ct)\b', t_lower)
+    if match2:
+        try:
+            qty = int(match2.group(1))
+            if 1 < qty <= 100:
+                return qty
+        except Exception:
+            pass
+
+    return 1
+
+
 def dispatch_catalog_alert(deal: dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
+    pack_info = f" ({deal['pack_qty']}-Pack)" if deal['pack_qty'] > 1 else ""
     text = (
-        f"🎯 *VERIFIED WHOLESALE CATALOG LEAD*\n\n"
+        f"🎯 *HIGH-MARGIN CATALOG LEAD (PER-SALE QUALIFIED)*\n\n"
         f"🏢 *Distributor:* `{deal['vendor']}` (SKU: `{deal['sku']}`)\n"
-        f"📦 *Product:* {deal['title']}\n"
+        f"📦 *Product:* {deal['title']}{pack_info}\n"
         f"🏷 *Brand:* `{deal['brand']}`\n"
         f"🆔 *ASIN:* `{deal['asin']}` | *UPC:* `{deal['upc']}`\n"
         f"📊 *Sales Rank (BSR):* {deal['sales_rank']:,} ({deal['category']})\n"
-        f"💰 *Wholesale Cost:* ${deal['cost']:.2f}\n"
+        f"💰 *Wholesale Cost:* ${deal['cost']:.2f}/ea (${deal['total_cogs']:.2f} total order COGS)\n"
         f"🛒 *Amazon Buy Box:* ${deal['buybox']:.2f}\n"
-        f"📈 *Estimated Net ROI:* *{deal['roi']:.1f}%*\n"
-        f"💵 *Estimated Net Profit:* *${deal['profit']:.2f}*\n"
+        f"📈 *Estimated Net ROI:* *{deal['roi']:.1f}%* (Floor: 75%)\n"
+        f"💵 *Profit per Sale:* *${deal['profit_per_sale']:.2f}* (Floor: $10.00/order)\n"
         f"👥 *Competition:* FBA Sellers: {deal['fba_count']} | FBM: {deal['fbm_count']}\n\n"
         f"🔗 [Amazon Listing](https://www.amazon.com/dp/{deal['asin']})"
     )
@@ -83,7 +116,7 @@ def dispatch_catalog_alert(deal: dict):
 
 
 def scan_catalog_file(file_path: Path):
-    logger.info(f"Starting catalog scan on: {file_path.name}")
+    logger.info(f"Starting catalog scan on: {file_path.name} (Hurdles: MIN_ROI={MIN_ROI * 100}%, MIN_PROFIT_PER_SALE=${MIN_PROFIT_PER_SALE:.2f})")
     try:
         if file_path.suffix.lower() in [".xlsx", ".xls"]:
             df = pd.read_excel(file_path)
@@ -113,7 +146,7 @@ def scan_catalog_file(file_path: Path):
         brand_val = str(row[brand_col]).strip() if brand_col else ""
         desc_val = str(row[desc_col]).strip() if desc_col else ""
 
-        # Checkpoint 1: Zero-Token Pre-flight IP Guard Check
+        # Zero-Token Pre-flight IP Guard Check
         if is_ip_blocked(brand=brand_val, title=desc_val, sku=sku_val):
             continue
 
@@ -150,7 +183,7 @@ def scan_catalog_file(file_path: Path):
             brand = p.get("brand") or "Unknown"
             title = p.get("title") or "Unknown"
 
-            # Checkpoint 2: Post-lookup normalized IP check
+            # Post-lookup normalized IP check
             if is_ip_blocked(brand=brand, title=title):
                 continue
 
@@ -171,16 +204,21 @@ def scan_catalog_file(file_path: Path):
             if bb_price <= 0:
                 continue
 
-            cost = matched_item["cost"]
+            piece_cost = matched_item["cost"]
+            pack_qty = extract_package_quantity(title, p.get("packageQuantity", 1))
+            total_order_cogs = piece_cost * pack_qty
+
             sales_rank = current[3] if len(current) > 3 else 999999
             fba_count = stats.get("fbaOfferCount", 0)
             fbm_count = stats.get("totalOfferCount", 0) - fba_count
 
+            # Fee modeling: 15% referral fee + $4.50 prep and pick/pack reserve
             est_fees = (bb_price * 0.15) + 4.50
-            net_profit = bb_price - cost - est_fees
-            roi = (net_profit / cost) if cost > 0 else 0.0
+            profit_per_sale = bb_price - total_order_cogs - est_fees
+            roi = (profit_per_sale / total_order_cogs) if total_order_cogs > 0 else 0.0
 
-            if roi >= MIN_ROI and net_profit >= 4.00:
+            # Double-gate evaluated strictly per sale/order:
+            if roi >= MIN_ROI and profit_per_sale >= MIN_PROFIT_PER_SALE:
                 deal = {
                     "vendor": vendor_name,
                     "sku": matched_item["sku"],
@@ -188,23 +226,25 @@ def scan_catalog_file(file_path: Path):
                     "upc": matched_item["upc"],
                     "title": title,
                     "brand": brand,
+                    "pack_qty": pack_qty,
                     "category": p.get("rootCategory", "Industrial"),
                     "sales_rank": sales_rank,
-                    "cost": cost,
+                    "cost": piece_cost,
+                    "total_cogs": total_order_cogs,
                     "buybox": bb_price,
                     "roi": round(roi * 100.0, 1),
-                    "profit": round(net_profit, 2),
+                    "profit_per_sale": round(profit_per_sale, 2),
                     "fba_count": fba_count,
                     "fbm_count": max(0, fbm_count)
                 }
-                logger.info(f"Verified Deal: [{vendor_name}] {asin} | {title[:30]} | ROI: {deal['roi']}%")
+                logger.info(f"Verified Deal: [{vendor_name}] {asin} ({pack_qty}-pk) | Profit/Sale: ${deal['profit_per_sale']:.2f} | ROI: {deal['roi']}%")
                 dispatch_catalog_alert(deal)
 
         time.sleep(max(0.5, round(2.0 / (refill_rate / 20.0), 2)))
 
 
 def run_catalog_scanner_daemon():
-    logger.info("Universal Catalog Scanner Daemon initialized.")
+    logger.info(f"Universal Catalog Scanner Daemon online (Min ROI: {MIN_ROI * 100}%, Min Profit per Sale: ${MIN_PROFIT_PER_SALE:.2f}).")
     while True:
         catalog_files = [f for f in INCOMING_DIR.glob("*.*") if f.suffix.lower() in [".xlsx", ".xls", ".csv"]]
         if catalog_files:
