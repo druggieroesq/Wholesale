@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Reverse Amazon Infill Hunter & Predictive Sourcing Engine (Clean Production)
-----------------------------------------------------------------------------
-- IP protection enforced via centralized core.ip_guard
+Reverse Amazon Infill Hunter & Predictive Sourcing Engine ($10+ Profit Per Sale Edition)
+---------------------------------------------------------------------------------------
+- Fully self-contained: Zero external module dependencies (No 'core' import crashes)
+- Direct live reload and inline additions to /app/data/ip_blocklist.json
+- Minimum 75% ROI hurdle AND $10.00 Net Profit PER ORDER/SALE
+- Pack/bundle aware: computes aggregate order COGS and total order profit
+- Dynamic MABC calculated per order so multipacks adjust allowable cost correctly
 - Live Block IP button in Telegram permanently mutes ASIN & writes brand to blocklist
 - Button UI changes immediately on decision so you know it was reviewed
 - High velocity targeting: ~150+ units/mo floor across all categories
-- Live estimated monthly velocity calculated and displayed on Telegram alerts
 - Form-data Keepa /query serialization (perPage >= 50, page=0)
 - Manufacturer / private label trap blocker (totalOfferCount >= 2)
 - Zero-FBA buy box monopoly gate (fbaOfferCount == 0, buyBoxIsFBA == False)
@@ -18,6 +21,7 @@ import sys
 import time
 import json
 import math
+import re
 import logging
 import argparse
 import threading
@@ -26,13 +30,6 @@ import requests
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
-
-# Ensure /app root directory is available on sys.path
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from core.ip_guard import is_ip_blocked, append_brand_to_blocklist
 
 load_dotenv("/app/.env")
 
@@ -45,15 +42,19 @@ logger = logging.getLogger("ReverseHunter")
 KEEPA_KEY = os.getenv("KEEPA_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TARGET_MIN_ROI = 0.75               # 75% minimum ROI hurdle
+MIN_PROFIT_PER_SALE = 10.00         # $10.00 minimum net profit per order/sale
 
 DATA_DIR = Path("/app/data")
 REPORTS_DIR = DATA_DIR / "reports"
 CATALOGS_DIR = DATA_DIR / "catalogs" / "incoming"
 DECISIONS_FILE = DATA_DIR / "lead_decisions.json"
+PRIMARY_IP_FILE = DATA_DIR / "ip_blocklist.json"
+FALLBACK_IP_FILE = Path(__file__).resolve().parent.parent / "data" / "ip_blocklist.json"
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Velocity rank ceilings calibrated for ~150+ units/mo minimum (3x baseline)
+# Velocity rank ceilings calibrated for ~150+ units/mo minimum
 CATEGORY_CONFIG = {
     16310091: {
         "name": "Industrial & Scientific",
@@ -86,6 +87,83 @@ BULK_BLOCKLIST = [
 decisions_lock = threading.Lock()
 
 
+# ==========================================
+# SELF-CONTAINED EMBEDDED IP GUARD
+# ==========================================
+def get_ip_blocklist_path() -> Path:
+    if PRIMARY_IP_FILE.parent.exists():
+        return PRIMARY_IP_FILE
+    FALLBACK_IP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    return FALLBACK_IP_FILE
+
+
+def load_ip_blocklist() -> dict:
+    target = get_ip_blocklist_path()
+    if not target.exists():
+        return {"brands": set(), "skus": set()}
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            return {
+                "brands": set(str(b).strip().lower() for b in raw if str(b).strip()),
+                "skus": set()
+            }
+        elif isinstance(raw, dict):
+            brands = set(str(b).strip().lower() for b in raw.get("brands", []) if str(b).strip())
+            skus = set(str(s).strip().upper() for s in raw.get("skus", []) if str(s).strip())
+            return {"brands": brands, "skus": skus}
+    except Exception as e:
+        logger.error(f"Failed to read blocklist from {target}: {e}")
+    return {"brands": set(), "skus": set()}
+
+
+def is_ip_blocked(brand: str = "", title: str = "", sku: str = "") -> bool:
+    blocklist = load_ip_blocklist()
+    b_clean = (brand or "").strip().lower()
+    t_clean = (title or "").strip().lower()
+    s_clean = (sku or "").strip().upper()
+
+    for blocked_sku in blocklist["skus"]:
+        if blocked_sku and blocked_sku in s_clean:
+            return True
+
+    for blocked_brand in blocklist["brands"]:
+        if blocked_brand:
+            if blocked_brand in b_clean or blocked_brand in t_clean:
+                return True
+
+    return False
+
+
+def append_brand_to_blocklist(brand: str) -> bool:
+    brand_clean = (brand or "").strip().lower()
+    if not brand_clean:
+        return False
+
+    target = get_ip_blocklist_path()
+    data = {"version": "2.2.0", "description": "Dynamic IP Guard Shield", "brands": [], "skus": []}
+
+    if target.exists():
+        try:
+            raw = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                data["brands"] = [str(b).strip().upper() for b in raw if str(b).strip()]
+            elif isinstance(raw, dict):
+                data["brands"] = [str(b).strip().upper() for b in raw.get("brands", []) if str(b).strip()]
+                data["skus"] = raw.get("skus", [])
+        except Exception as e:
+            logger.error(f"Error reading {target} for append: {e}")
+
+    existing_set = set(b.lower() for b in data["brands"])
+    if brand_clean not in existing_set:
+        data["brands"].append(brand.strip().upper())
+        data["brands"] = sorted(list(set(data["brands"])))
+        target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.info(f"Appended brand '{brand.strip().upper()}' to IP blocklist at {target}")
+        return True
+    return False
+
+
 def load_decisions() -> dict:
     if DECISIONS_FILE.exists():
         try:
@@ -116,6 +194,32 @@ def is_asin_suppressed(asin: str) -> bool:
             if time.time() < expires_ts:
                 return True
     return False
+
+
+def extract_package_quantity(title: str, package_quantity_field: int = 1) -> int:
+    if package_quantity_field and int(package_quantity_field) > 1:
+        return int(package_quantity_field)
+    
+    t_lower = (title or "").lower()
+    match = re.search(r'\b(?:pack of|pack|pk|count of|ct|case of)\s*([0-9]{1,3})\b', t_lower)
+    if match:
+        try:
+            qty = int(match.group(1))
+            if 1 < qty <= 100:
+                return qty
+        except Exception:
+            pass
+
+    match2 = re.search(r'\b([0-9]{1,3})[\s-]*(?:pack|pk|count|ct)\b', t_lower)
+    if match2:
+        try:
+            qty = int(match2.group(1))
+            if 1 < qty <= 100:
+                return qty
+        except Exception:
+            pass
+
+    return 1
 
 
 def start_telegram_feedback_listener():
@@ -199,14 +303,12 @@ def start_telegram_feedback_listener():
                         else:
                             status_text = "REVIEWED"
 
-                        # 1. Acknowledge button click to user
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
                             json={"callback_query_id": cb_id, "text": f"Saved: {status_text}", "show_alert": False},
                             timeout=5
                         )
 
-                        # 2. Update Telegram button markup to show decision status
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
                             json={
@@ -316,23 +418,28 @@ def dispatch_telegram_alert(deal: dict):
     google_shopping = f"https://www.google.com/search?tbm=shop&q={sourcing_query}"
     zoro_search = f"https://www.zoro.com/search?q={sourcing_query}"
 
+    pack_info = f" ({deal['pack_qty']}-Pack)" if deal['pack_qty'] > 1 else ""
+
     if deal.get("matched_vendor"):
         match_section = (
             f"✅ *Direct Catalog Match:* `{deal['matched_vendor']}`\n"
-            f"🏷 *SKU:* `{deal['matched_sku']}` | *Cost:* ${deal['matched_cost']:.2f}\n"
-            f"📈 *ROI:* *{deal['est_roi']:.1f}%* | 💰 *Profit:* *${deal['est_net_profit']:.2f}*\n"
+            f"🏷 *SKU:* `{deal['matched_sku']}` | *Cost:* ${deal['matched_cost']:.2f}/ea (${deal['total_order_cogs']:.2f} total order)\n"
+            f"📈 *ROI:* *{deal['est_roi']:.1f}%* (Floor: 75%)\n"
+            f"💵 *Profit per Sale:* *${deal['est_net_profit']:.2f}* (Floor: $10.00/order)\n"
         )
     else:
         target_dist_str = " / ".join(deal["target_distributors"])
+        unit_breakdown = f" (~${deal['max_buy_cost'] / deal['pack_qty']:.2f}/ea)" if deal['pack_qty'] > 1 else ""
         match_section = (
             f"🏢 *Suggested Wholesalers:* `{target_dist_str}`\n"
-            f"🎯 *Max Allowable Buy Cost:* *${deal['max_buy_cost']:.2f}* (Guarantees $\\ge$ 35% ROI)\n"
+            f"🎯 *Max Allowable Buy Cost:* *${deal['max_buy_cost']:.2f} total order*{unit_breakdown}\n"
+            f"   *(Guarantees $\\ge$ $10 Profit Per Sale & 75% ROI)*\n"
             f"🔎 *Wholesale Search:* [Google Shopping]({google_shopping}) | [Zoro]({zoro_search})\n"
         )
 
     text = (
         f"🔥 *HIGH-VELOCITY PRIME MONOPOLY LEAD*\n\n"
-        f"📦 *Product:* {deal['title']}\n"
+        f"📦 *Product:* {deal['title']}{pack_info}\n"
         f"🏷 *Brand:* `{brand}`\n"
         f"🆔 *ASIN:* `{asin}` | *UPC:* `{upc_str if upc_str else 'N/A'}`\n"
         f"🚀 *Estimated Velocity:* *~{deal['est_monthly_units']:,} units/mo* (BSR: {deal['sales_rank']:,})\n"
@@ -406,11 +513,11 @@ def fetch_products_detail(asins: list):
         return [], 0
 
 
-def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, min_rank_override=1, max_rank_override=250000):
+def run_high_velocity_hunter(min_fbm_price=22.0, max_weight=8.0, max_dim=16.0, min_rank_override=1, max_rank_override=250000):
     start_telegram_feedback_listener()
 
     tokens, refill = get_keepa_meta()
-    logger.info(f"High-Velocity Hunter Online | Refill: {refill}/min | Tokens: {tokens} | Centralized IP Shield active.")
+    logger.info(f"High-Velocity Hunter Online | Refill: {refill}/min | Tokens: {tokens} | Hurdle: 75%+ ROI & $10+ Profit Per Sale Floor")
 
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
     leads = []
@@ -426,7 +533,6 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, m
     while True:
         for cat_id, cat_info in CATEGORY_CONFIG.items():
             cat_name = cat_info["name"]
-            # Strict velocity cap guarantees ~150+ units/mo floor
             max_rank = cat_info["max_rank"]
             cur_min = min_rank_override
 
@@ -434,10 +540,11 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, m
 
             while cur_min < max_rank:
                 tokens_left, refill_rate = get_keepa_meta()
-                dynamic_reserve = max(10, int(refill_rate * 0.5))
+                # Maintain safe reserve so both processes avoid negative token crashes
+                dynamic_reserve = max(25, int(refill_rate * 0.75))
 
                 if tokens_left < dynamic_reserve:
-                    sleep_sec = max(2.0, round(float(dynamic_reserve - tokens_left) / (refill_rate / 60.0), 2))
+                    sleep_sec = max(3.0, round(float(dynamic_reserve - tokens_left) / (refill_rate / 60.0), 2))
                     logger.info(f"Tokens ({tokens_left}) below reserve ({dynamic_reserve}). Resting {sleep_sec}s...")
                     time.sleep(sleep_sec)
                     continue
@@ -457,16 +564,16 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, m
                 fresh_asins = [a for a in asin_candidates if a not in seen_asins and not is_asin_suppressed(a)]
 
                 if not fresh_asins:
-                    time.sleep(max(0.5, round(2.0 / (refill_rate / 20.0), 2)))
+                    time.sleep(max(1.0, round(3.0 / (refill_rate / 20.0), 2)))
                     continue
 
                 batch_size = 30 if refill_rate >= 100 else (20 if refill_rate >= 50 else 10)
 
                 for i in range(0, len(fresh_asins), batch_size):
                     tokens_left, refill_rate = get_keepa_meta()
-                    dynamic_reserve = max(10, int(refill_rate * 0.5))
+                    dynamic_reserve = max(25, int(refill_rate * 0.75))
                     if tokens_left < dynamic_reserve:
-                        sleep_sec = max(2.0, round(float(dynamic_reserve - tokens_left) / (refill_rate / 60.0), 2))
+                        sleep_sec = max(3.0, round(float(dynamic_reserve - tokens_left) / (refill_rate / 60.0), 2))
                         time.sleep(sleep_sec)
                         break
 
@@ -485,7 +592,7 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, m
                             seen_asins.add(asin)
                             continue
 
-                        # Centralized IP Guard Check (brand + title substring match)
+                        # Centralized IP Guard Check
                         if is_ip_blocked(brand=brand, title=title):
                             seen_asins.add(asin)
                             continue
@@ -540,9 +647,20 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, m
 
                         target_prime_price = round(baseline_price * 1.10, 2)
                         est_units = estimate_monthly_velocity(sales_rank, cat_id)
+                        pack_qty = extract_package_quantity(title, p.get("packageQuantity", 1))
 
-                        max_buy_cost = round((target_prime_price - 4.20 - (target_prime_price * 0.15)) / 1.35, 2)
-                        target_distributors = predict_distributors(brand, title, cat_name)
+                        # Maximum Buy Cost guaranteeing BOTH >= 75% ROI and >= $10.00 Net Profit PER ORDER
+                        net_payout = target_prime_price - 4.20 - (target_prime_price * 0.15)
+                        
+                        cost_cap_roi = net_payout / (1.0 + TARGET_MIN_ROI)
+                        cost_cap_profit = net_payout - MIN_PROFIT_PER_SALE
+                        
+                        max_buy_cost = round(min(cost_cap_roi, cost_cap_profit), 2)
+
+                        # Drop if impossible to clear $10 profit per sale
+                        if max_buy_cost <= 3.00:
+                            seen_asins.add(asin)
+                            continue
 
                         upcs = p.get("upcList") or []
                         matched_distributor = None
@@ -554,16 +672,26 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, m
 
                         est_roi = 0.0
                         net_profit = 0.0
+                        total_order_cogs = 0.0
                         if matched_distributor:
                             unit_cogs = matched_distributor["cost"]
+                            total_order_cogs = unit_cogs * pack_qty
                             est_fees = 4.20 + (target_prime_price * 0.15)
-                            net_profit = target_prime_price - est_fees - unit_cogs
-                            est_roi = (net_profit / unit_cogs) * 100.0 if unit_cogs > 0 else 0.0
+                            net_profit = target_prime_price - est_fees - total_order_cogs
+                            est_roi = (net_profit / total_order_cogs) * 100.0 if total_order_cogs > 0 else 0.0
+
+                            # Strict check: must clear 75% ROI AND $10.00 profit for the entire sale
+                            if (est_roi / 100.0) < TARGET_MIN_ROI or net_profit < MIN_PROFIT_PER_SALE:
+                                seen_asins.add(asin)
+                                continue
+
+                        target_distributors = predict_distributors(brand, title, cat_name)
 
                         lead = {
                             "asin": asin,
                             "title": title,
                             "brand": brand,
+                            "pack_qty": pack_qty,
                             "category": cat_name,
                             "sales_rank": sales_rank,
                             "est_monthly_units": est_units,
@@ -579,13 +707,14 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, m
                             "matched_vendor": matched_distributor["vendor"] if matched_distributor else None,
                             "matched_sku": matched_distributor["sku"] if matched_distributor else None,
                             "matched_cost": matched_distributor["cost"] if matched_distributor else None,
+                            "total_order_cogs": round(total_order_cogs, 2),
                             "est_roi": round(est_roi, 1),
                             "est_net_profit": round(net_profit, 2)
                         }
 
                         leads.append(lead)
                         seen_asins.add(asin)
-                        logger.info(f"High-Velocity Lead: {asin} | ~{est_units} units/mo | BSR {sales_rank:,} | Base ${baseline_price:.2f}")
+                        logger.info(f"Verified Deal: {asin} ({pack_qty}-pk) | Profit/Sale: ${net_profit:.2f} | MABC: ${max_buy_cost:.2f}")
                         dispatch_telegram_alert(lead)
 
                     results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
@@ -605,7 +734,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="High-Velocity Reverse Amazon Infill Hunter")
     parser.add_argument("--min-rank", type=int, default=1, help="Min BSR rank (Railway compatibility)")
     parser.add_argument("--max-rank", type=int, default=250000, help="Max BSR rank (Railway compatibility)")
-    parser.add_argument("--min-fbm-price", type=float, default=18.0)
+    parser.add_argument("--min-fbm-price", type=float, default=22.0, help="Min FBM retail price floor")
     parser.add_argument("--min-tokens", type=int, default=50, help="Min token reserve (Railway compatibility)")
     parser.add_argument("--max-weight", type=float, default=8.0)
     parser.add_argument("--max-dim", type=float, default=16.0)
