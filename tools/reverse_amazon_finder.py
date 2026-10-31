@@ -32,9 +32,6 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_ip_blocklist():
-    """Loads brands and ASINs from /app/data/ip_blocklist.json.
-    Supports a list, a dict with 'brands'/'asins', or brand-keyed mappings.
-    """
     blocked_brands = set()
     blocked_asins = set()
     if not IP_BLOCKLIST_PATH.exists():
@@ -68,10 +65,15 @@ def load_ip_blocklist():
 BLOCKED_BRANDS, BLOCKED_ASINS = load_ip_blocklist()
 
 
+def is_catalog_scanner_running() -> bool:
+    try:
+        res = os.popen("pgrep -f universal_catalog_scanner.py").read().strip()
+        return bool(res)
+    except Exception:
+        return False
+
+
 def build_local_catalog_index():
-    """Builds an in-memory index of UPCs and SKUs from incoming catalogs
-    (BCI, Frontier, Contour) to quickly match found Amazon ASINs to distributors.
-    """
     catalog_index = {}
     if not CATALOGS_DIR.exists():
         return catalog_index
@@ -139,19 +141,13 @@ def dispatch_telegram_reverse_alert(deal: dict):
 
 
 def query_keepa_product_finder(min_rank=1, max_rank=80000, per_page=50):
-    """Executes Keepa Product Finder query:
-    - BSR between min_rank and max_rank
-    - FBA seller count == 0
-    - Buy Box or FBM price >= $20.00
-    - Amazon is NOT a seller (out of stock)
-    """
     url = f"https://api.keepa.com/query?key={KEEPA_KEY}&domain=1&selection="
     query_payload = {
         "current_SALES_gte": min_rank,
         "current_SALES_lte": max_rank,
-        "current_FBA_lte": -1,              # -1 indicates no FBA offers present
-        "current_AMAZON_lte": -1,           # Amazon Retail is out of stock
-        "current_NEW_gte": 2000,            # Lowest New MFN price >= $20.00
+        "current_FBA_lte": -1,
+        "current_AMAZON_lte": -1,
+        "current_NEW_gte": 2000,
         "productType": [0, 1, 2],
         "sort": [["current_SALES", "asc"]],
         "perPage": per_page
@@ -180,7 +176,6 @@ def query_keepa_product_finder(min_rank=1, max_rank=80000, per_page=50):
 
 
 def fetch_products_detail(asins: list):
-    """Fetches full product stats for candidate ASINs in batches of 20."""
     if not asins:
         return [], 0
     codes = ",".join(asins)
@@ -208,7 +203,10 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
     seen_asins = {l["asin"] for l in leads if "asin" in l}
 
     while True:
-        logger.info("Executing Keepa 0-FBA Product Finder sweep...")
+        catalog_busy = is_catalog_scanner_running()
+        mode_label = "50/50 Dual Allocation Mode" if catalog_busy else "100% Full-Throttle Mode"
+        logger.info(f"Keepa 0-FBA Product Finder sweep [{mode_label}]...")
+
         asin_candidates, tokens = query_keepa_product_finder(min_rank, max_rank, per_page=40)
         logger.info(f"Retrieved {len(asin_candidates)} ASIN candidates. Tokens remaining: {tokens}")
 
@@ -231,7 +229,6 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
                 brand = (p.get("brand") or "").strip().lower()
                 title = p.get("title") or "Unknown"
 
-                # 1. IP Blocklist Filtering (drop brand or ASIN matches immediately)
                 if asin in BLOCKED_ASINS or brand in BLOCKED_BRANDS:
                     logger.info(f"🛡 [IP BLOCKED] Skipping {asin} ('{brand}')")
                     seen_asins.add(asin)
@@ -245,16 +242,7 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
                 sales_rank = current[3] if len(current) > 3 else -1
                 fba_price = current[10] if len(current) > 10 else -1
 
-                # 2. Hard Verification of 0-FBA and No-Amazon presence
-                if amazon_price > 0:
-                    seen_asins.add(asin)
-                    continue
-
-                if fba_price > 0:
-                    seen_asins.add(asin)
-                    continue
-
-                if fbm_price_raw <= 0:
+                if amazon_price > 0 or fba_price > 0 or fbm_price_raw <= 0:
                     seen_asins.add(asin)
                     continue
 
@@ -263,11 +251,9 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
                     seen_asins.add(asin)
                     continue
 
-                # 3. Model Prime Pricing (Capture 100% Buy Box by pricing at a 10% premium over FBM)
                 target_prime_price = round(fbm_price * 1.10, 2)
                 upcs = p.get("upcList") or []
 
-                # 4. Check Internal Catalogs for instant cost matching
                 matched_distributor = None
                 for upc in upcs:
                     clean_upc = str(upc).strip()
@@ -305,17 +291,17 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
                 logger.info(f"🎯 [PRIME TARGET] {title[:45]} | BSR: {sales_rank} | FBM Floor: ${fbm_price:.2f} | Brand: {lead['brand']}")
                 dispatch_telegram_reverse_alert(lead)
 
-            # Persist leads to disk
             results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
 
-            # 50/50 token-sharing delay
-            if tokens <= 0:
-                logger.info("Tokens momentarily zeroed. Pausing 20s...")
-                time.sleep(20)
+            # Dynamic pacing: 50% split if catalog scanner is running, 100% capacity when it is finished
+            if is_catalog_scanner_running():
+                sleep_delay = 20 if tokens <= 0 else 15
             else:
-                time.sleep(15)
+                sleep_delay = 10 if tokens <= 0 else 4
 
-        logger.info("Finished candidate batch. Pausing 30s before next iteration...")
+            time.sleep(sleep_delay)
+
+        logger.info("Batch cycle complete. Pausing 30s before next sweep...")
         time.sleep(30)
 
 
