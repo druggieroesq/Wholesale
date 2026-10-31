@@ -31,9 +31,9 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_ip_blocklist():
-    """Checks mounted volume first, then repo root fallbacks."""
     candidate_paths = [
         Path("/app/data/ip_blocklist.json"),
+        Path("/app/ip_blocklist.json.bak"),
         Path("/app/ip_blocklist.json"),
         Path("data/ip_blocklist.json"),
         Path("ip_blocklist.json")
@@ -128,7 +128,7 @@ def dispatch_telegram_reverse_alert(deal: dict):
     matched_text = (
         f"🏷 *Internal Match:* `{deal.get('matched_vendor')}` (SKU: `{deal.get('matched_sku')}` | Cost: ${deal.get('matched_cost'):.2f})\n"
         f"📈 *Estimated ROI:* *{deal.get('est_roi'):.1f}%*\n"
-    ) if deal.get("matched_vendor") else "🔍 *Internal Match:* None (Source Online / Distributor Hunt)\n"
+    ) if deal.get("matched_vendor") else "🔍 *Internal Match:* None (Distributor Hunt Opportunity)\n"
 
     text = (
         f"🎯 *PRIME MONOPOLIST TARGET (0 FBA)*\n\n"
@@ -137,7 +137,7 @@ def dispatch_telegram_reverse_alert(deal: dict):
         f"🆔 *ASIN:* `{deal.get('asin')}`\n"
         f"📊 *Sales Rank (BSR):* {deal.get('sales_rank'):,}\n"
         f"🛒 *FBM Floor Price:* ${deal.get('fbm_price'):.2f}\n"
-        f"🎯 *Target Prime Price (10% markup):* ${deal.get('target_prime_price'):.2f}\n"
+        f"🎯 *Target Prime Price (+10%):* ${deal.get('target_prime_price'):.2f}\n"
         f"👥 *Active Sellers:* {deal.get('seller_count')} (FBA: 0 | FBM: {deal.get('seller_count')})\n\n"
         f"{matched_text}\n"
         f"🔗 [Amazon Listing](https://www.amazon.com/dp/{deal.get('asin')}) | "
@@ -150,23 +150,23 @@ def dispatch_telegram_reverse_alert(deal: dict):
         logger.error(f"Telegram alert dispatch failed: {e}")
 
 
-def query_keepa_product_finder(min_rank=1, max_rank=80000, per_page=50):
-    url = f"https://api.keepa.com/query?key={KEEPA_KEY}&domain=1&selection="
+def query_keepa_product_finder(min_rank=1, max_rank=80000, min_fbm_price=25.0, per_page=50):
     query_payload = {
         "current_SALES_gte": min_rank,
         "current_SALES_lte": max_rank,
-        "current_FBA_lte": -1,
-        "current_AMAZON_lte": -1,
-        "current_NEW_gte": 2000,
+        "current_NEW_gte": int(min_fbm_price * 100),
+        "outOfStock_AMAZON": True,
+        "outOfStock_FBA": True,
         "productType": [0, 1, 2],
         "sort": [["current_SALES", "asc"]],
         "perPage": per_page
     }
 
     try:
+        url = f"https://api.keepa.com/query?key={KEEPA_KEY}&domain=1"
         r = requests.post(
-            f"https://api.keepa.com/query?key={KEEPA_KEY}&domain=1",
-            json=query_payload,
+            url,
+            json={"selection": json.dumps(query_payload)},
             timeout=40
         )
         if r.status_code == 429:
@@ -199,7 +199,7 @@ def fetch_products_detail(asins: list):
         return [], 0
 
 
-def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
+def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=25.0):
     logger.info(f"Starting Reverse Infill Hunter | BSR: {min_rank}-{max_rank} | Max FBA: 0 | Min Price: ${min_fbm_price:.2f}")
 
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
@@ -217,12 +217,17 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
         mode_label = "50/50 Dual Allocation Mode" if catalog_busy else "100% Full-Throttle Mode"
         logger.info(f"Keepa 0-FBA Product Finder sweep [{mode_label}]...")
 
-        asin_candidates, tokens = query_keepa_product_finder(min_rank, max_rank, per_page=40)
+        asin_candidates, tokens = query_keepa_product_finder(
+            min_rank=min_rank,
+            max_rank=max_rank,
+            min_fbm_price=min_fbm_price,
+            per_page=50
+        )
         logger.info(f"Retrieved {len(asin_candidates)} ASIN candidates. Tokens remaining: {tokens}")
 
         fresh_asins = [a for a in asin_candidates if a not in seen_asins]
         if not fresh_asins:
-            logger.info("All returned ASINs already evaluated. Sleeping 60s before next sweep...")
+            logger.info("No new ASIN candidates in this cycle. Sleeping 60s before next sweep...")
             time.sleep(60)
             continue
 
@@ -303,7 +308,6 @@ def run_reverse_hunter(min_rank=1, max_rank=80000, min_fbm_price=20.0):
 
             results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
 
-            # Dynamic pacing: 50% split if catalog scanner is running, 100% capacity when complete
             if is_catalog_scanner_running():
                 sleep_delay = 20 if tokens <= 0 else 15
             else:
@@ -320,7 +324,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-rank", type=int, default=1)
     parser.add_argument("--max-rank", type=int, default=80000)
     parser.add_argument("--max-fba", type=int, default=0)
-    parser.add_argument("--min-fbm-price", type=float, default=20.0)
+    parser.add_argument("--min-fbm-price", type=float, default=25.0)
     args = parser.parse_args()
 
     run_reverse_hunter(
