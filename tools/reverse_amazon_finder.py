@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-Reverse Amazon Infill Hunter (v2.0 Production)
------------------------------------------------
-Upgrades & Protections:
-1. Multi-category rotation:
+Reverse Amazon Infill Hunter (Dynamic High-Throughput Edition)
+---------------------------------------------------------------
+Core Features:
+1. Dynamic Token Adaptation:
+   - Reads Keepa's live `refillRate` and `tokensLeft` dynamically.
+   - Adjusts batch sizes and sleep delays proportionally to the account subscription tier.
+   - Automatically accelerates when plan speed increases without requiring manual config changes.
+2. Private Label / Brand-Owner Filter:
+   - Enforces `totalOfferCount >= 2` to eliminate 1-seller DTC private label traps (e.g. Essential Values).
+3. Zero-Prime & Strict Buy Box Lock:
+   - Requires `fbaOfferCount == 0` and `buyBoxIsFBA is False`.
+4. Physical Bulky-Freight Safety Gate:
+   - Filters out unlisted dimension/weight metadata, weights > 8.0 lbs, or longest edge > 16.0 inches.
+   - Keyword blocklist suppresses toilet paper, paper towels, trash liners, and pallet freight.
+5. Continuous 4-Category Rotation:
    - Industrial & Scientific (16310091)
    - Tools & Home Improvement (228013)
    - Office Products (1064954)
    - Health & Household (3760901)
-2. Price floor lowered to $18.00 (captures high-margin MRO & commercial consumables).
-3. BSR ceiling expanded to 250,000 for steady, low-competition wholesale velocity.
-4. Physical size/weight gate (max 8.0 lbs, max 16.0 inches) to block commercial toilet paper and bulky oversize.
-5. Strict Zero-FBA requirement (fbaOfferCount == 0 and buyBoxIsFBA is False) to exclude brand private label and false-positive Prime listings.
-6. Token bucket guardrail: yields execution when Keepa balance falls below 50 tokens.
+6. Real-time Distributor Cross-Match:
+   - Checks Keepa `upcList` against indexed files in `/app/data/catalogs/incoming/`.
 """
 
 import os
@@ -51,17 +59,27 @@ TARGET_CATEGORIES = [
     (3760901, "Health & Household")
 ]
 
+BULK_BLOCKLIST = [
+    "toilet paper", "bath tissue", "paper towel", "facial tissue",
+    "can liner", "trash bag", "gallon drum", "drum of", "pallet",
+    "case of 48", "case of 96", "case of 80"
+]
 
-def get_token_balance() -> int:
+
+def get_keepa_meta():
+    """Fetches real-time available tokens and refill rate from Keepa."""
     try:
         r = requests.get(f"https://api.keepa.com/token?key={KEEPA_KEY}", timeout=10).json()
-        return int(r.get("tokensLeft", 0))
+        tokens_left = int(r.get("tokensLeft", 0))
+        refill_rate = int(r.get("refillRate", 20))
+        return tokens_left, refill_rate
     except Exception as e:
-        logger.warning(f"Failed to query Keepa token endpoint: {e}")
-        return 0
+        logger.warning(f"Error checking Keepa token meta: {e}")
+        return 0, 20
 
 
 def load_ip_blocklist():
+    """Loads known IP complaint brands and restricted ASINs."""
     candidate_paths = [
         Path("/app/data/ip_blocklist.json"),
         Path("/app/ip_blocklist.json.bak"),
@@ -101,6 +119,7 @@ BLOCKED_BRANDS, BLOCKED_ASINS = load_ip_blocklist()
 
 
 def build_local_catalog_index():
+    """Indexes incoming distributor catalogs for real-time UPC cross-matching."""
     catalog_index = {}
     if not CATALOGS_DIR.exists():
         return catalog_index
@@ -139,7 +158,8 @@ def build_local_catalog_index():
 CATALOG_INDEX = build_local_catalog_index()
 
 
-def dispatch_telegram_reverse_alert(deal: dict):
+def dispatch_telegram_alert(deal: dict):
+    """Dispatches qualified Prime monopoly alert to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
@@ -154,7 +174,7 @@ def dispatch_telegram_reverse_alert(deal: dict):
         f"📦 *Product:* {deal.get('title')}\n"
         f"🏷 *Brand:* `{deal.get('brand')}`\n"
         f"🆔 *ASIN:* `{deal.get('asin')}`\n"
-        f"📊 *Sales Rank (BSR):* {deal.get('sales_rank'):,}\n"
+        f"📊 *Sales Rank (BSR):* {deal.get('sales_rank'):,} ({deal.get('category')})\n"
         f"🛒 *Baseline FBM Price:* ${deal.get('baseline_price'):.2f}\n"
         f"🎯 *Target Prime Price:* ${deal.get('target_prime_price'):.2f} (+10% Prime Premium)\n"
         f"👥 *Competition:* FBM Sellers: {deal.get('seller_count')} | FBA Sellers: 0\n"
@@ -203,8 +223,13 @@ def fetch_products_detail(asins: list):
         return [], 0
 
 
-def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_tokens=50, max_weight_lbs=8.0, max_dim_inches=16.0):
-    logger.info(f"Overnight Hunter v2 Active | Min Tokens: {min_tokens} | Min Price: ${min_fbm_price:.2f} | BSR: {min_rank:,}-{max_rank:,}")
+def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
+    init_tokens, init_refill = get_keepa_meta()
+    logger.info(
+        f"Dynamic Reverse Hunter Active | Initial Refill: {init_refill}/min | "
+        f"Tokens: {init_tokens} | BSR: {min_rank:,}-{max_rank:,} | Min Price: ${min_fbm_price:.2f}"
+    )
+
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
     leads = []
     if results_file.exists():
@@ -218,38 +243,48 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_toke
 
     while True:
         for cat_id, cat_name in TARGET_CATEGORIES:
-            current_min_rank = min_rank
+            cur_min = min_rank
 
-            while current_min_rank < max_rank:
-                available_tokens = get_token_balance()
-                if available_tokens < min_tokens:
-                    logger.info(f"Token balance ({available_tokens}/300) below reserve {min_tokens}. Yielding 45s...")
-                    time.sleep(45)
+            while cur_min < max_rank:
+                tokens_left, refill_rate = get_keepa_meta()
+
+                # Dynamic reserve ceiling: half of 1 minute's refill capacity (floor at 10)
+                dynamic_reserve = max(10, int(refill_rate * 0.5))
+                if tokens_left < dynamic_reserve:
+                    # Dynamically calculate exact sleep time to replenish back to reserve
+                    sleep_sec = max(2.0, round(float(dynamic_reserve - tokens_left) / (refill_rate / 60.0), 2))
+                    logger.info(f"Token balance ({tokens_left}) below reserve ({dynamic_reserve}). Resting {sleep_sec}s for refill ({refill_rate}/min)...")
+                    time.sleep(sleep_sec)
                     continue
 
-                current_max_rank = min(current_min_rank + step_size, max_rank)
-                logger.info(f"Sweep [{cat_name}] BSR {current_min_rank:,}-{current_max_rank:,} (Tokens: {available_tokens})...")
+                cur_max = min(cur_min + step_size, max_rank)
+                logger.info(f"Sweep [{cat_name}] BSR {cur_min:,}-{cur_max:,} | Tokens: {tokens_left} (Refill: {refill_rate}/min)...")
 
                 asin_candidates, _ = query_keepa_product_finder(
                     category_id=cat_id,
-                    min_rank=current_min_rank,
-                    max_rank=current_max_rank,
+                    min_rank=cur_min,
+                    max_rank=cur_max,
                     min_price=min_fbm_price,
                     per_page=50
                 )
 
-                current_min_rank += step_size
+                cur_min += step_size
                 fresh_asins = [a for a in asin_candidates if a not in seen_asins]
 
                 if not fresh_asins:
-                    time.sleep(6)
+                    # Tiny cadence pause scaled to refill speed
+                    time.sleep(max(0.5, round(2.0 / (refill_rate / 20.0), 2)))
                     continue
 
-                batch_size = 10
+                # Batch sizing scales with refill capability (30 for fast plans, 10 for standard)
+                batch_size = 30 if refill_rate >= 100 else (20 if refill_rate >= 50 else 10)
+
                 for i in range(0, len(fresh_asins), batch_size):
-                    if get_token_balance() < 40:
-                        logger.info("Tokens low (<40). Pausing batch processing...")
-                        time.sleep(45)
+                    tokens_left, refill_rate = get_keepa_meta()
+                    dynamic_reserve = max(10, int(refill_rate * 0.5))
+                    if tokens_left < dynamic_reserve:
+                        sleep_sec = max(2.0, round(float(dynamic_reserve - tokens_left) / (refill_rate / 60.0), 2))
+                        time.sleep(sleep_sec)
                         break
 
                     batch = fresh_asins[i:i + batch_size]
@@ -263,10 +298,17 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_toke
                         brand = (p.get("brand") or "").strip().lower()
                         title = p.get("title") or "Unknown"
 
+                        # 1. IP Blocklist Filter
                         if asin in BLOCKED_ASINS or brand in BLOCKED_BRANDS:
                             seen_asins.add(asin)
                             continue
 
+                        # 2. Bulky Commercial Paper & Trash Liners Filter
+                        if any(k in title.lower() for k in BULK_BLOCKLIST):
+                            seen_asins.add(asin)
+                            continue
+
+                        # 3. Physical Specs Extraction
                         weight_lbs = round((p.get("packageWeight") or 0) * 0.00220462, 2)
                         max_dim_in = round(max(
                             p.get("packageLength") or 0,
@@ -274,7 +316,8 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_toke
                             p.get("packageHeight") or 0
                         ) * 0.0393701, 1)
 
-                        if weight_lbs > max_weight_lbs or max_dim_in > max_dim_inches:
+                        # Drop missing metadata (null/0) and oversize/heavy items
+                        if weight_lbs <= 0.05 or weight_lbs > max_weight or max_dim_in > max_dim:
                             seen_asins.add(asin)
                             continue
 
@@ -285,17 +328,25 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_toke
                         fbm_price_raw = current[1] if len(current) > 1 else -1
                         sales_rank = current[3] if len(current) > 3 else -1
 
+                        # 4. Amazon Retail Exclusion
                         if amazon_price > 0:
                             seen_asins.add(asin)
                             continue
 
+                        # 5. Strict Zero-Prime Buy Box Gate
                         fba_count = stats.get("fbaOfferCount", 0)
                         buy_box_is_fba = stats.get("buyBoxIsFBA", False)
-
                         if fba_count > 0 or buy_box_is_fba is True:
                             seen_asins.add(asin)
                             continue
 
+                        # 6. Minimum 2 Competing Sellers Gate (Blocks single-seller DTC private labels)
+                        total_offers = stats.get("totalOfferCount", 0)
+                        if total_offers < 2:
+                            seen_asins.add(asin)
+                            continue
+
+                        # 7. Price Gate
                         if fbm_price_raw <= 0:
                             seen_asins.add(asin)
                             continue
@@ -307,6 +358,7 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_toke
 
                         target_prime_price = round(baseline_price * 1.10, 2)
 
+                        # 8. Distributor Catalog Cross-Match
                         upcs = p.get("upcList") or []
                         matched_distributor = None
                         for upc in upcs:
@@ -333,7 +385,7 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_toke
                             "max_dim_in": max_dim_in,
                             "baseline_price": round(baseline_price, 2),
                             "target_prime_price": target_prime_price,
-                            "seller_count": stats.get("totalOfferCount", 1),
+                            "seller_count": total_offers,
                             "fba_count": 0,
                             "upcs": upcs,
                             "matched_vendor": matched_distributor["vendor"] if matched_distributor else None,
@@ -345,24 +397,28 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, min_toke
 
                         leads.append(lead)
                         seen_asins.add(asin)
-                        logger.info(f"Target Banked: {asin} | {title[:32]} | ${target_prime_price:.2f} | BSR {sales_rank:,} ({cat_name})")
-                        dispatch_telegram_reverse_alert(lead)
+                        logger.info(f"Verified Infill Lead: {asin} | {title[:32]} | BSR {sales_rank:,} | Base ${baseline_price:.2f}")
+                        dispatch_telegram_alert(lead)
 
                     results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
-                    time.sleep(10)
 
-                time.sleep(12)
+                    # Dynamic batch pause: scales down inversely with refill rate
+                    inter_batch_delay = max(0.5, round(6.0 / (refill_rate / 20.0), 2))
+                    time.sleep(inter_batch_delay)
 
-        logger.info("Full category cycle complete. Resting 30s before next rotation...")
-        time.sleep(30)
+                sweep_delay = max(1.0, round(4.0 / (refill_rate / 20.0), 2))
+                time.sleep(sweep_delay)
+
+        cycle_delay = max(2.0, round(10.0 / (refill_rate / 20.0), 2))
+        logger.info(f"Category sweep complete. Cycling rotation in {cycle_delay}s...")
+        time.sleep(cycle_delay)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reverse Amazon Infill Hunter v2")
+    parser = argparse.ArgumentParser(description="Reverse Amazon Infill Hunter (Dynamic Edition)")
     parser.add_argument("--min-rank", type=int, default=1)
     parser.add_argument("--max-rank", type=int, default=250000)
     parser.add_argument("--min-fbm-price", type=float, default=18.0)
-    parser.add_argument("--min-tokens", type=int, default=50)
     parser.add_argument("--max-weight", type=float, default=8.0)
     parser.add_argument("--max-dim", type=float, default=16.0)
     args = parser.parse_args()
@@ -371,7 +427,6 @@ if __name__ == "__main__":
         min_rank=args.min_rank,
         max_rank=args.max_rank,
         min_fbm_price=args.min_fbm_price,
-        min_tokens=args.min_tokens,
-        max_weight_lbs=args.max_weight,
-        max_dim_inches=args.max_dim
+        max_weight=args.max_weight,
+        max_dim=args.max_dim
     )
