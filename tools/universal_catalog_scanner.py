@@ -27,22 +27,31 @@ MIN_ROI = float(os.getenv("MIN_ROI", 0.50))
 DATA_DIR = Path("/app/data")
 REPORTS_DIR = DATA_DIR / "reports"
 CHECKPOINTS_DIR = DATA_DIR / "checkpoints"
-IP_BLOCKLIST_PATH = DATA_DIR / "ip_blocklist.json"
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_ip_blocklist():
-    """Loads brands and ASINs from /app/data/ip_blocklist.json supporting lists or dicts."""
+    """Checks mounted volume first, then repo root fallbacks."""
+    candidate_paths = [
+        Path("/app/data/ip_blocklist.json"),
+        Path("/app/ip_blocklist.json"),
+        Path("data/ip_blocklist.json"),
+        Path("ip_blocklist.json")
+    ]
+    target_path = next((p for p in candidate_paths if p.exists()), None)
+
     blocked_brands = set()
     blocked_asins = set()
-    if not IP_BLOCKLIST_PATH.exists():
-        logger.warning(f"No IP blocklist found at {IP_BLOCKLIST_PATH}. Proceeding without IP filter.")
+
+    if not target_path:
+        logger.warning("No IP blocklist found at /app/data or root. Running without IP blocklist.")
         return blocked_brands, blocked_asins
 
     try:
-        raw = json.loads(IP_BLOCKLIST_PATH.read_text(encoding="utf-8"))
+        logger.info(f"Loading IP blocklist from: {target_path}")
+        raw = json.loads(target_path.read_text(encoding="utf-8"))
         if isinstance(raw, list):
             for item in raw:
                 item_str = str(item).strip()
@@ -55,13 +64,12 @@ def load_ip_blocklist():
                 blocked_brands.add(str(b).strip().lower())
             for a in raw.get("asins", []):
                 blocked_asins.add(str(a).strip().upper())
-            # Support generic key/value mappings
             for key, val in raw.items():
-                if key not in ["brands", "asins"] and isinstance(val, (str, list)):
+                if key not in ["brands", "asins"] and isinstance(val, (str, list, dict)):
                     blocked_brands.add(str(key).strip().lower())
-        logger.info(f"Loaded IP Blocklist: {len(blocked_brands)} brands, {len(blocked_asins)} ASINs protected.")
+        logger.info(f"Loaded IP Blocklist: {len(blocked_brands)} brands, {len(blocked_asins)} ASINs.")
     except Exception as e:
-        logger.error(f"Failed to read {IP_BLOCKLIST_PATH}: {e}")
+        logger.error(f"Failed to read {target_path}: {e}")
 
     return blocked_brands, blocked_asins
 
@@ -75,6 +83,7 @@ def dispatch_telegram_alert(deal: dict):
     text = (
         f"[QUALIFIED DEAL FOUND]\n\n"
         f"Product: {deal.get('title')}\n"
+        f"Brand: {deal.get('brand')}\n"
         f"Distributor: {deal.get('vendor')} | SKU: {deal.get('sku')}\n"
         f"ASIN: {deal.get('asin')}\n"
         f"Pack Size: {deal.get('pack_size')}\n"
@@ -190,14 +199,14 @@ def scan_catalog(input_path: str, distributor: str):
     df["clean_upc"] = df["upc"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     df = df[(df["clean_cost"] > 0) & (df["clean_upc"].str.len() >= 8)]
 
-    # PRE-FILTER: Discard SKUs whose distributor brand matches the IP blocklist before spending Keepa tokens
+    # Pre-Filter: drop SKUs matching blocked brands before spending Keepa tokens
     if "brand" in df.columns and BLOCKED_BRANDS:
         initial_count = len(df)
         df["brand_clean"] = df["brand"].astype(str).str.strip().str.lower()
         df = df[~df["brand_clean"].isin(BLOCKED_BRANDS)]
         dropped = initial_count - len(df)
         if dropped > 0:
-            logger.info(f"🛡 Pre-filtered {dropped} SKUs matching IP Blocklist brands (0 tokens wasted).")
+            logger.info(f"Pre-filtered {dropped} SKUs matching IP Blocklist brands (0 tokens spent).")
 
     valid_items = df.to_dict("records")
     logger.info(f"Pre-filter complete: {len(valid_items)} SKUs queued.")
@@ -228,9 +237,8 @@ def scan_catalog(input_path: str, distributor: str):
             asin = (p.get("asin") or "").strip().upper()
             keepa_brand = (p.get("brand") or "").strip().lower()
 
-            # POST-FILTER: Check Keepa's identified brand and ASIN against IP blocklist
             if asin in BLOCKED_ASINS or keepa_brand in BLOCKED_BRANDS:
-                logger.info(f"🛡 Skipping {asin} ('{keepa_brand}'): Match in IP Blocklist.")
+                logger.info(f"Skipping {asin} ('{keepa_brand}'): Match in IP Blocklist.")
                 continue
 
             upcs = p.get("upcList") or []
