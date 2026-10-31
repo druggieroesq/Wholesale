@@ -162,7 +162,7 @@ def dispatch_telegram_reverse_alert(deal: dict):
         logger.error(f"Telegram alert dispatch failed: {e}")
 
 
-def query_keepa_product_finder(min_rank=1, max_rank=80000, max_fba=2, min_price=25.0, per_page=50):
+def query_keepa_product_finder(min_rank=1, max_rank=80000, max_fba=2, min_price=25.0, per_page=50, page=0):
     query_payload = {
         "current_SALES_gte": min_rank,
         "current_SALES_lte": max_rank,
@@ -170,7 +170,8 @@ def query_keepa_product_finder(min_rank=1, max_rank=80000, max_fba=2, min_price=
         "outOfStock_AMAZON": True,
         "productType": [0, 1, 2],
         "sort": [["current_SALES", "asc"]],
-        "perPage": per_page
+        "perPage": per_page,
+        "page": page
     }
 
     if max_fba == 0:
@@ -215,18 +216,20 @@ def fetch_products_detail(asins: list):
         return [], 0
 
 
-def run_reverse_hunter(min_rank=1, max_rank=100000, max_fba=2, min_fbm_price=25.0):
+def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.0):
     bsr_windows = [
         (1, 5000),
         (5001, 15000),
         (15001, 30000),
         (30001, 50000),
         (50001, 75000),
-        (75001, 100000)
+        (75001, 100000),
+        (100001, 120000)
     ]
     window_idx = 0
+    page_idx = 0
 
-    logger.info(f"Starting Reverse Infill Hunter | Tiers: 1-100k BSR | Max FBA: {max_fba} | Min Price: ${min_fbm_price:.2f}")
+    logger.info(f"Starting Reverse Infill Hunter | Dynamic Sliding Tiers | Max FBA: {max_fba} | Min Price: ${min_fbm_price:.2f}")
 
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
     leads = []
@@ -243,25 +246,29 @@ def run_reverse_hunter(min_rank=1, max_rank=100000, max_fba=2, min_fbm_price=25.
         mode_label = "50/50 Dual Allocation Mode" if catalog_busy else "100% Full-Throttle Mode"
 
         cur_min, cur_max = bsr_windows[window_idx]
-        logger.info(f"Keepa Product Finder sweep [BSR {cur_min:,}-{cur_max:,}] (Max FBA: {max_fba}) [{mode_label}]...")
+        logger.info(f"Keepa sweep [BSR {cur_min:,}-{cur_max:,} | Page {page_idx}] (Max FBA: {max_fba}) [{mode_label}]...")
 
         asin_candidates, tokens = query_keepa_product_finder(
             min_rank=cur_min,
             max_rank=cur_max,
             max_fba=max_fba,
             min_price=min_fbm_price,
-            per_page=50
+            per_page=50,
+            page=page_idx
         )
-        logger.info(f"Retrieved {len(asin_candidates)} ASIN candidates from BSR {cur_min:,}-{cur_max:,}. Tokens remaining: {tokens}")
-
-        # Step to next BSR tier for subsequent loop
-        window_idx = (window_idx + 1) % len(bsr_windows)
+        logger.info(f"Retrieved {len(asin_candidates)} candidates [Tier {cur_min:,}-{cur_max:,} | P{page_idx}]. Tokens: {tokens}")
 
         fresh_asins = [a for a in asin_candidates if a not in seen_asins]
-        if not fresh_asins:
-            logger.info("No un-evaluated ASINs in this BSR tier. Moving to next window...")
-            time.sleep(10)
-            continue
+
+        # Advance pagination or rotate BSR bracket
+        if not fresh_asins or page_idx >= 4:
+            page_idx = 0
+            window_idx = (window_idx + 1) % len(bsr_windows)
+            if not fresh_asins:
+                time.sleep(5)
+                continue
+        else:
+            page_idx += 1
 
         batch_size = 10
         for i in range(0, len(fresh_asins), batch_size):
@@ -374,14 +381,14 @@ def run_reverse_hunter(min_rank=1, max_rank=100000, max_fba=2, min_fbm_price=25.
 
             time.sleep(sleep_delay)
 
-        logger.info("Batch cycle complete. Pausing 20s before next tier...")
+        logger.info("Batch cycle complete. Pausing 20s before next sweep...")
         time.sleep(20)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-rank", type=int, default=1)
-    parser.add_argument("--max-rank", type=int, default=100000)
+    parser.add_argument("--max-rank", type=int, default=120000)
     parser.add_argument("--max-fba", type=int, default=2)
     parser.add_argument("--min-fbm-price", type=float, default=25.0)
     args = parser.parse_args()
