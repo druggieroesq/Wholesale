@@ -2,10 +2,9 @@
 """
 Reverse Amazon Infill Hunter & Predictive Sourcing Engine (Clean Production)
 ----------------------------------------------------------------------------
-- IP blocklist decoupled from code: dynamic reload from /app/data/ip_blocklist.json
+- IP protection enforced via centralized core.ip_guard
 - High velocity targeting: ~150+ units/mo floor across all categories
 - Live estimated monthly velocity calculated and displayed on Telegram alerts
-- Substring IP matching across brand name and listing title before alerting
 - Interactive Telegram buttons: "🛒 Bought", "⛔ Deny (180d)", "⏩ Ignore"
 - Persistent suppression stored in /app/data/lead_decisions.json
 - Form-data Keepa /query serialization (perPage >= 50, page=0)
@@ -28,6 +27,8 @@ import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 
+from core.ip_guard import is_ip_blocked
+
 load_dotenv("/app/.env")
 
 logging.basicConfig(
@@ -44,7 +45,6 @@ DATA_DIR = Path("/app/data")
 REPORTS_DIR = DATA_DIR / "reports"
 CATALOGS_DIR = DATA_DIR / "catalogs" / "incoming"
 DECISIONS_FILE = DATA_DIR / "lead_decisions.json"
-IP_BLOCKLIST_FILE = DATA_DIR / "ip_blocklist.json"
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -79,30 +79,6 @@ BULK_BLOCKLIST = [
 ]
 
 decisions_lock = threading.Lock()
-
-
-def load_ip_blocklist() -> set:
-    """Dynamically reads /app/data/ip_blocklist.json on each cycle."""
-    if not IP_BLOCKLIST_FILE.exists():
-        return set()
-    try:
-        raw = json.loads(IP_BLOCKLIST_FILE.read_text(encoding="utf-8"))
-        items = raw if isinstance(raw, list) else raw.get("brands", [])
-        return set(str(b).strip().lower() for b in items if str(b).strip())
-    except Exception as e:
-        logger.error(f"Error loading {IP_BLOCKLIST_FILE}: {e}")
-        return set()
-
-
-def is_ip_blocked(brand: str, title: str) -> bool:
-    """Checks if any brand from ip_blocklist.json matches brand or title as a substring."""
-    blocked_brands = load_ip_blocklist()
-    b_lower = (brand or "").strip().lower()
-    t_lower = (title or "").strip().lower()
-    for blocked in blocked_brands:
-        if blocked and (blocked in b_lower or blocked in t_lower):
-            return True
-    return False
 
 
 def load_decisions() -> dict:
@@ -428,11 +404,7 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
     start_telegram_feedback_listener()
 
     tokens, refill = get_keepa_meta()
-    active_ip_count = len(load_ip_blocklist())
-    logger.info(
-        f"High-Velocity Hunter Online | Initial Refill: {refill}/min | "
-        f"Tokens: {tokens} | Loaded {active_ip_count} IP Blocked Brands from JSON."
-    )
+    logger.info(f"High-Velocity Hunter Online | Refill: {refill}/min | Tokens: {tokens} | Centralized IP Shield active.")
 
     results_file = REPORTS_DIR / "reverse_prime_monopoly_leads.json"
     leads = []
@@ -506,17 +478,17 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
                             seen_asins.add(asin)
                             continue
 
-                        # 1. Dynamic IP Check against /app/data/ip_blocklist.json
-                        if is_ip_blocked(brand, title):
+                        # Centralized IP Guard Check (brand + title)
+                        if is_ip_blocked(brand=brand, title=title):
                             seen_asins.add(asin)
                             continue
 
-                        # 2. Bulky Commercial Goods Keyword Gate
+                        # Bulky Commercial Goods Keyword Gate
                         if any(k in title.lower() for k in BULK_BLOCKLIST):
                             seen_asins.add(asin)
                             continue
 
-                        # 3. Physical Specs Extraction
+                        # Physical Specs Extraction
                         weight_lbs = round((p.get("packageWeight") or 0) * 0.00220462, 2)
                         max_dim_in = round(max(
                             p.get("packageLength") or 0,
@@ -562,7 +534,6 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
                         target_prime_price = round(baseline_price * 1.10, 2)
                         est_units = estimate_monthly_velocity(sales_rank, cat_id)
 
-                        # Maximum Buy Cost allowing >= 35% Net ROI
                         max_buy_cost = round((target_prime_price - 4.20 - (target_prime_price * 0.15)) / 1.35, 2)
                         target_distributors = predict_distributors(brand, title, cat_name)
 
