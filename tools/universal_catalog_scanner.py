@@ -33,9 +33,9 @@ CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_ip_blocklist():
-    """Checks mounted volume first, then repo root fallbacks."""
     candidate_paths = [
         Path("/app/data/ip_blocklist.json"),
+        Path("/app/ip_blocklist.json.bak"),
         Path("/app/ip_blocklist.json"),
         Path("data/ip_blocklist.json"),
         Path("ip_blocklist.json")
@@ -46,10 +46,19 @@ def load_ip_blocklist():
     blocked_asins = set()
 
     if not target_path:
-        logger.warning("No IP blocklist found at /app/data or root. Running without IP blocklist.")
+        logger.warning("No IP blocklist found at /app/data, /app root, or .bak. Running without IP blocklist.")
         return blocked_brands, blocked_asins
 
     try:
+        # Auto-mirror to persistent volume mount if loaded from a fallback
+        dest_path = Path("/app/data/ip_blocklist.json")
+        if target_path != dest_path and not dest_path.exists():
+            try:
+                dest_path.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
+                logger.info(f"Mirrored {target_path} -> {dest_path} for persistent storage.")
+            except Exception as e:
+                logger.warning(f"Could not mirror blocklist to /app/data: {e}")
+
         logger.info(f"Loading IP blocklist from: {target_path}")
         raw = json.loads(target_path.read_text(encoding="utf-8"))
         if isinstance(raw, list):
@@ -156,9 +165,9 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             col_map["title"] = col
         elif "brand" not in col_map and any(k in cu for k in ["MFGNAME", "VENDORNAME", "BRAND", "MANUFACTURER"]):
             col_map["brand"] = col
-        elif "cost" not in col_map and any(k in cu for k in ["DEALERPRICE", "PRICE", "COST", "WHOLESALE"]):
+        elif "cost" not in col_map and any(k in cu for k in ["DEALERPRICE", "PRICE", "COST", "WHOLESALE", "WHLS PRICE"]):
             col_map["cost"] = col
-        elif "sku" not in col_map and any(k in cu for k in ["ACTIVERECORDCODE", "ITEMNUMBER", "ITEM", "SKU", "PART"]):
+        elif "sku" not in col_map and any(k in cu for k in ["ACTIVERECORDCODE", "ITEMNUMBER", "ITEM NUMBER", "ITEM", "SKU", "PART"]):
             col_map["sku"] = col
 
     logger.info(f"Column normalization mapping: {col_map}")
@@ -180,7 +189,7 @@ def query_keepa_batch(upcs: list) -> tuple:
                 logger.warning(f"Keepa 429 (Tokens exhausted). Pausing {int(ws)}s for refill...")
                 time.sleep(max(ws, 20))
                 continue
-            return data.get("products", []), data.get("tokensLeft", 0)
+            return data.get("products", []) or [], data.get("tokensLeft", 0)
         except Exception as e:
             logger.error(f"Keepa error: {e}. Retrying in 10s...")
             time.sleep(10)
@@ -199,7 +208,6 @@ def scan_catalog(input_path: str, distributor: str):
     df["clean_upc"] = df["upc"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     df = df[(df["clean_cost"] > 0) & (df["clean_upc"].str.len() >= 8)]
 
-    # Pre-Filter: drop SKUs matching blocked brands before spending Keepa tokens
     if "brand" in df.columns and BLOCKED_BRANDS:
         initial_count = len(df)
         df["brand_clean"] = df["brand"].astype(str).str.strip().str.lower()
@@ -312,8 +320,8 @@ def scan_catalog(input_path: str, distributor: str):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--input", required=True)
-    p.add_argument("--distributor", required=True)
-    a = p.parse_args()
-    scan_catalog(a.input, a.distributor)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--distributor", required=True)
+    args = parser.parse_args()
+    scan_catalog(args.input, args.distributor)
