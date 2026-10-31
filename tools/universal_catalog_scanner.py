@@ -2,6 +2,7 @@
 """
 Universal Wholesale Catalog Forward Scanner ($10+ Profit Per Sale & 75%+ ROI)
 -----------------------------------------------------------------------------
+- Automatic Excel header row detection (handles Frontier metadata in row 0)
 - Fully self-contained: Zero external module dependencies (No 'core' import crashes)
 - Direct live reload from /app/data/ip_blocklist.json
 - CLI argument compatibility: accepts --input and --distributor flags from Railway entrypoint
@@ -161,28 +162,48 @@ def dispatch_catalog_alert(deal: dict):
         logger.error(f"Telegram dispatch failed: {e}")
 
 
+def load_dataframe_with_smart_headers(file_path: Path) -> pd.DataFrame:
+    """Reads Excel/CSV and dynamically detects header row if metadata precedes column titles."""
+    if file_path.suffix.lower() not in [".xlsx", ".xls"]:
+        return pd.read_csv(file_path, dtype=str)
+
+    # Check first 10 rows for valid header names
+    for header_idx in range(10):
+        try:
+            df = pd.read_excel(file_path, header=header_idx, nrows=10)
+            col_names = " ".join([str(c).upper() for c in df.columns])
+            if any(k in col_names for k in ["UPC", "BARCODE", "EAN"]) and any(k in col_names for k in ["PRICE", "COST", "WHLS", "DEALER"]):
+                logger.info(f"Detected valid column headers at row {header_idx} in {file_path.name}")
+                return pd.read_excel(file_path, header=header_idx)
+        except Exception:
+            continue
+
+    # Fallback to standard row 0
+    return pd.read_excel(file_path)
+
+
 def scan_catalog_file(file_path: Path, distributor_override: str = None):
     vendor_name = distributor_override.upper() if distributor_override else file_path.stem.replace("_Catalog", "").upper()
     logger.info(f"Starting catalog scan on: {file_path.name} | Vendor: {vendor_name} (Hurdles: MIN_ROI={MIN_ROI * 100}%, MIN_PROFIT_PER_SALE=${MIN_PROFIT_PER_SALE:.2f})")
     
     try:
-        if file_path.suffix.lower() in [".xlsx", ".xls"]:
-            df = pd.read_excel(file_path)
-        else:
-            df = pd.read_csv(file_path, dtype=str)
+        df = load_dataframe_with_smart_headers(file_path)
     except Exception as e:
         logger.error(f"Failed to read file {file_path.name}: {e}")
         return
 
-    upc_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["UPC", "BARCODE", "EAN"])), None)
-    cost_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["PRICE", "COST", "DEALER", "WHLS"])), None)
-    sku_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["ITEM", "SKU", "CODE"])), None)
+    # Flexible matching for Frontier, BCI, and Contour column schemas
+    upc_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["UPC", "BARCODE", "BAR CODE", "EAN"])), None)
+    cost_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["PRICE", "COST", "DEALER", "WHLS", "WHL PRICE", "WHOLESALE"])), None)
+    sku_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["ITEM", "SKU", "CODE", "ITEM NUMBER"])), None)
     brand_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["BRAND", "MFR", "MANUFACTURER"])), None)
-    desc_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["DESC", "DESCRIPTION", "NAME"])), None)
+    desc_col = next((c for c in df.columns if any(k in str(c).upper() for k in ["DESC", "DESCRIPTION", "NAME", "PRODUCT NAME"])), None)
 
     if not upc_col or not cost_col:
-        logger.warning(f"Could not map UPC and Cost columns in {file_path.name}. Skipping.")
+        logger.warning(f"Could not map UPC and Cost columns in {file_path.name}. Detected columns: {list(df.columns[:8])}. Skipping.")
         return
+
+    logger.info(f"Column mapping confirmed: UPC='{upc_col}', Cost='{cost_col}', SKU='{sku_col}', Brand='{brand_col}'")
 
     items_to_query = []
 
@@ -205,7 +226,6 @@ def scan_catalog_file(file_path: Path, distributor_override: str = None):
     batch_size = 20
     for i in range(0, len(items_to_query), batch_size):
         tokens_left, refill_rate = get_keepa_tokens()
-        # Elevated buffer to coordinate with concurrent Reverse Hunter execution
         if tokens_left < 30:
             sleep_time = max(3.0, round(float(30 - tokens_left) / (refill_rate / 60.0), 2))
             logger.info(f"Token reserve buffer active ({tokens_left} tokens). Sleeping {sleep_time}s...")
