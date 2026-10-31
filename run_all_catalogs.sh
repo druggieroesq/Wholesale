@@ -8,47 +8,74 @@ REPORTS_DIR="/app/data/reports"
 
 mkdir -p "$INCOMING_DIR" "$PROCESSED_DIR" "$LOGS_DIR" "$CHECKPOINTS_DIR" "$REPORTS_DIR"
 
-echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] === Initializing Autonomous Catalog Pipeline ==="
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] === Initializing Autonomous 50/50 Dual Pipeline ==="
 
-# Auto-download Frontier if missing
+# -------------------------------------------------------------------
+# 1. Launch 24/7 Reverse Hunter Immediately in Background (50% tokens)
+# -------------------------------------------------------------------
+if ! pgrep -f "reverse_amazon_finder.py" > /dev/null; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Starting Reverse Amazon Hunter (0-FBA Prime targets)..."
+    nohup python3 /app/tools/reverse_amazon_finder.py \
+        --min-rank 1 \
+        --max-rank 80000 \
+        --max-fba 0 \
+        --min-fbm-price 25.0 \
+        > "$LOGS_DIR/reverse_hunter.log" 2>&1 &
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Reverse Hunter running (PID: $!). Streaming to Telegram."
+fi
+
+# -------------------------------------------------------------------
+# 2. Auto-download Catalog Sheets if Missing
+# -------------------------------------------------------------------
 if [ ! -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ] && [ ! -f "$PROCESSED_DIR/Frontier_Catalog.xlsx" ]; then
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Frontier Catalog..."
     curl -sL "https://docs.google.com/spreadsheets/d/122YeUPONFQuwy5UfoE3pz8RNK1pdb9l0/export?format=xlsx" -o "$INCOMING_DIR/Frontier_Catalog.xlsx"
 fi
 
-# Auto-download BCI if missing
 if [ ! -f "$INCOMING_DIR/BCI_Catalog.xlsx" ] && [ ! -f "$PROCESSED_DIR/BCI_Catalog.xlsx" ]; then
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching BCI Catalog..."
     curl -sL "https://docs.google.com/spreadsheets/d/1D1hUS38LK-8XsQIdIOeluUM1XKUu-n8-/export?format=xlsx" -o "$INCOMING_DIR/BCI_Catalog.xlsx"
 fi
 
-# Auto-download Contour if missing
 if [ ! -f "$INCOMING_DIR/Contour_Catalog.csv" ] && [ ! -f "$PROCESSED_DIR/Contour_Catalog.csv" ]; then
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Contour Catalog..."
     curl -sL "https://drive.google.com/uc?export=download&id=1-YRPv_YSM82L38E7TnUNDdfSxRDWK0sA" -o "$INCOMING_DIR/Contour_Catalog.csv"
 fi
 
-catalogs=( "$INCOMING_DIR"/* )
-valid_catalogs=()
+# -------------------------------------------------------------------
+# 3. Prioritized Catalog Queue: Frontier First, then Contour, then BCI
+# -------------------------------------------------------------------
+queue=()
 
-for cat in "${catalogs[@]}"; do
+# Prioritize high-velocity consumer catalogs first
+[[ -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ]] && queue+=("$INCOMING_DIR/Frontier_Catalog.xlsx")
+[[ -f "$INCOMING_DIR/Contour_Catalog.csv" ]]    && queue+=("$INCOMING_DIR/Contour_Catalog.csv")
+[[ -f "$INCOMING_DIR/BCI_Catalog.xlsx" ]]       && queue+=("$INCOMING_DIR/BCI_Catalog.xlsx")
+
+# Add any additional user-uploaded files
+for cat in "$INCOMING_DIR"/*; do
     if [[ -f "$cat" && ("$cat" == *.xlsx || "$cat" == *.xls || "$cat" == *.csv) ]]; then
-        valid_catalogs+=("$cat")
+        if [[ ! " ${queue[*]} " =~ " ${cat} " ]]; then
+            queue+=("$cat")
+        fi
     fi
 done
 
-echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Total catalogs ready for processing: ${#valid_catalogs[@]}"
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Total catalogs ready for processing: ${#queue[@]}"
 
-for cat in "${valid_catalogs[@]}"; do
+# -------------------------------------------------------------------
+# 4. Process Forward Catalogs
+# -------------------------------------------------------------------
+for cat in "${queue[@]}"; do
     filename=$(basename "$cat")
     distributor="generic"
 
-    if [[ "$filename" =~ [Bb][Cc][Ii] ]]; then
-        distributor="bci"
-    elif [[ "$filename" =~ [Ff]rontier ]]; then
+    if [[ "$filename" =~ [Ff]rontier ]]; then
         distributor="frontier"
     elif [[ "$filename" =~ [Cc]ontour ]]; then
         distributor="contour"
+    elif [[ "$filename" =~ [Bb][Cc][Ii] ]]; then
+        distributor="bci"
     fi
 
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Starting $distributor processing: $filename"
@@ -56,13 +83,12 @@ for cat in "${valid_catalogs[@]}"; do
     status=$?
 
     if [ $status -eq 0 ]; then
-        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Successfully completed $filename. Archiving..."
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] >>> Completed $filename. Archiving..."
         mv "$cat" "$PROCESSED_DIR/$filename"
     else
-        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ERROR] Scanner exited on $filename with code $status. Halting pipeline."
-        exit 1
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [WARNING] Scanner exited on $filename with code $status. Continuing pipeline..."
     fi
 done
 
-echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] All catalog batches complete. Launching 24/7 background finder..."
-python3 /app/tools/reverse_amazon_finder.py
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] All initial catalog queues processed. Continuous hunting remains active."
+wait
