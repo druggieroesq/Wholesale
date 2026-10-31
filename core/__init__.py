@@ -1,1 +1,1 @@
-"""Wholesale sniper core modules."""
+"""Core module for shared wholesale pipeline utilities."""
