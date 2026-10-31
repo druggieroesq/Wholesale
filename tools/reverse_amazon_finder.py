@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# tools/reverse_amazon_finder.py - Complete Hunter with Dynamic BSR Sliding, Page Iteration, and Max-FBA Support
 import os
 import re
 import sys
@@ -140,7 +141,7 @@ def dispatch_telegram_reverse_alert(deal: dict):
         f"🏷 *Internal Match:* `{deal.get('matched_vendor')}` (SKU: `{deal.get('matched_sku')}` | Cost: ${deal.get('matched_cost'):.2f})\n"
         f"📈 *Estimated Net ROI:* *{deal.get('est_roi'):.1f}%*\n"
         f"💰 *Estimated Net Profit:* *${deal.get('est_net_profit'):.2f}*\n"
-    ) if deal.get("matched_vendor") else "🔍 *Internal Match:* None (Distributor Hunt Opportunity)\n"
+    ) if deal.get("matched_vendor") else "🔍 *Internal Match:* None (Distributor Sourcing Lead)\n"
 
     text = (
         f"🎯 *OPPORTUNITY TARGET [{fba_tag}]*\n\n"
@@ -148,7 +149,7 @@ def dispatch_telegram_reverse_alert(deal: dict):
         f"🏷 *Brand:* `{deal.get('brand')}`\n"
         f"🆔 *ASIN:* `{deal.get('asin')}`\n"
         f"📊 *Sales Rank (BSR):* {deal.get('sales_rank'):,}\n"
-        f"🛒 *Floor / Baseline Price:* ${deal.get('baseline_price'):.2f}\n"
+        f"🛒 *Baseline Price:* ${deal.get('baseline_price'):.2f}\n"
         f"🎯 *Target Selling Price:* ${deal.get('target_prime_price'):.2f} ({deal.get('pricing_strategy')})\n"
         f"👥 *Competition:* Total Sellers: {deal.get('seller_count')} | FBA Sellers: {deal.get('fba_count')}\n\n"
         f"{matched_text}\n"
@@ -260,7 +261,6 @@ def run_reverse_hunter(min_rank=1, max_rank=120000, max_fba=2, min_fbm_price=25.
 
         fresh_asins = [a for a in asin_candidates if a not in seen_asins]
 
-        # Advance pagination or rotate BSR bracket
         if not fresh_asins or page_idx >= 4:
             page_idx = 0
             window_idx = (window_idx + 1) % len(bsr_windows)
