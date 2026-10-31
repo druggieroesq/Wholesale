@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Reverse Amazon Infill Hunter (High-Speed Dynamic Edition)
----------------------------------------------------------
+Reverse Amazon Infill Hunter & Telegram Feedback Loop (Full Production)
+-----------------------------------------------------------------------
 Features:
-- Dynamic Keepa token handling (adapts instantly to upgraded speed tiers)
-- Strict Keepa /query form-data serialization (perPage >= 50, page=0)
-- Manufacturer & Private Label suppression (totalOfferCount >= 2)
-- Bulky goods & unlisted dimension filtering (< 8 lbs, < 16 in, keyword blocklist)
-- Strict Zero-FBA Buy Box monopoly gate (fbaOfferCount == 0, buyBoxIsFBA == False)
-- Real-time UPC cross-referencing against incoming distributor catalogs
+- Dynamic Keepa token adjustment based on live refillRate
+- Inline Telegram interactive buttons: "🛒 Bought", "⛔ Deny (180d)", "⏩ Ignore"
+- Persistent suppression storage in /app/data/lead_decisions.json:
+    * Bought: Suppressed permanently
+    * Denied: Suppressed for 180 days (evaluated against epoch timestamp)
+- Background Telegram polling thread handling button callbacks & inline status updates
+- Validated Keepa /query form-data serialization (perPage >= 50, page=0)
+- Manufacturer & private label trap blocker (totalOfferCount >= 2)
+- Bulky freight keyword filter and package dimension/weight ceilings
+- 0-FBA monopoly gate (fbaOfferCount == 0 and buyBoxIsFBA == False)
+- Real-time catalog cross-matching against incoming distributor files
 """
 
 import os
@@ -17,6 +22,7 @@ import time
 import json
 import logging
 import argparse
+import threading
 import requests
 import pandas as pd
 from pathlib import Path
@@ -37,6 +43,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DATA_DIR = Path("/app/data")
 REPORTS_DIR = DATA_DIR / "reports"
 CATALOGS_DIR = DATA_DIR / "catalogs" / "incoming"
+DECISIONS_FILE = DATA_DIR / "lead_decisions.json"
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -52,6 +59,156 @@ BULK_BLOCKLIST = [
     "can liner", "trash bag", "gallon drum", "drum of", "pallet",
     "case of 48", "case of 96", "case of 80"
 ]
+
+decisions_lock = threading.Lock()
+
+
+def load_decisions() -> dict:
+    if DECISIONS_FILE.exists():
+        try:
+            return json.loads(DECISIONS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_decisions(data: dict):
+    with decisions_lock:
+        DECISIONS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def is_asin_suppressed(asin: str) -> bool:
+    """Returns True if ASIN was marked Bought or is inside the 180-day Denied window."""
+    with decisions_lock:
+        decisions = load_decisions()
+        entry = decisions.get(asin.upper())
+        if not entry:
+            return False
+
+        status = entry.get("status")
+        if status == "BOUGHT":
+            return True
+
+        if status == "DENIED":
+            expires_ts = entry.get("expires_ts", 0)
+            if time.time() < expires_ts:
+                return True
+    return False
+
+
+def start_telegram_feedback_listener():
+    """Runs continuous background listener for Telegram inline keyboard actions."""
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("No TELEGRAM_BOT_TOKEN set; feedback listener skipped.")
+        return
+
+    def listener_loop():
+        logger.info("Telegram feedback callback listener started.")
+        last_update_id = 0
+        while True:
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+                params = {"offset": last_update_id + 1, "timeout": 20}
+                r = requests.get(url, params=params, timeout=25).json()
+
+                for update in r.get("result", []):
+                    last_update_id = update["update_id"]
+                    cb = update.get("callback_query")
+                    if not cb:
+                        continue
+
+                    cb_id = cb.get("id")
+                    data = cb.get("data", "")
+                    msg = cb.get("message", {})
+                    chat_id = msg.get("chat", {}).get("id")
+                    msg_id = msg.get("message_id")
+
+                    if data == "noop":
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                            json={"callback_query_id": cb_id, "text": "Decision already recorded.", "show_alert": False},
+                            timeout=5
+                        )
+                        continue
+
+                    if ":" not in data:
+                        continue
+
+                    action, asin = data.split(":", 1)
+                    asin = asin.strip().upper()
+                    now_ts = int(time.time())
+
+                    with decisions_lock:
+                        decisions = load_decisions()
+
+                        if action == "BUY":
+                            decisions[asin] = {
+                                "status": "BOUGHT",
+                                "timestamp": now_ts,
+                                "expires_ts": None
+                            }
+                            save_decisions(decisions)
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                json={"callback_query_id": cb_id, "text": "Marked BOUGHT (Permanently muted)", "show_alert": False},
+                                timeout=5
+                            )
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+                                json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "reply_markup": {"inline_keyboard": [[{"text": "STATUS: BOUGHT", "callback_data": "noop"}]]}
+                                },
+                                timeout=5
+                            )
+                            logger.info(f"Decision logged: {asin} -> BOUGHT")
+
+                        elif action == "DENY":
+                            decisions[asin] = {
+                                "status": "DENIED",
+                                "timestamp": now_ts,
+                                "expires_ts": now_ts + (180 * 86400)
+                            }
+                            save_decisions(decisions)
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                json={"callback_query_id": cb_id, "text": "DENIED: Suppressed for 180 days", "show_alert": False},
+                                timeout=5
+                            )
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+                                json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "reply_markup": {"inline_keyboard": [[{"text": "STATUS: DENIED (180d)", "callback_data": "noop"}]]}
+                                },
+                                timeout=5
+                            )
+                            logger.info(f"Decision logged: {asin} -> DENIED (180 days)")
+
+                        elif action == "PASS":
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                json={"callback_query_id": cb_id, "text": "Ignored (no suppression)", "show_alert": False},
+                                timeout=5
+                            )
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+                                json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "reply_markup": {"inline_keyboard": [[{"text": "STATUS: SKIPPED", "callback_data": "noop"}]]}
+                                },
+                                timeout=5
+                            )
+                            logger.info(f"Decision logged: {asin} -> PASS")
+
+            except Exception as e:
+                time.sleep(5)
+
+    listener_thread = threading.Thread(target=listener_loop, daemon=True)
+    listener_thread.start()
 
 
 def get_keepa_meta():
@@ -135,10 +292,11 @@ def build_local_catalog_index():
 CATALOG_INDEX = build_local_catalog_index()
 
 
-def dispatch_telegram(deal: dict):
+def dispatch_telegram_alert(deal: dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
+    asin = deal.get("asin")
     matched_text = (
         f"🏷 *Internal Match:* `{deal.get('matched_vendor')}` (SKU: `{deal.get('matched_sku')}` | Cost: ${deal.get('matched_cost'):.2f})\n"
         f"📈 *Estimated Net ROI:* *{deal.get('est_roi'):.1f}%*\n"
@@ -149,24 +307,43 @@ def dispatch_telegram(deal: dict):
         f"🎯 *PRIME MONOPOLY LEAD (0 FBA Competitors)*\n\n"
         f"📦 *Product:* {deal.get('title')}\n"
         f"🏷 *Brand:* `{deal.get('brand')}`\n"
-        f"🆔 *ASIN:* `{deal.get('asin')}`\n"
+        f"🆔 *ASIN:* `{asin}`\n"
         f"📊 *Sales Rank (BSR):* {deal.get('sales_rank'):,} ({deal.get('category')})\n"
         f"🛒 *Baseline FBM Price:* ${deal.get('baseline_price'):.2f}\n"
         f"🎯 *Target Prime Price:* ${deal.get('target_prime_price'):.2f} (+10% Prime Premium)\n"
         f"👥 *Competition:* FBM Sellers: {deal.get('seller_count')} | FBA Sellers: 0\n"
         f"⚖️ *Dimensions/Weight:* {deal.get('weight_lbs')} lbs | {deal.get('max_dim_in')}\"\n\n"
         f"{matched_text}\n"
-        f"🔗 [Amazon Listing](https://www.amazon.com/dp/{deal.get('asin')})"
+        f"🔗 [Amazon Listing](https://www.amazon.com/dp/{asin})"
     )
+
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {"text": "🛒 Bought", "callback_data": f"BUY:{asin}"},
+                {"text": "⛔ Deny (180d)", "callback_data": f"DENY:{asin}"},
+                {"text": "⏩ Ignore", "callback_data": f"PASS:{asin}"}
+            ]
+        ]
+    }
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "Markdown",
+                "reply_markup": reply_markup
+            },
+            timeout=10
+        )
     except Exception as e:
         logger.error(f"Telegram dispatch failed: {e}")
 
 
 def query_keepa_product_finder(category_id: int, min_rank: int, max_rank: int, min_price: float, per_page: int = 50):
-    """Executes a properly-formatted Keepa /query POST using form-data selection."""
     payload = {
         "rootCategory": category_id,
         "current_SALES_gte": min_rank,
@@ -201,6 +378,8 @@ def fetch_products_detail(asins: list):
 
 
 def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
+    start_telegram_feedback_listener()
+
     tokens, refill = get_keepa_meta()
     logger.info(
         f"Dynamic Reverse Hunter Active | Initial Refill: {refill}/min | "
@@ -228,7 +407,7 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weig
 
                 if tokens_left < dynamic_reserve:
                     sleep_sec = max(2.0, round(float(dynamic_reserve - tokens_left) / (refill_rate / 60.0), 2))
-                    logger.info(f"Token balance ({tokens_left}) below reserve ({dynamic_reserve}). Resting {sleep_sec}s...")
+                    logger.info(f"Tokens ({tokens_left}) below reserve ({dynamic_reserve}). Resting {sleep_sec}s...")
                     time.sleep(sleep_sec)
                     continue
 
@@ -244,7 +423,7 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weig
                 )
 
                 cur_min += step_size
-                fresh_asins = [a for a in asin_candidates if a not in seen_asins]
+                fresh_asins = [a for a in asin_candidates if a not in seen_asins and not is_asin_suppressed(a)]
 
                 if not fresh_asins:
                     cadence_sleep = max(0.5, round(2.0 / (refill_rate / 20.0), 2))
@@ -272,17 +451,18 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weig
                         brand = (p.get("brand") or "").strip().lower()
                         title = p.get("title") or "Unknown"
 
-                        # 1. IP Blocklist Filter
+                        if is_asin_suppressed(asin):
+                            seen_asins.add(asin)
+                            continue
+
                         if asin in BLOCKED_ASINS or brand in BLOCKED_BRANDS:
                             seen_asins.add(asin)
                             continue
 
-                        # 2. Bulky Commercial Goods Keyword Filter
                         if any(k in title.lower() for k in BULK_BLOCKLIST):
                             seen_asins.add(asin)
                             continue
 
-                        # 3. Physical Specs Extraction
                         weight_lbs = round((p.get("packageWeight") or 0) * 0.00220462, 2)
                         max_dim_in = round(max(
                             p.get("packageLength") or 0,
@@ -290,7 +470,6 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weig
                             p.get("packageHeight") or 0
                         ) * 0.0393701, 1)
 
-                        # Filter missing metadata (null/0) and oversize/heavy items
                         if weight_lbs <= 0.05 or weight_lbs > max_weight or max_dim_in > max_dim:
                             seen_asins.add(asin)
                             continue
@@ -302,25 +481,21 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weig
                         fbm_price_raw = current[1] if len(current) > 1 else -1
                         sales_rank = current[3] if len(current) > 3 else -1
 
-                        # 4. Amazon Retail Exclusion
                         if amazon_price > 0:
                             seen_asins.add(asin)
                             continue
 
-                        # 5. Strict Zero-Prime Buy Box Gate
                         fba_count = stats.get("fbaOfferCount", 0)
                         buy_box_is_fba = stats.get("buyBoxIsFBA", False)
                         if fba_count > 0 or buy_box_is_fba is True:
                             seen_asins.add(asin)
                             continue
 
-                        # 6. Minimum 2 Competing Sellers Gate (Blocks single-seller DTC private labels)
                         total_offers = stats.get("totalOfferCount", 0)
                         if total_offers < 2:
                             seen_asins.add(asin)
                             continue
 
-                        # 7. Price Gate
                         if fbm_price_raw <= 0:
                             seen_asins.add(asin)
                             continue
@@ -332,7 +507,6 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weig
 
                         target_prime_price = round(baseline_price * 1.10, 2)
 
-                        # 8. Distributor Catalog Cross-Match
                         upcs = p.get("upcList") or []
                         matched_distributor = None
                         for upc in upcs:
@@ -372,7 +546,7 @@ def run_reverse_hunter(min_rank=1, max_rank=250000, min_fbm_price=18.0, max_weig
                         leads.append(lead)
                         seen_asins.add(asin)
                         logger.info(f"Verified Infill Lead: {asin} | {title[:32]} | BSR {sales_rank:,} | Base ${baseline_price:.2f}")
-                        dispatch_telegram(lead)
+                        dispatch_telegram_alert(lead)
 
                     results_file.write_text(json.dumps(leads, indent=2), encoding="utf-8")
 
@@ -392,6 +566,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-rank", type=int, default=1)
     parser.add_argument("--max-rank", type=int, default=250000)
     parser.add_argument("--min-fbm-price", type=float, default=18.0)
+    parser.add_argument("--min-tokens", type=int, default=15, help="Legacy token floor parameter")
     parser.add_argument("--max-weight", type=float, default=8.0)
     parser.add_argument("--max-dim", type=float, default=16.0)
     args = parser.parse_args()
