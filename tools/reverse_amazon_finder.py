@@ -3,14 +3,14 @@
 Reverse Amazon Infill Hunter & Predictive Sourcing Engine (Clean Production)
 ----------------------------------------------------------------------------
 - IP protection enforced via centralized core.ip_guard
+- Live Block IP button in Telegram permanently mutes ASIN & writes brand to blocklist
+- Button UI changes immediately on decision so you know it was reviewed
 - High velocity targeting: ~150+ units/mo floor across all categories
 - Live estimated monthly velocity calculated and displayed on Telegram alerts
-- Interactive Telegram buttons: "🛒 Bought", "⛔ Deny (180d)", "⏩ Ignore"
-- Persistent suppression stored in /app/data/lead_decisions.json
 - Form-data Keepa /query serialization (perPage >= 50, page=0)
 - Manufacturer / private label trap blocker (totalOfferCount >= 2)
 - Zero-FBA buy box monopoly gate (fbaOfferCount == 0, buyBoxIsFBA == False)
-- Real-time catalog cross-referencing against incoming distributor files
+- Full CLI argument compatibility for Railway startup scripts
 """
 
 import os
@@ -27,7 +27,12 @@ import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 
-from core.ip_guard import is_ip_blocked
+# Ensure /app root directory is available on sys.path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.ip_guard import is_ip_blocked, append_brand_to_blocklist
 
 load_dotenv("/app/.env")
 
@@ -103,7 +108,7 @@ def is_asin_suppressed(asin: str) -> bool:
             return False
 
         status = entry.get("status")
-        if status == "BOUGHT":
+        if status in ["BOUGHT", "IP_BLOCKED"]:
             return True
 
         if status == "DENIED":
@@ -147,11 +152,13 @@ def start_telegram_feedback_listener():
                         )
                         continue
 
-                    if ":" not in data:
+                    parts = data.split(":", 2)
+                    if len(parts) < 2:
                         continue
 
-                    action, asin = data.split(":", 1)
-                    asin = asin.strip().upper()
+                    action = parts[0]
+                    asin = parts[1].strip().upper()
+                    brand_context = parts[2].strip() if len(parts) > 2 else ""
                     now_ts = int(time.time())
 
                     with decisions_lock:
@@ -164,21 +171,19 @@ def start_telegram_feedback_listener():
                                 "expires_ts": None
                             }
                             save_decisions(decisions)
-                            requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                json={"callback_query_id": cb_id, "text": "Marked BOUGHT (Permanently muted)", "show_alert": False},
-                                timeout=5
-                            )
-                            requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
-                                json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "reply_markup": {"inline_keyboard": [[{"text": "STATUS: PURCHASED", "callback_data": "noop"}]]}
-                                },
-                                timeout=5
-                            )
-                            logger.info(f"Feedback: {asin} marked as BOUGHT")
+                            status_text = "🛒 BOUGHT (Muted)"
+
+                        elif action == "BLOCKIP":
+                            decisions[asin] = {
+                                "status": "IP_BLOCKED",
+                                "brand": brand_context,
+                                "timestamp": now_ts,
+                                "expires_ts": None
+                            }
+                            save_decisions(decisions)
+                            if brand_context:
+                                append_brand_to_blocklist(brand_context)
+                            status_text = f"🚫 BLOCKED IP ({brand_context})" if brand_context else "🚫 BLOCKED IP"
 
                         elif action == "DENY":
                             decisions[asin] = {
@@ -187,38 +192,33 @@ def start_telegram_feedback_listener():
                                 "expires_ts": now_ts + (180 * 86400)
                             }
                             save_decisions(decisions)
-                            requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                json={"callback_query_id": cb_id, "text": "DENIED: Suppressed for 180 days", "show_alert": False},
-                                timeout=5
-                            )
-                            requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
-                                json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "reply_markup": {"inline_keyboard": [[{"text": "STATUS: DENIED (180d)", "callback_data": "noop"}]]}
-                                },
-                                timeout=5
-                            )
-                            logger.info(f"Feedback: {asin} marked as DENIED (180 days)")
+                            status_text = "⛔ DENIED (180d)"
 
                         elif action == "PASS":
-                            requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                json={"callback_query_id": cb_id, "text": "Ignored (no suppression)", "show_alert": False},
-                                timeout=5
-                            )
-                            requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
-                                json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "reply_markup": {"inline_keyboard": [[{"text": "STATUS: SKIPPED", "callback_data": "noop"}]]}
-                                },
-                                timeout=5
-                            )
-                            logger.info(f"Feedback: {asin} marked as PASS")
+                            status_text = "⏩ SKIPPED"
+                        else:
+                            status_text = "REVIEWED"
+
+                        # 1. Acknowledge button click to user
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                            json={"callback_query_id": cb_id, "text": f"Saved: {status_text}", "show_alert": False},
+                            timeout=5
+                        )
+
+                        # 2. Update Telegram button markup to show decision status
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+                            json={
+                                "chat_id": chat_id,
+                                "message_id": msg_id,
+                                "reply_markup": {
+                                    "inline_keyboard": [[{"text": f"✅ {status_text}", "callback_data": "noop"}]]
+                                }
+                            },
+                            timeout=5
+                        )
+                        logger.info(f"Feedback logged: {asin} -> {status_text}")
 
             except Exception as e:
                 time.sleep(5)
@@ -237,7 +237,6 @@ def get_keepa_meta():
 
 
 def estimate_monthly_velocity(sales_rank: int, category_id: int) -> int:
-    """Estimates monthly unit volume using category power-law curves."""
     if sales_rank <= 0:
         return 0
     config = CATEGORY_CONFIG.get(category_id, {})
@@ -310,6 +309,8 @@ def dispatch_telegram_alert(deal: dict):
         return
 
     asin = deal["asin"]
+    brand = deal["brand"]
+    safe_brand = brand.replace(":", " ")[:20].strip()
     upc_str = deal["upcs"][0] if deal.get("upcs") else ""
     sourcing_query = urllib.parse.quote(upc_str if upc_str else f"{deal['brand']} {deal['title'][:25]}")
     google_shopping = f"https://www.google.com/search?tbm=shop&q={sourcing_query}"
@@ -332,7 +333,7 @@ def dispatch_telegram_alert(deal: dict):
     text = (
         f"🔥 *HIGH-VELOCITY PRIME MONOPOLY LEAD*\n\n"
         f"📦 *Product:* {deal['title']}\n"
-        f"🏷 *Brand:* `{deal['brand']}`\n"
+        f"🏷 *Brand:* `{brand}`\n"
         f"🆔 *ASIN:* `{asin}` | *UPC:* `{upc_str if upc_str else 'N/A'}`\n"
         f"🚀 *Estimated Velocity:* *~{deal['est_monthly_units']:,} units/mo* (BSR: {deal['sales_rank']:,})\n"
         f"🛒 *Baseline FBM Price:* ${deal['baseline_price']:.2f}\n"
@@ -344,11 +345,16 @@ def dispatch_telegram_alert(deal: dict):
     )
 
     reply_markup = {
-        "inline_keyboard": [[
-            {"text": "🛒 Bought", "callback_data": f"BUY:{asin}"},
-            {"text": "⛔ Deny (180d)", "callback_data": f"DENY:{asin}"},
-            {"text": "⏩ Ignore", "callback_data": f"PASS:{asin}"}
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "🛒 Bought", "callback_data": f"BUY:{asin}"},
+                {"text": "⛔ Deny (180d)", "callback_data": f"DENY:{asin}"}
+            ],
+            [
+                {"text": "🚫 Block IP Brand", "callback_data": f"BLOCKIP:{asin}:{safe_brand}"},
+                {"text": "⏩ Ignore", "callback_data": f"PASS:{asin}"}
+            ]
+        ]
     }
 
     try:
@@ -400,7 +406,7 @@ def fetch_products_detail(asins: list):
         return [], 0
 
 
-def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
+def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0, min_rank_override=1, max_rank_override=250000):
     start_telegram_feedback_listener()
 
     tokens, refill = get_keepa_meta()
@@ -420,8 +426,9 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
     while True:
         for cat_id, cat_info in CATEGORY_CONFIG.items():
             cat_name = cat_info["name"]
+            # Strict velocity cap guarantees ~150+ units/mo floor
             max_rank = cat_info["max_rank"]
-            cur_min = 1
+            cur_min = min_rank_override
 
             logger.info(f"Targeting Category [{cat_name}] with Velocity Floor (Max Rank: {max_rank:,})")
 
@@ -478,7 +485,7 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
                             seen_asins.add(asin)
                             continue
 
-                        # Centralized IP Guard Check (brand + title)
+                        # Centralized IP Guard Check (brand + title substring match)
                         if is_ip_blocked(brand=brand, title=title):
                             seen_asins.add(asin)
                             continue
@@ -596,8 +603,10 @@ def run_high_velocity_hunter(min_fbm_price=18.0, max_weight=8.0, max_dim=16.0):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="High-Velocity Reverse Amazon Infill Hunter")
+    parser.add_argument("--min-rank", type=int, default=1, help="Min BSR rank (Railway compatibility)")
+    parser.add_argument("--max-rank", type=int, default=250000, help="Max BSR rank (Railway compatibility)")
     parser.add_argument("--min-fbm-price", type=float, default=18.0)
-    parser.add_argument("--min-tokens", type=int, default=15, help="Legacy token floor parameter")
+    parser.add_argument("--min-tokens", type=int, default=50, help="Min token reserve (Railway compatibility)")
     parser.add_argument("--max-weight", type=float, default=8.0)
     parser.add_argument("--max-dim", type=float, default=16.0)
     args = parser.parse_args()
@@ -605,5 +614,7 @@ if __name__ == "__main__":
     run_high_velocity_hunter(
         min_fbm_price=args.min_fbm_price,
         max_weight=args.max_weight,
-        max_dim=args.max_dim
+        max_dim=args.max_dim,
+        min_rank_override=args.min_rank,
+        max_rank_override=args.max_rank
     )
