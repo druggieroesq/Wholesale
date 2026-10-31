@@ -25,21 +25,21 @@ if ! pgrep -f "reverse_amazon_finder.py" > /dev/null; then
 fi
 
 # -------------------------------------------------------------------
-# 2. Auto-download Catalog Sheets if Missing
+# 2. Auto-download Catalog Sheets if Missing in Incoming
 # -------------------------------------------------------------------
-if [ ! -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ] && [ ! -f "$PROCESSED_DIR/Frontier_Catalog.xlsx" ]; then
+if [ ! -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ]; then
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Frontier Catalog..."
     curl -sL "https://docs.google.com/spreadsheets/d/122YeUPONFQuwy5UfoE3pz8RNK1pdb9l0/export?format=xlsx" -o "$INCOMING_DIR/Frontier_Catalog.xlsx"
 fi
 
-if [ ! -f "$INCOMING_DIR/BCI_Catalog.xlsx" ] && [ ! -f "$PROCESSED_DIR/BCI_Catalog.xlsx" ]; then
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching BCI Catalog..."
-    curl -sL "https://docs.google.com/spreadsheets/d/1D1hUS38LK-8XsQIdIOeluUM1XKUu-n8-/export?format=xlsx" -o "$INCOMING_DIR/BCI_Catalog.xlsx"
-fi
-
-if [ ! -f "$INCOMING_DIR/Contour_Catalog.csv" ] && [ ! -f "$PROCESSED_DIR/Contour_Catalog.csv" ]; then
+if [ ! -f "$INCOMING_DIR/Contour_Catalog.csv" ]; then
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching Contour Catalog..."
     curl -sL "https://drive.google.com/uc?export=download&id=1-YRPv_YSM82L38E7TnUNDdfSxRDWK0sA" -o "$INCOMING_DIR/Contour_Catalog.csv"
+fi
+
+if [ ! -f "$INCOMING_DIR/BCI_Catalog.xlsx" ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Fetching BCI Catalog..."
+    curl -sL "https://docs.google.com/spreadsheets/d/1D1hUS38LK-8XsQIdIOeluUM1XKUu-n8-/export?format=xlsx" -o "$INCOMING_DIR/BCI_Catalog.xlsx"
 fi
 
 # -------------------------------------------------------------------
@@ -47,12 +47,11 @@ fi
 # -------------------------------------------------------------------
 queue=()
 
-# Prioritize high-velocity consumer catalogs first
 [[ -f "$INCOMING_DIR/Frontier_Catalog.xlsx" ]] && queue+=("$INCOMING_DIR/Frontier_Catalog.xlsx")
 [[ -f "$INCOMING_DIR/Contour_Catalog.csv" ]]    && queue+=("$INCOMING_DIR/Contour_Catalog.csv")
 [[ -f "$INCOMING_DIR/BCI_Catalog.xlsx" ]]       && queue+=("$INCOMING_DIR/BCI_Catalog.xlsx")
 
-# Add any additional user-uploaded files
+# Pick up any additional manual uploads
 for cat in "$INCOMING_DIR"/*; do
     if [[ -f "$cat" && ("$cat" == *.xlsx || "$cat" == *.xls || "$cat" == *.csv) ]]; then
         if [[ ! " ${queue[*]} " =~ " ${cat} " ]]; then
