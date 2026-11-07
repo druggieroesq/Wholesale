@@ -1,0 +1,10 @@
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.log
+data/catalogs/wholesale_catalogs/incoming/*.csv
+data/catalogs/wholesale_catalogs/incoming/*.xlsx
+data/catalogs/wholesale_catalogs/indexed/*.parquet
+__pycache__/
+*.pyc
+.env
