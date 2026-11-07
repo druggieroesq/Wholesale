@@ -1,16 +1,5 @@
-# 1. Ensure the file is written to tools/grainger_lead_matcher.py
-cat << 'EOF' > /app/tools/grainger_lead_matcher.py
-#!/usr/bin/env python3
-"""
-tools/grainger_lead_matcher.py
-Two-stage Grainger MRO lead matcher & direct URL targeter.
-
-Stage 1: Matches active wholesale buy-sheet leads against the parsed Grainger catalog
-         by MPN and model tokens without web requests.
-Stage 2: Generates exact Grainger product URLs (https://www.grainger.com/product/<ITEM_NO>)
-         and exports high-confidence verified targets to CSV and JSON.
-"""
-
+python3 -c '
+code = """#!/usr/bin/env python3
 import os
 import re
 import sys
@@ -29,19 +18,17 @@ STOPWORDS: Set[str] = {
 }
 
 def clean_key(val: Any) -> str:
-    """Sanitizes alphanumeric keys, stripping punctuation and whitespace."""
     if val is None or pd.isna(val):
         return ""
     return re.sub(r"[^A-Z0-9]", "", str(val).upper())
 
 def safe_float(val: Any) -> float:
-    """Extracts numeric float from formatted price strings or non-numeric tokens."""
     if val is None or pd.isna(val):
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
     s = str(val).strip().replace("$", "").replace(",", "")
-    match = re.search(r"[-+]?\d*\.\d+|\d+", s)
+    match = re.search(r"[-+]?\d*\\.\\d+|\\d+", s)
     return float(match.group(0)) if match else 0.0
 
 class GraingerLeadMatcher:
@@ -136,7 +123,7 @@ class GraingerLeadMatcher:
                 if len(val) >= 4 and val not in STOPWORDS:
                     candidate_keys.add(val)
 
-            for token in re.findall(r"\b[A-Za-z0-9-]{4,20}\b", title):
+            for token in re.findall(r"\\b[A-Za-z0-9-]{4,20}\\b", title):
                 ck = clean_key(token)
                 if ck not in STOPWORDS and any(ch.isdigit() for ch in ck):
                     candidate_keys.add(ck)
@@ -185,13 +172,13 @@ class GraingerLeadMatcher:
         df_out.to_csv(out_csv, index=False)
         df_out.to_json(out_json, orient="records", indent=2)
 
-        print("\n" + "=" * 65)
+        print("\\n" + "=" * 65)
         print(f"VERIFIED GRAINGER OPPORTUNITIES FOUND: {len(df_out):,}")
         print("=" * 65)
         if not df_out.empty:
             display_cols = ["asin", "matched_key", "grainger_item_no", "grainger_url"]
             print(df_out[display_cols].head(15).to_string(index=False))
-            print(f"\nSaved verified opportunities with direct URLs to:")
+            print(f"\\nSaved verified opportunities with direct URLs to:")
             print(f"  - {out_csv}")
             print(f"  - {out_json}")
         else:
@@ -207,12 +194,10 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
-
-chmod +x /app/tools/grainger_lead_matcher.py
-
-# 2. Stage, commit, and push to GitHub origin main
-cd /app
-git add tools/grainger_lead_matcher.py
-git commit -m "feat(grainger): add two-stage lead matcher and direct URL generator"
-git push origin main
+"""
+with open("/app/tools/grainger_lead_matcher.py", "w") as f:
+    f.write(code)
+os.chmod("/app/tools/grainger_lead_matcher.py", 0o755)
+print("Successfully generated /app/tools/grainger_lead_matcher.py")
+'
+python3 /app/tools/grainger_lead_matcher.py
