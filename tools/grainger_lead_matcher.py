@@ -1,4 +1,4 @@
-# 1. Write the complete, production-ready Grainger two-stage matcher & URL generator bot
+# 1. Ensure the file is written to tools/grainger_lead_matcher.py
 cat << 'EOF' > /app/tools/grainger_lead_matcher.py
 #!/usr/bin/env python3
 """
@@ -58,7 +58,6 @@ class GraingerLeadMatcher:
         self.total_grainger_skus: int = 0
 
     def load_grainger_catalog(self) -> None:
-        """Loads Grainger items from Parquet index or SQLite parsing cache."""
         self.grainger_mpn_index.clear()
         self.total_grainger_skus = 0
 
@@ -97,7 +96,6 @@ class GraingerLeadMatcher:
         print(f"Active Clean MPN Search Keys: {len(self.grainger_mpn_index):,}")
 
     def collect_leads(self) -> List[Dict[str, Any]]:
-        """Collects candidate wholesale leads from buy-sheets and reports."""
         leads: List[Dict[str, Any]] = []
         candidate_paths = [
             "/app/data/live_sheet_leads.csv",
@@ -124,7 +122,6 @@ class GraingerLeadMatcher:
         return leads
 
     def match(self, leads: List[Dict[str, Any]]) -> pd.DataFrame:
-        """Executes two-stage match and builds direct product URLs."""
         matches: List[Dict[str, Any]] = []
 
         for lead in leads:
@@ -139,7 +136,6 @@ class GraingerLeadMatcher:
                 if len(val) >= 4 and val not in STOPWORDS:
                     candidate_keys.add(val)
 
-            # Extract model tokens from title with digit requirements
             for token in re.findall(r"\b[A-Za-z0-9-]{4,20}\b", title):
                 ck = clean_key(token)
                 if ck not in STOPWORDS and any(ch.isdigit() for ch in ck):
@@ -213,10 +209,10 @@ if __name__ == "__main__":
     main()
 EOF
 
-# 2. Grant executable permissions
 chmod +x /app/tools/grainger_lead_matcher.py
 
-# 3. Stage, commit, and push to GitHub remote repository
+# 2. Stage, commit, and push to GitHub origin main
+cd /app
 git add tools/grainger_lead_matcher.py
-git commit -m "feat(grainger): deploy two-stage lead matcher and direct product URL generator bot"
+git commit -m "feat(grainger): add two-stage lead matcher and direct URL generator"
 git push origin main
