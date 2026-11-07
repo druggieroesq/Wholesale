@@ -1,0 +1,71 @@
+[
+  {
+    "vendor": "JB TOOLS",
+    "enabled": true,
+    "base_url": "https://www.jbtools.com",
+    "is_flat_file": false,
+    "auth": null,
+    "seed_categories": [
+      "https://www.jbtools.com/air-tools/",
+      "https://www.jbtools.com/hand-tools/",
+      "https://www.jbtools.com/power-tools/",
+      "https://www.jbtools.com/automotive-diagnostic-tools/",
+      "https://www.jbtools.com/shop-equipment/",
+      "https://www.jbtools.com/lubrication-fluid-handling/",
+      "https://www.jbtools.com/safety-equipment/"
+    ],
+    "url_patterns": [
+      "/[a-z0-9-]+-[a-z0-9]+/",
+      "/[a-z0-9-]+/"
+    ],
+    "page_param": "page"
+  },
+  {
+    "vendor": "PETEDGE",
+    "enabled": true,
+    "base_url": "https://www.petedge.com",
+    "is_flat_file": false,
+    "auth": null,
+    "seed_categories": [
+      "https://www.petedge.com/grooming",
+      "https://www.petedge.com/shampoos-bathing",
+      "https://www.petedge.com/shears-accessories",
+      "https://www.petedge.com/clippers-blades",
+      "https://www.petedge.com/tables-tubs",
+      "https://www.petedge.com/cages-crates-pens",
+      "https://www.petedge.com/health-wellness"
+    ],
+    "url_patterns": [
+      "/products/",
+      "/product/",
+      "/[a-z0-9-]+-[0-9]{3,}"
+    ],
+    "page_param": "page"
+  },
+  {
+    "vendor": "GLOBAL INDUSTRIAL",
+    "enabled": true,
+    "base_url": "https://www.globalindustrial.com",
+    "is_flat_file": false,
+    "auth": {
+      "login_url": "https://www.globalindustrial.com/login",
+      "user_field": "email",
+      "pass_field": "password",
+      "username": "wholesale.bizbridge@gmail.com",
+      "password": "StuDanStuDan69!"
+    },
+    "seed_categories": [
+      "https://www.globalindustrial.com/c/storage",
+      "https://www.globalindustrial.com/c/material-handling",
+      "https://www.globalindustrial.com/c/safety-security",
+      "https://www.globalindustrial.com/c/tools-instruments",
+      "https://www.globalindustrial.com/c/janitorial-maintenance",
+      "https://www.globalindustrial.com/c/hvac"
+    ],
+    "url_patterns": [
+      "/p/",
+      "/product/"
+    ],
+    "page_param": "page"
+  }
+]

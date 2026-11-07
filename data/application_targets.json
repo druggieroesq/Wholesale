@@ -1,0 +1,162 @@
+[
+  {
+    "brand": "Leatherman",
+    "vendor_name": "Pavrix Wholesale",
+    "portal_url": "https://www.pavrix.com/register",
+    "sourcing_tier": "WHOLESALE",
+    "account_type": "Authorized Distributor",
+    "notes": "Tools & Multi-tools. Requires resale certificate & EIN."
+  },
+  {
+    "brand": "Leatherman",
+    "vendor_name": "All-Spec / Hisco",
+    "portal_url": "https://www.all-spec.com/Customer/Register",
+    "sourcing_tier": "WHOLESALE",
+    "account_type": "Industrial Distributor",
+    "notes": "Industrial MRO & commercial tools line card."
+  },
+  {
+    "brand": "Govee",
+    "vendor_name": "IOCA Group",
+    "portal_url": "https://www.iocagroup.com/en/contact-us",
+    "sourcing_tier": "WHOLESALE",
+    "account_type": "Consumer Electronics Distributor",
+    "notes": "Official smart lighting & home automation line card."
+  },
+  {
+    "brand": "Govee",
+    "vendor_name": "Govee Direct B2B",
+    "portal_url": "https://www.govee.com/pages/business-inquiry",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Brand Corporate Sales",
+    "notes": "Commercial lighting accounts and volume wholesale tier."
+  },
+  {
+    "brand": "eufy Security",
+    "vendor_name": "Injured Gadgets",
+    "portal_url": "https://www.injuredgadgets.com/customer/account/create",
+    "sourcing_tier": "WHOLESALE",
+    "account_type": "Electronics Wholesale Distributor",
+    "notes": "Smart home security cameras, sensors, and doorbell lines."
+  },
+  {
+    "brand": "eufy Security",
+    "vendor_name": "Anker B2B Commercial",
+    "portal_url": "https://www.anker.com/bulk-orders",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Parent Brand Corporate Program",
+    "notes": "Direct wholesale line card from Anker Innovations."
+  },
+  {
+    "brand": "Aqara",
+    "vendor_name": "JST Electronics",
+    "portal_url": "https://www.jstmea.com/resellers-retaliers",
+    "sourcing_tier": "WHOLESALE",
+    "account_type": "Authorized Master Distributor",
+    "notes": "Zigbee smart home sensors, hubs, and commercial controllers."
+  },
+  {
+    "brand": "Aqara",
+    "vendor_name": "Aqara Direct Partner Program",
+    "portal_url": "https://www.aqara.com/us/reseller",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Brand Reseller Program",
+    "notes": "Direct B2B dealer line card and regional allocation."
+  },
+  {
+    "brand": "YESWELDER",
+    "vendor_name": "YESWELDER Wholesale",
+    "portal_url": "https://wholesale.yeswelder.com/pages/wholesale",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Manufacturer Portal",
+    "notes": "Welding gear, auto-darkening helmets, and consumables."
+  },
+  {
+    "brand": "ARCCAPTAIN",
+    "vendor_name": "ARCCAPTAIN B2B",
+    "portal_url": "https://www.arccaptain.com/pages/welding-solutions",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Manufacturer Portal",
+    "notes": "Commercial welders, plasma cutters, and safety equipment."
+  },
+  {
+    "brand": "OLIGHT",
+    "vendor_name": "OLIGHT Dealer Program",
+    "portal_url": "https://www.olight.com/dealers",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Wholesale Dealer Program",
+    "notes": "Tactical lighting, flashlights, and rechargeable batteries."
+  },
+  {
+    "brand": "Fanttik",
+    "vendor_name": "Palletfly",
+    "portal_url": "https://www.palletfly.com/register",
+    "sourcing_tier": "WHOLESALE",
+    "account_type": "Master Wholesale Marketplace",
+    "notes": "Automotive air inflators, electric screwdrivers, and power stations."
+  },
+  {
+    "brand": "Fanttik",
+    "vendor_name": "Fanttik Corporate Sales",
+    "portal_url": "https://fanttik.com/pages/b2b-corporate",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Brand B2B",
+    "notes": "Direct wholesale ordering for power tools and auto equipment."
+  },
+  {
+    "brand": "Sifely",
+    "vendor_name": "Sifely Commercial Solutions",
+    "portal_url": "https://sifely.com/pages/contact-us",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Commercial Door & Hospitality B2B",
+    "notes": "Smart locks, deadbolts, and access control hardware."
+  },
+  {
+    "brand": "Seesii",
+    "vendor_name": "Seesii Tools Wholesale",
+    "portal_url": "https://seesiitools.com/pages/wholesale",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Power Tool OEM",
+    "notes": "Cordless electric ratchets, mini chainsaws, and diagnostic tools."
+  },
+  {
+    "brand": "THERMOBIO",
+    "vendor_name": "THERMOBIO Medical & Industrial",
+    "portal_url": "https://www.thermobio.com/pages/contact",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Diagnostic Equipment OEM",
+    "notes": "Calibrated thermometers and environmental monitoring gear."
+  },
+  {
+    "brand": "DXZtoz",
+    "vendor_name": "DXZtoz OEM Direct",
+    "portal_url": "https://www.dxztoz.com/contact-us",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Hardware OEM Factory Outreach",
+    "notes": "Hardware fasteners and specialized hand tool line cards."
+  },
+  {
+    "brand": "ToLanbbt",
+    "vendor_name": "ToLanbbt Direct",
+    "portal_url": "https://www.tolanbbt.com/contact",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Specialty Tool OEM",
+    "notes": "Woodworking clamps and automotive accessory kits."
+  },
+  {
+    "brand": "Rossetta",
+    "vendor_name": "Rossetta Official",
+    "portal_url": "https://rossettaprojector.com/pages/contact",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Consumer Electronics OEM",
+    "notes": "Optical and decorative lighting units."
+  },
+  {
+    "brand": "LitONES",
+    "vendor_name": "LitONES Direct",
+    "portal_url": "https://www.litones.com/pages/contact",
+    "sourcing_tier": "MANUFACTURER",
+    "account_type": "Direct Consumer Hardware OEM",
+    "notes": "Under-cabinet lighting and motion sensor kits."
+  }
+]
