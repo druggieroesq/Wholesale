@@ -1,3 +1,4 @@
+cat << 'EOF' > /app/core/ip_guard.py
 #!/usr/bin/env python3
 """
 Core IP & Account Health Guard (v5.0 Enterprise)
@@ -23,7 +24,6 @@ DEFAULT_BLOCKLIST_PATH = os.path.join(
     "ip_blocklist.json"
 )
 
-# Core fallback list if data/ip_blocklist.json is missing or corrupted
 EMERGENCY_FALLBACK_BRANDS = [
     "3M", "ANDIS", "ARM & HAMMER", "ARM AND HAMMER", "BAG BALM", "BALL", 
     "BAYER", "BENEBONE", "BIL JAC", "BLACK FLAG", "BOEHRINGER INGELHEIM", 
@@ -77,12 +77,9 @@ class IPGuard:
         if not loaded:
             loaded = EMERGENCY_FALLBACK_BRANDS
 
-        # Clean metadata artifacts
         banned_meta = {"BRANDS", "SKUS", "UPDATED_AT", "VERSION"}
         self.raw_brands = [str(b).strip().upper() for b in loaded if str(b).strip().upper() not in banned_meta]
         self.normalized_brands = {self.normalize_brand(b) for b in self.raw_brands if self.normalize_brand(b)}
-        
-        logger.info(f"IPGuard loaded {len(self.normalized_brands)} normalized brand shields.")
         return len(self.normalized_brands)
 
     def is_ip_restricted(self, brand: str, title: str = "") -> Tuple[bool, str]:
@@ -95,16 +92,13 @@ class IPGuard:
 
         clean_brand = self.normalize_brand(brand)
 
-        # 1. Exact normalized brand match
         if clean_brand in self.normalized_brands:
             return True, f"Brand '{brand}' matches protected IP blocklist."
 
-        # 2. Substring brand matching for compound variations (len > 3)
         for b in self.normalized_brands:
             if len(b) >= 4 and (b in clean_brand or clean_brand in b):
                 return True, f"Brand '{brand}' contains litigious brand token '{b}'."
 
-        # 3. Title token scanning (catches private-label accessories or disguised listings)
         if title:
             clean_title = self.normalize_brand(title)
             critical_tokens = [
@@ -129,7 +123,6 @@ class IPGuard:
         peak_sellers = max(recent_slice)
         current_sellers = recent_slice[-1]
 
-        # Trigger threshold: Was 5+ sellers, dropped by >= 60%, and currently <= 2
         if peak_sellers >= 5 and current_sellers <= 2:
             drop_pct = (peak_sellers - current_sellers) / float(peak_sellers)
             if drop_pct >= 0.60:
@@ -142,7 +135,6 @@ class IPGuard:
         return False, ""
 
 
-# Global singleton instance for high-throughput pipeline calls
 _global_guard = IPGuard()
 
 def is_ip_restricted(brand: str, title: str = "") -> bool:
@@ -154,3 +146,4 @@ def is_blocked_with_reason(brand: str, title: str = "") -> Tuple[bool, str]:
 
 def check_seller_dropoff_sweep(seller_history: List[int]) -> Tuple[bool, str]:
     return _global_guard.evaluate_seller_dropoff(seller_history)
+EOF
