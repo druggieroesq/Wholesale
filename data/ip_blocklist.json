@@ -1,45 +1,46 @@
-[
-  "3M",
-  "ANDIS",
-  "ARM & HAMMER",
-  "ARM AND HAMMER",
-  "ARM HAMMER",
-  "BAG BALM",
-  "BALL",
-  "BAYER",
-  "BENEBONE",
-  "BIL JAC",
-  "BLACK FLAG",
-  "BOEHRINGER INGELHEIM",
-  "BONIDE",
-  "BRANDS",
-  "CADET",
-  "CHUCKIT",
-  "COMMAND",
-  "CRAFTSMAN",
-  "DEWALT",
-  "ELANCO",
-  "FIRST ALERT",
-  "FRONTGUARD",
-  "FRONTLINE",
-  "GREENIES",
-  "HARTZ",
-  "IRWIN",
-  "KIDDE",
-  "KONG",
-  "MAKITA",
-  "MILWAUKEE",
-  "OSTER",
-  "PETSAFE",
-  "POST-IT",
-  "PURINA",
-  "RADIO SYSTEMS",
-  "SCOTCH",
-  "SERESTO",
-  "SKUS",
-  "STANLEY",
-  "UPDATED_AT",
-  "VERSION",
-  "WAHL",
-  "ZOETIS"
+python3 -c '
+import json, re
+
+# Comprehensive list: existing base + Amazon private labels + notorious IP litigators
+master_additions = [
+    # --- Existing Verified Base ---
+    "3M", "ANDIS", "ARM & HAMMER", "ARM AND HAMMER", "ARM HAMMER", "BAG BALM", 
+    "BALL", "BAYER", "BENEBONE", "BIL JAC", "BLACK FLAG", "BOEHRINGER INGELHEIM", 
+    "BONIDE", "CADET", "CHUCKIT", "COMMAND", "ELANCO", "FIRST ALERT", 
+    "FRONTGUARD", "FRONTLINE", "GREENIES", "HARTZ", "KIDDE", "KONG", 
+    "OSTER", "PETSAFE", "POST-IT", "PURINA", "RADIO SYSTEMS", "SCOTCH", 
+    "SERESTO", "WAHL", "ZOETIS", "DEWALT", "STANLEY", "CRAFTSMAN", "IRWIN", 
+    "MILWAUKEE", "MAKITA", "BLACK & DECKER", "BLACK AND DECKER", "PORTER-CABLE", 
+    "BOSTITCH", "LENOX", "RYOBI", "RIDGID", "BOSCH", "DREMEL", "SKIL", 
+    "KLEIN TOOLS", "KLEIN", "SNAP-ON", "CHANNELLOCK", "HILTI", "FLIR", 
+    "LEATHERMAN", "SPYDERCO", "BENCHMADE", "OLAPLEX", "MOROCCANOIL", 
+    "PAUL MITCHELL", "JOHN PAUL MITCHELL", "KERASTASE", "REDKEN", "MATRIX", 
+    "BIOLAGE", "WELLA", "OPI", "SEBASTIAN", "NIOXIN", "DERMALOGICA", 
+    "CERAVE", "LA ROCHE-POSAY", "SKINCEUTICALS", "AVEDA", "CLINIQUE", 
+    "MAC COSMETICS", "DYSON", "LOREAL",
+
+    # --- Amazon In-House Private Labels (Exclusive Retailing) ---
+    "AMAZON BASICS", "AMAZONBASICS", "SOLIMO", "PRESTO", "PRESTO!",
+    "AMAZON ELEMENTS", "AMAZON AWARE", "AMAZON COMMERCIAL", "PINZON",
+    "HAPPY BELLY", "WICKEDLY PRIME", "AMAZON FRESH", "365 BY WHOLE FOODS",
+    "APLENTY", "MAMA BEAR", "WONDER BOUND", "WAG", "BASIC CARE",
+    "AMAZON ESSENTIALS", "GOODTHREADS", "DAILY RITUAL", "CORE 10",
+
+    # --- Notorious Litigious Third-Party Brands (Vorys / Brand Registry Enforcers) ---
+    "OTTERBOX", "OTTER PRODUCTS", "LIFEPROOF", "POPSOCKETS", "YETI", 
+    "HYDRO FLASK", "TRAEGER", "WEBER", "BOSE", "SONOS", "LEGO", 
+    "ANKER", "THERAGUN", "THERABODY", "GOVEE", "BURTS BEES", 
+    "BURT\x27S BEES", "NEUTROGENA", "ORAL-B", "COLGATE", "GILLETTE", 
+    "PAMPERS", "HUGGIES", "NUK", "HYDROXYCUT", "FITBIT", "GARMIN",
+    "JBL", "SKULLCANDY", "LOGITECH", "RAZER", "CORSAIR", "PHILIPS SONICARE"
 ]
+
+banned_meta = {"BRANDS", "SKUS", "UPDATED_AT", "VERSION"}
+cleaned_list = sorted(list({b.strip().upper() for b in master_additions if b.strip().upper() not in banned_meta}))
+
+target_path = "/app/data/ip_blocklist.json"
+with open(target_path, "w") as f:
+    json.dump(cleaned_list, f, indent=2)
+
+print(f"Successfully updated {target_path} with {len(cleaned_list)} protected brands.")
+'
