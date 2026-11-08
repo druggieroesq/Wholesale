@@ -1,0 +1,52 @@
+[
+  {
+    "name": "sitetype",
+    "value": "full",
+    "domain": ".www.grainger.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "LDC",
+    "value": "578915E73FAC0D2700158887C3DB8099",
+    "domain": ".www.grainger.com",
+    "path": "/",
+    "expires": 1825557751.124857,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "TLTSID",
+    "value": "578915E73FAC0D2700158887C3DB8099",
+    "domain": ".www.grainger.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "CIP",
+    "value": "152.55.181.84",
+    "domain": ".www.grainger.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "AB1",
+    "value": "G",
+    "domain": ".www.grainger.com",
+    "path": "/",
+    "expires": 1794072151.12492,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  }
+]

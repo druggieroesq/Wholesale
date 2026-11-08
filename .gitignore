@@ -1,0 +1,5 @@
+.env
+data/*.db-wal
+data/*.db-shm
+*.log
+*.pdf

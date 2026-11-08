@@ -1,0 +1,27 @@
+{
+  "company_name": "Apex Wholesale Solutions LLC",
+  "business_structure": "LLC",
+  "ein": "XX-XXXXXXX",
+  "resale_certificate_number": "PA-TAX-XXXXXX",
+  "state_of_incorporation": "PA",
+  "primary_address": {
+    "street": "100 Industrial Parkway",
+    "city": "Harrisburg",
+    "state": "PA",
+    "zip": "17101"
+  },
+  "billing_contact": {
+    "full_name": "Operations Manager",
+    "email": "purchasing@apexwholesalesolutions.com",
+    "phone": "717-555-0199"
+  },
+  "trade_references": [
+    {
+      "company": "Bradley Caldwell Inc",
+      "contact": "Accounts Receivable",
+      "phone": "800-257-9100",
+      "email": "credit@bciwholesale.com",
+      "account_number": "BCI-98421"
+    }
+  ]
+}
