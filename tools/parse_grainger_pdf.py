@@ -1,10 +1,9 @@
-cat << 'EOF' > /app/tools/parse_grainger_pdf.py
 #!/usr/bin/env python3
 """
 parse_grainger_pdf.py
 High-throughput chunked PDF extractor for large Grainger catalogs.
 Extracts: Grainger Item #, MPN/Model, Brand, Description, and Price.
-Saves to SQLite checkpoint DB and exports to Parquet.
+Saves to SQLite checkpoint DB, enforces the <45-lb parcel limit, and exports to Parquet.
 """
 
 import os
@@ -19,29 +18,32 @@ import pandas as pd
 try:
     import pdfplumber
 except ImportError:
-    print("pdfplumber missing. Installing...")
-    os.system("pip install pdfplumber pandas pyarrow")
+    print("pdfplumber missing. Installing dependencies...")
+    os.system("pip install -q pdfplumber pandas pyarrow")
     import pdfplumber
 
 DB_PATH = "/app/data/grainger_parsed_cache.db"
 OUTPUT_PARQUET = "/app/data/catalogs/wholesale_catalogs/normalized/grainger_catalog.parquet"
 
+# Regex patterns for heavy/bulky items >= 45 lbs
+HEAVY_REGEX = re.compile(
+    r"\b([4-9][5-9]|\d{3,})\s*(LB|LBS|POUND|POUNDS)\b|\b50-?LB\b", 
+    re.IGNORECASE
+)
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS grainger_items (
-            item_number TEXT PRIMARY KEY,
-            mpn TEXT,
-            brand TEXT,
-            description TEXT,
-            wholesale_cost REAL,
-            page_num INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS grainger_items (
+                item_number TEXT PRIMARY KEY,
+                mpn TEXT,
+                brand TEXT,
+                description TEXT,
+                wholesale_cost REAL,
+                page_num INTEGER
+            )
+        """)
 
 def parse_page_chunk(args):
     pdf_path, start_page, end_page = args
@@ -57,7 +59,7 @@ def parse_page_chunk(args):
                 page = pdf.pages[page_idx]
                 text = page.extract_text() or ""
                 
-                # Check tables first
+                # 1. Check structured tables first
                 tables = page.extract_tables() or []
                 for table in tables:
                     for row in table:
@@ -67,26 +69,33 @@ def parse_page_chunk(args):
                         price_match = price_pat.search(row_text)
                         
                         if item_match and price_match:
+                            desc = row_text[:120]
+                            # Hard filter out items matching heavy parcel patterns
+                            if HEAVY_REGEX.search(desc):
+                                continue
                             extracted.append((
                                 item_match.group(1),
                                 clean_row[1] if len(clean_row) > 1 else "",
                                 clean_row[0] if len(clean_row) > 0 else "Grainger MRO",
-                                row_text[:120],
+                                desc,
                                 float(price_match.group(1)),
                                 page_idx + 1
                             ))
                 
-                # Fallback to line scanning if no tables
+                # 2. Fallback to freeform line scanning
                 if not tables:
                     for line in text.split("\n"):
                         item_match = item_pat.search(line)
                         price_match = price_pat.search(line)
                         if item_match and price_match:
+                            desc = line[:120]
+                            if HEAVY_REGEX.search(desc):
+                                continue
                             extracted.append((
                                 item_match.group(1),
                                 "",
                                 "Grainger MRO",
-                                line[:120],
+                                desc,
                                 float(price_match.group(1)),
                                 page_idx + 1
                             ))
@@ -111,39 +120,59 @@ def main():
 
     with pdfplumber.open(str(pdf_file)) as pdf:
         total_pages = len(pdf.pages)
-    print(f"Loaded '{pdf_file.name}' with {total_pages} pages.")
+    print(f"Loaded '{pdf_file.name}' with {total_pages} total pages.")
 
-    chunks = []
-    for start in range(0, total_pages, args.chunk_size):
-        chunks.append((str(pdf_file), start, start + args.chunk_size))
+    chunks = [
+        (str(pdf_file), start, start + args.chunk_size)
+        for start in range(0, total_pages, args.chunk_size)
+    ]
 
     print(f"Dispatching {len(chunks)} chunks across {args.workers} workers...")
-    all_results = []
+    total_cached = 0
     with Pool(processes=args.workers) as pool:
         for result in pool.imap_unordered(parse_page_chunk, chunks):
             if result:
-                all_results.extend(result)
-                conn = sqlite3.connect(DB_PATH)
-                cur = conn.cursor()
-                cur.executemany("""
-                    INSERT OR IGNORE INTO grainger_items 
-                    (item_number, mpn, brand, description, wholesale_cost, page_num)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, result)
-                conn.commit()
-                conn.close()
-                print(f"Cached {len(result)} items (Total: {len(all_results)})")
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.executemany("""
+                        INSERT OR IGNORE INTO grainger_items 
+                        (item_number, mpn, brand, description, wholesale_cost, page_num)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, result)
+                total_cached += len(result)
+                print(f"Cached batch: +{len(result)} items (Running Total: {total_cached})")
 
-    # Export cache to Parquet
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM grainger_items", conn)
-    conn.close()
+    # Export sanitized SQLite cache to normalized Parquet
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query("SELECT * FROM grainger_items", conn)
+
+    if df.empty:
+        print("Warning: No records extracted from PDF.")
+        return
+
+    # Secondary enforcement against description patterns
+    heavy_mask = df["description"].str.contains(
+        r"\b([4-9][5-9]|\d{3,})\s*(LB|LBS|POUND|POUNDS)\b|\b50-?LB\b",
+        case=False,
+        regex=True,
+        na=False
+    )
+    df = df[~heavy_mask].copy()
+
+    # Standardize schema for universal catalog indexer
+    df["vendor"] = "GRAINGER"
+    df["clean_mpn"] = df["mpn"]
+    df["root_mpn"] = df["item_number"]
+    df["upc_raw"] = ""
+    df["gtin14"] = ""
+    df["unit_cost"] = df["wholesale_cost"]
+    df["raw_cost"] = df["wholesale_cost"]
+    df["title"] = df["description"]
+    df["uom"] = "EA"
+    df["pack_qty"] = 1
 
     os.makedirs(os.path.dirname(OUTPUT_PARQUET), exist_ok=True)
     df.to_parquet(OUTPUT_PARQUET, index=False)
-    print(f"Successfully extracted {len(df)} SKUs into {OUTPUT_PARQUET}")
+    print(f"Successfully extracted and normalized {len(df):,} items into {OUTPUT_PARQUET}")
 
 if __name__ == "__main__":
     main()
-EOF
-chmod +x /app/tools/parse_grainger_pdf.py
