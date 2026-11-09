@@ -1,16 +1,47 @@
-cat << 'EOF' > /app/core/engine.py
 """
 core/engine.py
-In-memory aggregation & fast lookup across all normalized wholesale Parquet feeds.
+In-memory aggregation & fast lookup across all normalized wholesale Parquet feeds,
+with strict 45-lb standard parcel ceiling guardrails.
 """
 import os
+import re
 import glob
 import logging
 import sqlite3
 import pandas as pd
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("IndustrialCatalogEngine")
+
+def is_over_weight_limit(title: str = "", package_weight_raw: Any = 0, item_weight_raw: Any = 0, max_lbs: float = 45.0) -> Tuple[bool, str]:
+    """
+    Hard-rejects products >= 45 lbs.
+    Guards against Keepa gram-to-pound parsing defects and missing weight metadata.
+    """
+    title_upper = str(title or "").upper()
+    heavy_patterns = [
+        r"\b([4-9][5-9]|\d{3,})\s*(LB|LBS|POUND|POUNDS)\b",  # Matches 45 lb, 50 lbs, 100 lb, etc.
+        r"\b50\s*LB\b",
+        r"\b50-LB\b",
+        r"\b50LB\b"
+    ]
+    for pat in heavy_patterns:
+        if re.search(pat, title_upper):
+            return True, f"TITLE_HEAVY_TOKEN ({pat})"
+
+    for raw_wt in [package_weight_raw, item_weight_raw]:
+        try:
+            wt_float = float(raw_wt or 0)
+            if wt_float > 0:
+                # If Keepa sends grams (>100 is almost certainly grams), convert to lbs
+                lbs = wt_float / 453.592 if wt_float > 100 else wt_float
+                if lbs >= max_lbs:
+                    return True, f"WEIGHT_EXCEEDS_{max_lbs}LB ({lbs:.1f} lbs)"
+        except (ValueError, TypeError):
+            continue
+
+    return False, "CLEAN"
+
 
 class DatabaseManager:
     def __init__(self, db_path: str = "/app/data/mro_pipeline.db"):
@@ -27,6 +58,7 @@ class DatabaseManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
 
 class IndustrialCatalogEngine:
     def __init__(self, db_manager: Optional[DatabaseManager] = None, parquet_dir: str = "/app/data/catalogs/wholesale_catalogs/indexed"):
@@ -46,6 +78,15 @@ class IndustrialCatalogEngine:
                 cols = set(df.columns)
                 for _, row in df.iterrows():
                     rec = row.to_dict()
+
+                    # Heavy/bulky guardrail filter at indexing time
+                    over_limit, _ = is_over_weight_limit(
+                        title=rec.get("title") or rec.get("description") or "",
+                        package_weight_raw=rec.get("weight") or rec.get("package_weight") or 0
+                    )
+                    if over_limit:
+                        continue  # Skip indexing SKUs exceeding parcel limits
+
                     for u_col in ["upc_raw", "gtin14", "upc", "barcode"]:
                         if u_col in cols:
                             upc = str(rec.get(u_col) or "").strip()
@@ -62,160 +103,3 @@ class IndustrialCatalogEngine:
                 logger.error("Error reading %s: %s", pf, e)
 
         print(f"Loaded {len(self.catalog_barcodes):,} barcodes and {len(self.catalog_brand_mpns):,} Brand-MPN index keys.")
-EOF
-
-cat << 'EOF' > /app/tools/parse_grainger_pdf.py
-#!/usr/bin/env python3
-"""
-parse_grainger_pdf.py
-Multiprocess chunked extractor for large Grainger PDF catalogs.
-Extracts: Item #, MPN, Brand, Description, and Wholesale Cost.
-"""
-import os
-import re
-import sys
-import sqlite3
-import argparse
-from multiprocessing import Pool, cpu_count
-import pandas as pd
-
-try:
-    import pdfplumber
-except ImportError:
-    os.system("pip install -q pdfplumber pandas pyarrow")
-    import pdfplumber
-
-DB_PATH = "/app/data/grainger_parsed_cache.db"
-OUTPUT_PARQUET = "/app/data/catalogs/wholesale_catalogs/normalized/grainger_catalog.parquet"
-
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS grainger_items (
-                item_number TEXT PRIMARY KEY,
-                mpn TEXT,
-                brand TEXT,
-                description TEXT,
-                wholesale_cost REAL,
-                page_num INTEGER
-            )
-        """)
-
-def parse_page_chunk(args_tuple):
-    pdf_path, start_page, end_page = args_tuple
-    extracted = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            actual_end = min(end_page, len(pdf.pages))
-            for p_num in range(start_page, actual_end):
-                page = pdf.pages[p_num]
-                text = page.extract_text() or ""
-                matches = re.findall(r"([0-9A-Z]{5,8})\s+([A-Za-z0-9\-\.\/]{3,20})?\s+(.*?)\s+\$(\d+\.\d{2})", text)
-                for item_num, mpn, desc, price in matches:
-                    extracted.append((
-                        item_num.strip(),
-                        (mpn or item_num).strip(),
-                        "GRAINGER",
-                        desc.strip()[:100],
-                        float(price),
-                        p_num + 1
-                    ))
-    except Exception as e:
-        print(f"Error on pages {start_page}-{end_page}: {e}")
-    return extracted
-
-def main():
-    parser = argparse.ArgumentParser(description="Grainger PDF Parser")
-    parser.add_argument("pdf", help="Path to raw Grainger PDF")
-    parser.add_argument("--workers", type=int, default=4, help="Worker pool size")
-    parser.add_argument("--chunk_size", type=int, default=50, help="Pages per chunk")
-    args = parser.parse_args()
-
-    if not os.path.isfile(args.pdf):
-        print(f"Error: {args.pdf} not found.")
-        sys.exit(1)
-
-    init_db()
-    with pdfplumber.open(args.pdf) as pdf:
-        total_pages = len(pdf.pages)
-    print(f"Opened {args.pdf}: {total_pages} total pages.")
-
-    chunks = [
-        (args.pdf, start, start + args.chunk_size)
-        for start in range(0, total_pages, args.chunk_size)
-    ]
-
-    print(f"Dispatching {len(chunks)} chunks across {args.workers} workers...")
-    total_cached = 0
-    with Pool(processes=args.workers) as pool:
-        for result in pool.imap_unordered(parse_page_chunk, chunks):
-            if result:
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.executemany("""
-                        INSERT OR IGNORE INTO grainger_items
-                        (item_number, mpn, brand, description, wholesale_cost, page_num)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, result)
-                total_cached += len(result)
-                print(f"Cached batch: +{len(result)} items (Running Total: {total_cached})")
-
-    with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query("SELECT * FROM grainger_items", conn)
-
-    # Standardize column schema for universal catalog aggregator
-    df["vendor"] = "GRAINGER"
-    df["clean_mpn"] = df["mpn"]
-    df["root_mpn"] = df["item_number"]
-    df["upc_raw"] = ""
-    df["gtin14"] = ""
-    df["unit_cost"] = df["wholesale_cost"]
-    df["raw_cost"] = df["wholesale_cost"]
-    df["title"] = df["description"]
-    df["uom"] = "EA"
-    df["pack_qty"] = 1
-
-    os.makedirs(os.path.dirname(OUTPUT_PARQUET), exist_ok=True)
-    df.to_parquet(OUTPUT_PARQUET, index=False)
-    print(f"Extraction complete: {len(df):,} items exported to {OUTPUT_PARQUET}")
-
-if __name__ == "__main__":
-    main()
-EOF
-
-chmod +x /app/tools/parse_grainger_pdf.py
-
-pip install -q gdown pdfplumber pandas pyarrow
-
-python3 -c "
-import os
-import gdown
-
-out_file = '/app/data/catalogs/wholesale_catalogs/incoming/grainger_raw.pdf'
-os.makedirs(os.path.dirname(out_file), exist_ok=True)
-url = 'https://drive.google.com/uc?id=1ZiV9PKmXbEzOsDaG2NPPUYDSjz_MHmqm'
-print('Downloading Grainger.pdf via gdown...')
-gdown.download(url, out_file, quiet=False)
-sz_mb = os.path.getsize(out_file) / (1024 * 1024)
-print(f'Verified file on disk: {out_file} ({sz_mb:.2f} MB)')
-"
-
-python3 /app/tools/parse_grainger_pdf.py \
-  /app/data/catalogs/wholesale_catalogs/incoming/grainger_raw.pdf \
-  --workers 4 \
-  --chunk_size 50
-
-cp /app/data/catalogs/wholesale_catalogs/normalized/grainger_catalog.parquet \
-   /app/data/catalogs/wholesale_catalogs/indexed/grainger_normalized.parquet
-
-python3 -c "
-from core.engine import IndustrialCatalogEngine, DatabaseManager
-engine = IndustrialCatalogEngine(DatabaseManager())
-engine.build_index()
-print(f'Updated Barcodes in Memory:   {len(engine.catalog_barcodes):,}')
-print(f'Updated Brand-MPNs in Memory: {len(engine.catalog_brand_mpns):,}')
-"
-
-git add core/engine.py tools/parse_grainger_pdf.py
-git commit -m "feat(grainger): implement end-to-end PDF parsing and catalog indexing pipeline"
-git push origin main
