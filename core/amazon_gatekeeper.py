@@ -8,9 +8,10 @@ Inspects account listing restrictions and submits programmatic soft-ungate appli
 
 import os
 import sys
+import time
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import requests
 from dotenv import load_dotenv
 
@@ -18,53 +19,98 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env", override=True)
 
 logger = logging.getLogger("AmazonGatekeeper")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
 
 
 class AmazonGatekeeper:
     def __init__(self):
-        self.client_id = os.getenv("SP_API_CLIENT_ID", "").strip()
-        self.client_secret = os.getenv("SP_API_CLIENT_SECRET", "").strip()
-        self.refresh_token = os.getenv("SP_API_REFRESH_TOKEN", "").strip()
-        self.seller_id = os.getenv("SP_API_SELLER_ID", "").strip()
-        self.marketplace_id = os.getenv("SP_API_MARKETPLACE_ID", "ATVPDKIKX0DER").strip()
+        # Support both SP_API_ prefix and standard LWA/Seller prefixes
+        self.client_id = (
+            os.getenv("SP_API_CLIENT_ID")
+            or os.getenv("LWA_CLIENT_ID")
+            or os.getenv("CLIENT_ID", "")
+        ).strip()
+        
+        self.client_secret = (
+            os.getenv("SP_API_CLIENT_SECRET")
+            or os.getenv("LWA_CLIENT_SECRET")
+            or os.getenv("CLIENT_SECRET", "")
+        ).strip()
+        
+        self.refresh_token = (
+            os.getenv("SP_API_REFRESH_TOKEN")
+            or os.getenv("LWA_REFRESH_TOKEN")
+            or os.getenv("REFRESH_TOKEN", "")
+        ).strip()
+        
+        self.seller_id = (
+            os.getenv("SP_API_SELLER_ID")
+            or os.getenv("AMAZON_SELLER_ID")
+            or os.getenv("SELLER_ID", "")
+        ).strip()
+        
+        self.marketplace_id = (
+            os.getenv("SP_API_MARKETPLACE_ID")
+            or os.getenv("MARKETPLACE_ID", "ATVPDKIKX0DER")
+        ).strip()
+        
         self.base_url = "https://sellingpartnerapi-na.amazon.com"
         self._access_token: Optional[str] = None
+        self._token_expires_at: float = 0.0
 
     def _get_access_token(self) -> Optional[str]:
-        if self._access_token:
+        """Fetches or refreshes the Login with Amazon (LWA) access token."""
+        # Return cached token if valid with at least a 60-second buffer
+        if self._access_token and time.time() < (self._token_expires_at - 60):
             return self._access_token
 
         if not self.refresh_token or not self.client_id or not self.client_secret:
+            logger.error("Missing required LWA credentials in environment variables.")
             return None
 
-        url = "https://api.amazon.com/auth/o2o/token"
+        # Fixed endpoint: o2 instead of o2o
+        url = "https://api.amazon.com/auth/o2/token"
         payload = {
             "grant_type": "refresh_token",
             "refresh_token": self.refresh_token,
             "client_id": self.client_id,
             "client_secret": self.client_secret
         }
+        
         try:
-            res = requests.post(url, data=payload, timeout=10)
+            res = requests.post(url, data=payload, timeout=15)
             if res.status_code == 200:
-                self._access_token = res.json().get("access_token")
+                data = res.json()
+                self._access_token = data.get("access_token")
+                expires_in = data.get("expires_in", 3600)
+                self._token_expires_at = time.time() + float(expires_in)
+                logger.info("Successfully refreshed Amazon LWA access token.")
                 return self._access_token
+            else:
+                logger.error(f"LWA authentication failed ({res.status_code}): {res.text}")
         except Exception as e:
             logger.error(f"Error authenticating with Amazon LWA: {e}")
+            
         return None
 
     def evaluate_asin_approval(self, asin: str) -> Dict[str, Any]:
         """
-        1. Checks if already ungated.
-        2. If gated, executes automated approval request.
-        3. Returns: 'UNRESTRICTED', 'AUTO_UNGATED', or 'INVOICE_REQUIRED'.
+        1. Checks if already ungated via listings restrictions endpoint.
+        2. If gated, executes automated approval request when application links exist.
+        3. Returns status: 'UNRESTRICTED', 'AUTO_UNGATED', 'INVOICE_REQUIRED', or 'ERROR'.
         """
         token = self._get_access_token()
         if not token:
-            return {"status": "MOCK_OFFLINE"}
+            logger.warning("No valid access token available. Returning MOCK_OFFLINE.")
+            return {"status": "MOCK_OFFLINE", "asin": asin}
 
         headers = {
             "x-amz-access-token": token,
+            "Accept": "application/json",
             "User-Agent": "WholesaleSniper/1.0"
         }
 
@@ -78,38 +124,66 @@ class AmazonGatekeeper:
 
         try:
             res = requests.get(restrictions_url, headers=headers, params=params, timeout=10)
+            
             if res.status_code == 200:
                 data = res.json()
                 restrictions = data.get("restrictions", [])
 
                 if not restrictions:
-                    return {"status": "UNRESTRICTED"}
+                    return {"status": "UNRESTRICTED", "asin": asin, "reasons": []}
 
                 return self._attempt_auto_ungate(asin, restrictions, headers)
+
+            elif res.status_code == 429:
+                logger.warning(f"Rate limited (429) checking restrictions for {asin}. Sleeping 2 seconds.")
+                time.sleep(2)
+                return {"status": "RATE_LIMITED", "asin": asin}
+            else:
+                logger.error(f"SP-API returned status {res.status_code} for ASIN {asin}: {res.text[:120]}")
+                return {"status": "ERROR", "asin": asin, "code": res.status_code}
 
         except Exception as e:
             logger.error(f"SP-API error inspecting ASIN {asin}: {e}")
 
-        return {"status": "INVOICE_REQUIRED"}
+        return {"status": "INVOICE_REQUIRED", "asin": asin}
 
-    def _attempt_auto_ungate(self, asin: str, restrictions: list, headers: dict) -> Dict[str, Any]:
+    def _attempt_auto_ungate(self, asin: str, restrictions: List[Dict[str, Any]], headers: Dict[str, str]) -> Dict[str, Any]:
         """Submits programmatic soft-ungate application to trigger Amazon's auto-approval algorithm."""
+        collected_reasons = []
+
         for r in restrictions:
             for reason in r.get("reasons", []):
+                reason_code = reason.get("reasonCode", "UNKNOWN")
+                collected_reasons.append(reason_code)
                 links = reason.get("links", [])
+                
                 for link in links:
-                    if "approval" in link.get("resource", "").lower() or link.get("verb") == "POST":
+                    resource = link.get("resource", "")
+                    verb = link.get("verb", "").upper()
+                    
+                    if "approval" in resource.lower() or verb == "POST":
                         try:
-                            app_url = link.get("resource")
-                            if not app_url.startswith("http"):
-                                app_url = f"{self.base_url}{app_url}"
+                            app_url = resource if resource.startswith("http") else f"{self.base_url}{resource}"
+                            apply_res = requests.post(app_url, headers=headers, json={"asin": asin}, timeout=12)
                             
-                            apply_res = requests.post(app_url, headers=headers, json={"asin": asin}, timeout=10)
                             if apply_res.status_code in [200, 204]:
                                 res_json = apply_res.json() if apply_res.text else {}
                                 if res_json.get("status") == "APPROVED" or apply_res.status_code == 204:
-                                    return {"status": "AUTO_UNGATED"}
-                        except Exception:
-                            pass
+                                    logger.info(f"Auto-ungate application approved for ASIN {asin}!")
+                                    return {"status": "AUTO_UNGATED", "asin": asin}
+                        except Exception as e:
+                            logger.error(f"Error submitting auto-ungate application for ASIN {asin}: {e}")
 
-        return {"status": "INVOICE_REQUIRED"}
+        return {
+            "status": "INVOICE_REQUIRED",
+            "asin": asin,
+            "reasons": collected_reasons
+        }
+
+
+if __name__ == "__main__":
+    gatekeeper = AmazonGatekeeper()
+    test_asin = sys.argv[1] if len(sys.argv) > 1 else "B00004SQ5G"
+    print(f"Testing AmazonGatekeeper with ASIN: {test_asin}")
+    result = gatekeeper.evaluate_asin_approval(test_asin)
+    print("Result:", result)
