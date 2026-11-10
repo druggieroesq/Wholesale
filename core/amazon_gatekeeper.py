@@ -28,7 +28,6 @@ if not logger.handlers:
 
 class AmazonGatekeeper:
     def __init__(self):
-        # Support both SP_API_ prefix and standard LWA/Seller prefixes
         self.client_id = (
             os.getenv("SP_API_CLIENT_ID")
             or os.getenv("LWA_CLIENT_ID")
@@ -63,8 +62,6 @@ class AmazonGatekeeper:
         self._token_expires_at: float = 0.0
 
     def _get_access_token(self) -> Optional[str]:
-        """Fetches or refreshes the Login with Amazon (LWA) access token."""
-        # Return cached token if valid with at least a 60-second buffer
         if self._access_token and time.time() < (self._token_expires_at - 60):
             return self._access_token
 
@@ -72,7 +69,6 @@ class AmazonGatekeeper:
             logger.error("Missing required LWA credentials in environment variables.")
             return None
 
-        # Fixed endpoint: o2 instead of o2o
         url = "https://api.amazon.com/auth/o2/token"
         payload = {
             "grant_type": "refresh_token",
@@ -98,11 +94,6 @@ class AmazonGatekeeper:
         return None
 
     def evaluate_asin_approval(self, asin: str) -> Dict[str, Any]:
-        """
-        1. Checks if already ungated via listings restrictions endpoint.
-        2. If gated, executes automated approval request when application links exist.
-        3. Returns status: 'UNRESTRICTED', 'AUTO_UNGATED', 'INVOICE_REQUIRED', or 'ERROR'.
-        """
         token = self._get_access_token()
         if not token:
             logger.warning("No valid access token available. Returning MOCK_OFFLINE.")
@@ -148,7 +139,6 @@ class AmazonGatekeeper:
         return {"status": "INVOICE_REQUIRED", "asin": asin}
 
     def _attempt_auto_ungate(self, asin: str, restrictions: List[Dict[str, Any]], headers: Dict[str, str]) -> Dict[str, Any]:
-        """Submits programmatic soft-ungate application to trigger Amazon's auto-approval algorithm."""
         collected_reasons = []
 
         for r in restrictions:
