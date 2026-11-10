@@ -4,6 +4,7 @@ tools/auto_cross_catalog_matcher_daemon.py
 Automated cross-catalog matcher bot for wholesale pipelines.
 Scans incoming and normalized distributor Parquet feeds against
 Amazon verified_deals and candidate_cache in hunter_engine.db.
+Filters out blacklisted IP liability brands.
 """
 
 import os
@@ -53,14 +54,27 @@ class CrossCatalogMatcherBot:
     def __init__(self,
                  parquet_dir: str = "/app/data/catalogs/wholesale_catalogs/indexed",
                  reports_dir: str = "/app/data/reports",
-                 db_path: str = "/app/data/hunter_engine.db"):
+                 db_path: str = "/app/data/hunter_engine.db",
+                 blacklist_path: str = "/app/data/ip_blacklist.json"):
         self.parquet_dir = parquet_dir
         self.reports_dir = reports_dir
         self.db_path = db_path
+        self.blacklist_path = blacklist_path
         
         self.upc_index: Dict[str, List[Dict[str, Any]]] = {}
         self.mpn_index: Dict[str, List[Dict[str, Any]]] = {}
         self.total_skus: int = 0
+        self.ip_blacklist: Set[str] = set()
+        self._load_blacklist()
+
+    def _load_blacklist(self):
+        if os.path.exists(self.blacklist_path):
+            try:
+                with open(self.blacklist_path, "r") as f:
+                    self.ip_blacklist = {b.upper().strip() for b in json.load(f)}
+                logger.info(f"Loaded {len(self.ip_blacklist):,} blacklisted IP brands.")
+            except Exception as e:
+                logger.error(f"Error loading blacklist from {self.blacklist_path}: {e}")
 
     def load_distributor_indexes(self):
         self.upc_index.clear()
@@ -133,13 +147,13 @@ class CrossCatalogMatcherBot:
                         cc.drops_90
                     FROM verified_deals vd
                     LEFT JOIN candidate_cache cc ON vd.asin = cc.asin
-                    WHERE vd.asin IS NOT NULL;
+                    WHERE vd.asin IS NOT NULL AND vd.status NOT IN ('BLOCKED_IP_BRAND', 'REJECTED');
                     """
                     leads = pd.read_sql_query(query, conn).to_dict(orient="records")
                     logger.info(f"Fetched {len(leads):,} enriched leads from verified_deals.")
                 except Exception as e:
                     logger.warning(f"Error querying verified_deals join: {e}")
-                    query = "SELECT * FROM candidate_cache WHERE asin IS NOT NULL;"
+                    query = "SELECT * FROM candidate_cache WHERE asin IS NOT NULL AND status NOT IN ('BLOCKED_IP_BRAND', 'REJECTED');"
                     leads = pd.read_sql_query(query, conn).to_dict(orient="records")
                     logger.info(f"Fallback: loaded {len(leads):,} leads from candidate_cache.")
         return leads
@@ -148,9 +162,15 @@ class CrossCatalogMatcherBot:
         verified_hits = []
 
         for lead in leads:
+            brand_raw = str(lead.get("brand") or "").upper().strip()
+            
+            # Blacklist Guard: Skip any prohibited or litigious IP brand
+            if brand_raw in self.ip_blacklist or any(b in brand_raw for b in self.ip_blacklist if len(b) > 3):
+                continue
+
             asin = lead.get("asin") or ""
             title = str(lead.get("title") or "")
-            brand = clean_alphanumeric(lead.get("brand") or "")
+            brand = clean_alphanumeric(brand_raw)
             bb = safe_float(lead.get("buy_box_price") or lead.get("current_bb"))
             fba = safe_float(lead.get("fba_fee"))
             ref_pct = safe_float(lead.get("referral_pct")) or 0.15
