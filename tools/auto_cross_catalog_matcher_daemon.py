@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 tools/auto_cross_catalog_matcher_daemon.py
-Automated cross-catalog matcher bot for wholesale MRO pipelines.
-Continuously or periodically scans incoming distributor feeds against
-Amazon buy-sheets, hunter reports, and SQLite leads.
+Automated cross-catalog matcher bot for wholesale pipelines.
+Scans incoming and normalized distributor Parquet feeds against
+Amazon verified_deals and candidate_cache in hunter_engine.db.
 """
 
 import os
 import sys
-import time
 import glob
 import json
 import re
@@ -64,12 +63,10 @@ class CrossCatalogMatcherBot:
         self.total_skus: int = 0
 
     def load_distributor_indexes(self):
-        """Indexes all normalized Parquet catalogs with dynamic schema handling."""
         self.upc_index.clear()
         self.mpn_index.clear()
         self.total_skus = 0
         
-        # Include both indexed and normalized folders
         parquet_files = sorted(
             glob.glob(os.path.join(self.parquet_dir, "*.parquet")) +
             glob.glob("/app/data/catalogs/wholesale_catalogs/normalized/*.parquet")
@@ -87,8 +84,6 @@ class CrossCatalogMatcherBot:
                 df = pd.read_parquet(pf)
                 self.total_skus += len(df)
                 cols = set(df.columns)
-
-                # Identify price/cost column
                 cost_col = next((c for c in cols if any(k in c.lower() for k in ["cost", "price", "wholesale", "net"])), None)
 
                 for _, row in df.iterrows():
@@ -98,14 +93,12 @@ class CrossCatalogMatcherBot:
                     if cost_col:
                         item["raw_cost"] = safe_float(row[cost_col])
 
-                    # Universal Barcode Check (upc_raw, gtin14, upc, barcode, gtin)
                     for u_col in ["upc_raw", "gtin14", "upc", "barcode", "gtin"]:
                         if u_col in cols:
                             u = clean_alphanumeric(item.get(u_col))
                             if u and u not in ("0", "NONE", "NAN") and len(u) >= 8:
                                 self.upc_index.setdefault(u, []).append(item)
 
-                    # Universal Part Number Check (clean_mpn, root_mpn, mpn, sku, item)
                     for m_col in ["clean_mpn", "root_mpn", "mpn", "sku", "item"]:
                         if m_col in cols:
                             m = clean_alphanumeric(item.get(m_col))
@@ -119,80 +112,65 @@ class CrossCatalogMatcherBot:
         logger.info(f"Active Clean MPN Search Keys: {len(self.mpn_index):,}")
 
     def gather_leads(self) -> List[Dict[str, Any]]:
-        """Collects leads across JSON report files, CSV buysheets, and SQLite."""
         leads = []
-        
-        # 1. JSON Report sweeps
-        json_files = glob.glob(os.path.join(self.reports_dir, "*.json")) + glob.glob("/app/data/*.json")
-        for jf in json_files:
-            if "checkpoint" in jf or "cross_matches" in jf:
-                continue
-            try:
-                with open(jf, "r") as f:
-                    d = json.load(f)
-                    items = d if isinstance(d, list) else [it for v in d.values() if isinstance(v, list) for it in v]
-                    for it in items:
-                        if isinstance(it, dict) and ("asin" in it or "ASIN" in it):
-                            leads.append(it)
-            except Exception:
-                pass
-
-        # 2. SQLite Database sweeps (hunter_engine.db: verified_deals & candidate_cache)
         if os.path.isfile(self.db_path):
             with sqlite3.connect(self.db_path) as conn:
-                for tbl in ["verified_deals", "candidate_cache"]:
-                    try:
-                        query = f"SELECT * FROM {tbl} WHERE asin IS NOT NULL"
-                        for _, r in pd.read_sql_query(query, conn).iterrows():
-                            leads.append(r.to_dict())
-                    except Exception as e:
-                        logger.warning(f"Could not read table {tbl} from {self.db_path}: {e}")
-
-        # 3. CSV Buysheet sweeps
-        for csv_path in glob.glob("/app/data/*.csv"):
-            if "cross_matches" in csv_path or "checkpoint" in csv_path:
-                continue
-            try:
-                cdf = pd.read_csv(csv_path)
-                if "asin" in cdf.columns or "ASIN" in cdf.columns:
-                    for _, r in cdf.iterrows():
-                        leads.append(r.to_dict())
-            except Exception:
-                pass
-
-        logger.info(f"Gathered {len(leads):,} candidate lead entries.")
+                try:
+                    query = """
+                    SELECT 
+                        vd.asin, 
+                        vd.title, 
+                        vd.brand, 
+                        vd.buy_box_price, 
+                        vd.wholesale_cost AS existing_cost,
+                        vd.vendor AS existing_vendor,
+                        cc.upc, 
+                        cc.ean,
+                        cc.mpn, 
+                        cc.fba_fee, 
+                        cc.referral_pct, 
+                        cc.monthly_sold, 
+                        cc.drops_90
+                    FROM verified_deals vd
+                    LEFT JOIN candidate_cache cc ON vd.asin = cc.asin
+                    WHERE vd.asin IS NOT NULL;
+                    """
+                    leads = pd.read_sql_query(query, conn).to_dict(orient="records")
+                    logger.info(f"Fetched {len(leads):,} enriched leads from verified_deals.")
+                except Exception as e:
+                    logger.warning(f"Error querying verified_deals join: {e}")
+                    query = "SELECT * FROM candidate_cache WHERE asin IS NOT NULL;"
+                    leads = pd.read_sql_query(query, conn).to_dict(orient="records")
+                    logger.info(f"Fallback: loaded {len(leads):,} leads from candidate_cache.")
         return leads
 
     def match_leads(self, leads: List[Dict[str, Any]]) -> pd.DataFrame:
-        """Performs cross-matching and computes live FBA profit margins."""
         verified_hits = []
 
         for lead in leads:
-            asin = lead.get("asin") or lead.get("ASIN") or ""
-            title = str(lead.get("title") or lead.get("Title") or "")
-            brand = clean_alphanumeric(lead.get("brand") or lead.get("Brand") or "")
-            bb = safe_float(lead.get("current_bb") or lead.get("buy_box") or lead.get("price"))
+            asin = lead.get("asin") or ""
+            title = str(lead.get("title") or "")
+            brand = clean_alphanumeric(lead.get("brand") or "")
+            bb = safe_float(lead.get("buy_box_price") or lead.get("current_bb"))
             fba = safe_float(lead.get("fba_fee"))
             ref_pct = safe_float(lead.get("referral_pct")) or 0.15
 
-            # Parse UPCs
             candidate_upcs: Set[str] = set()
-            raw_upcs = lead.get("upcs") or lead.get("upc") or lead.get("UPC") or lead.get("ean")
-            if isinstance(raw_upcs, list):
-                for u in raw_upcs:
-                    c = clean_alphanumeric(u)
-                    if len(c) >= 8: candidate_upcs.add(c)
-            elif raw_upcs:
-                for u in str(raw_upcs).split(","):
-                    c = clean_alphanumeric(u)
-                    if len(c) >= 8: candidate_upcs.add(c)
+            for u_field in ["upc", "ean", "upcs"]:
+                val = lead.get(u_field)
+                if val:
+                    for u in str(val).split(","):
+                        c = clean_alphanumeric(u)
+                        if len(c) >= 8:
+                            candidate_upcs.add(c)
 
-            # 1. Barcode Matches (High Confidence)
+            # 1. Barcode Matches
             for upc in candidate_upcs:
                 if upc in self.upc_index:
                     for dist in self.upc_index[upc]:
                         dist_cost = safe_float(dist.get("unit_cost") or dist.get("raw_cost"))
-                        if dist_cost <= 0.05: continue
+                        if dist_cost <= 0.05:
+                            continue
                         
                         net_profit = bb - (bb * ref_pct) - fba - dist_cost if bb > 0 else 0.0
                         roi = (net_profit / dist_cost * 100) if dist_cost > 0 and bb > 0 else 0.0
@@ -214,7 +192,7 @@ class CrossCatalogMatcherBot:
 
             # Parse MPN candidates
             candidate_mpns: Set[str] = set()
-            for field in ["clean_mpn", "root_mpn", "mpn", "MPN", "model", "part_number", "sku"]:
+            for field in ["clean_mpn", "root_mpn", "mpn", "sku"]:
                 v = clean_alphanumeric(lead.get(field))
                 if len(v) >= 4 and not v.startswith("63F4") and v not in STOPWORDS:
                     candidate_mpns.add(v)
@@ -231,7 +209,8 @@ class CrossCatalogMatcherBot:
                         dist_brand = clean_alphanumeric(dist.get("brand"))
                         if not brand or not dist_brand or (brand in dist_brand) or (dist_brand in brand):
                             dist_cost = safe_float(dist.get("unit_cost") or dist.get("raw_cost"))
-                            if dist_cost <= 0.05: continue
+                            if dist_cost <= 0.05:
+                                continue
 
                             net_profit = bb - (bb * ref_pct) - fba - dist_cost if bb > 0 else 0.0
                             roi = (net_profit / dist_cost * 100) if dist_cost > 0 and bb > 0 else 0.0
@@ -274,36 +253,23 @@ class CrossCatalogMatcherBot:
         matches_df.to_csv(out_csv, index=False)
         logger.info(f"Cycle Complete. Saved {len(matches_df):,} verified matches to: {out_csv}")
 
-        # Filter profitable deals
         profitable = matches_df[matches_df["net_profit"] >= 1.50].sort_values(by="net_profit", ascending=False)
         prof_csv = os.path.join(self.reports_dir, "profitable_cross_matches.csv")
         profitable.to_csv(prof_csv, index=False)
         logger.info(f"Saved {len(profitable):,} profitable deals (Net Profit >= $1.50) to: {prof_csv}")
 
         if not profitable.empty:
-            print("\n--- TOP 15 PROFITABLE MATCHES ---")
-            print(profitable[["asin", "brand", "matched_vendor", "wholesale_cost", "buy_box", "net_profit", "roi_pct"]].head(15).to_string(index=False))
+            print("\n=================== TOP 20 PROFITABLE MATCHES ===================")
+            print(profitable[["asin", "brand", "matched_vendor", "wholesale_cost", "buy_box", "net_profit", "roi_pct"]].head(20).to_string(index=False))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Automated Cross-Catalog Matcher Bot")
     parser.add_argument("--run-once", action="store_true", help="Run a single match cycle and exit")
-    parser.add_argument("--interval", type=int, default=3600, help="Loop interval in seconds (default: 3600)")
     args = parser.parse_args()
 
     bot = CrossCatalogMatcherBot()
-
-    if args.run_once:
-        bot.execute_match_cycle()
-        sys.exit(0)
-
-    logger.info(f"Starting CrossCatalogMatcherBot daemon (interval: {args.interval}s)...")
-    while True:
-        try:
-            bot.execute_match_cycle()
-        except Exception as e:
-            logger.error(f"Error during matcher cycle: {e}")
-        time.sleep(args.interval)
+    bot.execute_match_cycle()
 
 
 if __name__ == "__main__":
