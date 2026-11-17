@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Amazon Gatekeeper & Automated SP-API Soft-Ungater
--------------------------------------------------
+core/amazon_gatekeeper.py
+-------------------------
 Direct interface with Amazon Selling Partner API (SP-API).
-Inspects account listing restrictions and submits programmatic soft-ungate applications.
+Inspects account listing restrictions, detects Q4 Holiday Toy holds and CPC/ASTM safety gates,
+and submits programmatic soft-ungate applications.
 """
 
 import os
@@ -33,30 +34,30 @@ class AmazonGatekeeper:
             or os.getenv("LWA_CLIENT_ID")
             or os.getenv("CLIENT_ID", "")
         ).strip()
-        
+
         self.client_secret = (
             os.getenv("SP_API_CLIENT_SECRET")
             or os.getenv("LWA_CLIENT_SECRET")
             or os.getenv("CLIENT_SECRET", "")
         ).strip()
-        
+
         self.refresh_token = (
             os.getenv("SP_API_REFRESH_TOKEN")
             or os.getenv("LWA_REFRESH_TOKEN")
             or os.getenv("REFRESH_TOKEN", "")
         ).strip()
-        
+
         self.seller_id = (
             os.getenv("SP_API_SELLER_ID")
             or os.getenv("AMAZON_SELLER_ID")
             or os.getenv("SELLER_ID", "")
         ).strip()
-        
+
         self.marketplace_id = (
             os.getenv("SP_API_MARKETPLACE_ID")
             or os.getenv("MARKETPLACE_ID", "ATVPDKIKX0DER")
         ).strip()
-        
+
         self.base_url = "https://sellingpartnerapi-na.amazon.com"
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -76,7 +77,7 @@ class AmazonGatekeeper:
             "client_id": self.client_id,
             "client_secret": self.client_secret
         }
-        
+
         try:
             res = requests.post(url, data=payload, timeout=15)
             if res.status_code == 200:
@@ -90,7 +91,7 @@ class AmazonGatekeeper:
                 logger.error(f"LWA authentication failed ({res.status_code}): {res.text}")
         except Exception as e:
             logger.error(f"Error authenticating with Amazon LWA: {e}")
-            
+
         return None
 
     def evaluate_asin_approval(self, asin: str) -> Dict[str, Any]:
@@ -115,13 +116,19 @@ class AmazonGatekeeper:
 
         try:
             res = requests.get(restrictions_url, headers=headers, params=params, timeout=10)
-            
+
             if res.status_code == 200:
                 data = res.json()
                 restrictions = data.get("restrictions", [])
 
                 if not restrictions:
-                    return {"status": "UNRESTRICTED", "asin": asin, "reasons": []}
+                    return {
+                        "status": "UNRESTRICTED",
+                        "asin": asin,
+                        "reasons": [],
+                        "q4_restricted": False,
+                        "cpc_required": False,
+                    }
 
                 return self._attempt_auto_ungate(asin, restrictions, headers)
 
@@ -140,34 +147,63 @@ class AmazonGatekeeper:
 
     def _attempt_auto_ungate(self, asin: str, restrictions: List[Dict[str, Any]], headers: Dict[str, str]) -> Dict[str, Any]:
         collected_reasons = []
+        q4_restricted = False
+        cpc_required = False
+        hard_blocked = False
 
         for r in restrictions:
             for reason in r.get("reasons", []):
                 reason_code = reason.get("reasonCode", "UNKNOWN")
-                collected_reasons.append(reason_code)
+                reason_msg = reason.get("message", "")
+                collected_reasons.append(f"{reason_code}: {reason_msg}".strip(": "))
+
+                upper_blob = f"{reason_code} {reason_msg}".upper()
+                if any(k in upper_blob for k in ("HOLIDAY", "SEASONAL", "Q4")):
+                    q4_restricted = True
+                if any(k in upper_blob for k in ("CPC", "CHILDREN", "ASTM", "CPSIA", "SAFETY")):
+                    cpc_required = True
+                if reason_code == "NOT_ELIGIBLE":
+                    hard_blocked = True
+
                 links = reason.get("links", [])
-                
                 for link in links:
                     resource = link.get("resource", "")
                     verb = link.get("verb", "").upper()
-                    
-                    if "approval" in resource.lower() or verb == "POST":
+
+                    if ("approval" in resource.lower() or verb == "POST") and not (q4_restricted or cpc_required or hard_blocked):
                         try:
                             app_url = resource if resource.startswith("http") else f"{self.base_url}{resource}"
                             apply_res = requests.post(app_url, headers=headers, json={"asin": asin}, timeout=12)
-                            
+
                             if apply_res.status_code in [200, 204]:
                                 res_json = apply_res.json() if apply_res.text else {}
                                 if res_json.get("status") == "APPROVED" or apply_res.status_code == 204:
                                     logger.info(f"Auto-ungate application approved for ASIN {asin}!")
-                                    return {"status": "AUTO_UNGATED", "asin": asin}
+                                    return {
+                                        "status": "AUTO_UNGATED",
+                                        "asin": asin,
+                                        "reasons": collected_reasons,
+                                        "q4_restricted": False,
+                                        "cpc_required": False,
+                                    }
                         except Exception as e:
                             logger.error(f"Error submitting auto-ungate application for ASIN {asin}: {e}")
 
+        if hard_blocked:
+            final_status = "HARD_BLOCKED"
+        elif q4_restricted:
+            final_status = "Q4_HOLIDAY_RESTRICTED"
+        elif cpc_required:
+            final_status = "CPC_SAFETY_REQUIRED"
+        else:
+            final_status = "INVOICE_REQUIRED"
+
         return {
-            "status": "INVOICE_REQUIRED",
+            "status": final_status,
             "asin": asin,
-            "reasons": collected_reasons
+            "reasons": collected_reasons,
+            "q4_restricted": q4_restricted,
+            "cpc_required": cpc_required,
         }
 
 
