@@ -2,7 +2,11 @@
 """
 tools/reverse_amazon_finder.py
 ------------------------------
-Reverse Amazon Hunter & Autonomous Sourcing Daemon (v16.8 Suppressed-BuyBox & Private-Label Shield).
+Reverse Amazon Hunter & Autonomous Sourcing Daemon (v16.9 0-FBA Buy Box Steal & Multi-Seller Shield).
+- Allows 0-FBA Buy Box Steals ONLY when monthly velocity >= 50 units/mo AND >= 2 independent FBM sellers exist.
+- Blocks 1-seller manufacturer / private-label listings (total_sellers <= 1 or brand == seller).
+- Anchors strictly to real active offers (current_bb, lowest_fba, lowest_fbm) — never MSRP/list_price.
+- Enforces accessory mismatch & 22% cost-floor guardrails and requires verified catalog COGS.
 """
 
 import os
@@ -67,9 +71,6 @@ STRICT_MAX_WHOLESALE_COST = 65.00
 MIN_REVIEW_RATING = 3.8
 MAX_SEARCH_PAGE_DEPTH = 100
 
-# ==============================================================================
-# ACCESSORY MISMATCH & EXTREME ROI FLOOR SHIELD
-# ==============================================================================
 ACCESSORY_TOKENS = {
     'bracket', 'screw', 'screws', 'bolt', 'bolts', 'gasket', 'seal',
     'plate', 'cover', 'adapter', 'harness', 'hardware kit', 'mounting kit',
@@ -105,10 +106,11 @@ SECTOR_DEFINITIONS: Dict[int, Dict[str, Any]] = {
     16310151: {"name": "Material Handling & Packaging Supplies", "is_root": False, "ref_fee": 0.12}
 }
 
+# Require at least 2 total new offers in Keepa query so 1-seller manufacturer listings are excluded at query time
 SEARCH_SLICES = [
-    {"price_min": 25, "price_max": 95, "bsr_min": 500, "bsr_max": 15000, "min_sellers": 2, "max_sellers": 5, "sort": "salesRankDrops30", "asc": False},
-    {"price_min": 20, "price_max": 80, "bsr_min": 15001, "bsr_max": 35000, "min_sellers": 2, "max_sellers": 5, "sort": "salesRankDrops30", "asc": False},
-    {"price_min": 18, "price_max": 60, "bsr_min": 35001, "bsr_max": 60000, "min_sellers": 2, "max_sellers": 4, "sort": "salesRankDrops30", "asc": False},
+    {"price_min": 25, "price_max": 95, "bsr_min": 500, "bsr_max": 15000, "min_sellers": 2, "max_sellers": 6, "sort": "salesRankDrops30", "asc": False},
+    {"price_min": 20, "price_max": 80, "bsr_min": 15001, "bsr_max": 35000, "min_sellers": 2, "max_sellers": 6, "sort": "salesRankDrops30", "asc": False},
+    {"price_min": 18, "price_max": 60, "bsr_min": 35001, "bsr_max": 60000, "min_sellers": 2, "max_sellers": 5, "sort": "salesRankDrops30", "asc": False},
     {"price_min": 65, "price_max": 160, "bsr_min": 1000, "bsr_max": 40000, "min_sellers": 2, "max_sellers": 6, "sort": "salesRankDrops90", "asc": False}
 ]
 
@@ -117,13 +119,11 @@ def is_accessory_mismatch(amz_title: str, dist_title: str, cogs: float, bb: floa
     cogs = float(cogs or 0.0)
     bb = float(bb or 0.0)
 
-    # 1. Price Floor Ratio Check for items > $25
     if bb > 25.0 and cogs > 0:
         cost_ratio = cogs / bb
         if cost_ratio < 0.22:
             return True, f"SUB_FLOOR_COST_RATIO ({cost_ratio:.1%} < 22% floor | Potential accessory mismatch)"
 
-    # 2. Equipment vs Accessory Token Check
     amz_t = str(amz_title).lower()
     dist_t = str(dist_title).lower()
 
@@ -144,45 +144,42 @@ def validate_real_buybox_and_brand_safety(
     lowest_fbm: float,
     fba_sellers: int,
     total_sellers: int,
-    brand: str
+    brand: str,
+    monthly_units: int = 0
 ) -> Tuple[bool, float, str]:
     """
-    Eliminates phantom '0-FBA Prime Steal' hallucinations caused by suppressed Buy Boxes
-    and blocks single-seller private-label IP traps (e.g., OSLTWI / B0GFTK78F2).
-    Returns: (is_valid, true_effective_price, status_reason)
+    Allows true 0-FBA Buy Box Steals (50+ units/mo) against multiple FBM sellers
+    while blocking 1-seller manufacturer/private-label traps and MSRP hallucinations.
+    Returns: (is_valid, effective_price, tier_tag_or_reason)
     """
     if not brand or str(brand).strip().upper() in ("", "UNKNOWN", "GENERIC", "N/A"):
         return False, 0.0, "MISSING_OR_GENERIC_BRAND"
 
-    # 1. Block Single-Seller Private-Label Traps (< 2 FBA sellers or <= 2 total sellers with 0 FBA)
-    if fba_sellers < 2:
-        return False, 0.0, f"SINGLE_SELLER_PRIVATE_LABEL_TRAP (FBA sellers: {fba_sellers} < 2)"
+    # 1. Block 1-seller manufacturer / private-label listings (never compete against sole brand owner)
+    if total_sellers <= 1:
+        return False, 0.0, f"SOLE_MANUFACTURER_OR_PRIVATE_LABEL (total_sellers={total_sellers})"
 
-    if fba_sellers == 0 and total_sellers <= 2:
-        return False, 0.0, "SINGLE_SELLER_PRIVATE_LABEL_TRAP (0 FBA & <=2 total sellers)"
+    # 2. For 0-FBA Buy Box Steal plays, require >= 50 units/mo velocity and >= 2 independent FBM sellers
+    if fba_sellers == 0:
+        if monthly_units < 50:
+            return False, 0.0, f"0_FBA_VELOCITY_TOO_LOW ({monthly_units} < 50 u/mo)"
+        if total_sellers < 2:
+            return False, 0.0, "0_FBA_SINGLE_SELLER_TRAP"
 
-    # 2. Require an active, unsuppressed Buy Box or real active FBA/FBM offer (never fall back to MSRP)
-    if current_bb <= 0 and lowest_fba <= 0:
-        return False, 0.0, "BUYBOX_SUPPRESSED_NO_ACTIVE_FBA_OFFER"
-
+    # 3. Anchor strictly to real active offers (current_bb, lowest_fba, lowest_fbm) — NEVER MSRP/list_price
     active_offers = [p for p in (current_bb, lowest_fba, lowest_fbm) if p and p > 0]
     if not active_offers:
         return False, 0.0, "NO_ACTIVE_OFFERS_BUYBOX_SUPPRESSED"
 
-    # Anchor strictly to the lowest real active offer
     real_market_price = min(active_offers)
 
-    # 3. Detect Suppressed Buy Box Price Spike (active offer > 35% above 90-day Buy Box average)
+    # 4. Reject temporary price spikes (> 35% above 90-day Buy Box average)
     if avg90_bb and avg90_bb > 0 and real_market_price > (avg90_bb * 1.35):
         return False, 0.0, f"SUPPRESSED_BUYBOX_PRICE_SPIKE (${real_market_price:.2f} vs 90d ${avg90_bb:.2f})"
 
-    # If 90d average exists and is lower than current active offer, use conservative min(real_market_price, avg90_bb)
-    if avg90_bb and avg90_bb > 0:
-        effective_price = min(real_market_price, avg90_bb)
-    else:
-        effective_price = real_market_price
-
-    return True, round(effective_price, 2), "VERIFIED_ACTIVE_BUYBOX"
+    effective_price = min(real_market_price, avg90_bb) if (avg90_bb and avg90_bb > 0) else real_market_price
+    tier_tag = "0_FBA_BUYBOX_STEAL" if fba_sellers == 0 else "VERIFIED_ACTIVE_BUYBOX"
+    return True, round(effective_price, 2), tier_tag
 
 
 def acquire_singleton_lock():
@@ -544,24 +541,36 @@ class ReverseAmazonHunter:
         lowest_fba = round(lowest_fba_cents / 100.0, 2)
         lowest_fbm = round(lowest_fbm_cents / 100.0, 2)
 
-        fba_stat = current_prices[11] if len(current_prices) > 11 and current_prices[11] is not None and current_prices[11] >= 0 else 0
         offers = product.get("offers") or []
-        offers_fba = sum(1 for o in offers if o.get("isFBA") and o.get("condition") == 1)
+        new_offers = [o for o in offers if o.get("condition") == 1]
+        offers_fba = sum(1 for o in new_offers if o.get("isFBA"))
+        fba_stat = current_prices[11] if len(current_prices) > 11 and current_prices[11] is not None and current_prices[11] >= 0 else 0
         competitive_fba = max(fba_stat, offers_fba)
-        total_sellers = current_prices[11] if len(current_prices) > 11 and current_prices[11] and current_prices[11] > 0 else len(offers)
 
-        # Enforce Suppressed Buy Box & Single-Seller Private-Label Trap Shield
-        is_bb_safe, buy_box_price, bb_reason = validate_real_buybox_and_brand_safety(
+        total_new_stat = current_prices[11] if len(current_prices) > 11 and current_prices[11] and current_prices[11] > 0 else 0
+        total_sellers = max(total_new_stat, len(new_offers), competitive_fba)
+
+        # Reject if seller name matches brand name (sole manufacturer / brand-owner listing)
+        brand_clean_upper = clean_brand_name(brand)
+        for o in new_offers:
+            seller_name = clean_brand_name(str(o.get("sellerName") or ""))
+            if seller_name and brand_clean_upper and (seller_name == brand_clean_upper or brand_clean_upper in seller_name):
+                self.db.cache_candidate(asin, {"title": title, "brand": brand}, "PRIVATE_LABEL_TRAP", f"Manufacturer/Brand Owner selling directly ({seller_name})")
+                return None
+
+        # Enforce 0-FBA Buy Box Steal (50+/mo & >=2 FBM sellers) & Sole-Manufacturer Shield
+        is_bb_safe, buy_box_price, tier_or_reason = validate_real_buybox_and_brand_safety(
             current_bb=current_bb,
             avg90_bb=avg90_bb,
             lowest_fba=lowest_fba,
             lowest_fbm=lowest_fbm,
             fba_sellers=competitive_fba,
             total_sellers=total_sellers,
-            brand=brand
+            brand=brand,
+            monthly_units=monthly_units
         )
         if not is_bb_safe:
-            self.db.cache_candidate(asin, {"title": title, "brand": brand, "current_bb": current_bb, "avg90_bb": avg90_bb, "num_sellers": competitive_fba}, "PRIVATE_LABEL_TRAP", bb_reason)
+            self.db.cache_candidate(asin, {"title": title, "brand": brand, "current_bb": current_bb, "avg90_bb": avg90_bb, "num_sellers": total_sellers}, "PRIVATE_LABEL_TRAP", tier_or_reason)
             return None
 
         if buy_box_price < 13.50:
@@ -586,9 +595,9 @@ class ReverseAmazonHunter:
         wholesale_cost = round(cat_match["unit_cost"] * amazon_pack_qty, 2)
         vendor = cat_match["vendor"]
         dist_title = cat_match.get("dist_title", "")
-        confidence_tier = "VERIFIED_WHOLESALE"
+        confidence_tier = "[0-FBA PRIME STEAL]" if competitive_fba == 0 else "[VERIFIED 95%+]"
 
-        # Enforce Accessory Mismatch & Extreme ROI Floor Shield
+        # Enforce Accessory Mismatch & 22% Cost Floor Shield
         mismatch, mismatch_reason = is_accessory_mismatch(title, dist_title, wholesale_cost, buy_box_price)
         if mismatch:
             self.db.cache_candidate(asin, {"title": title, "brand": brand, "current_bb": buy_box_price}, "STRUCTURAL_REJECT", mismatch_reason)
@@ -607,7 +616,7 @@ class ReverseAmazonHunter:
             "title": title, "brand": brand, "category_id": sector_id,
             "upc": primary_upc, "is_hazmat": is_hazmat, "monthly_sold": monthly_units,
             "drops_90": drops_90, "avg90_bb": avg90_bb, "current_bb": current_bb,
-            "num_sellers": competitive_fba, "amazon_pack_qty": amazon_pack_qty
+            "num_sellers": total_sellers, "amazon_pack_qty": amazon_pack_qty
         }
 
         is_valid_comp, comp_reason, effective_share_velocity = validate_fba_competition(monthly_units, competitive_fba)
@@ -648,14 +657,15 @@ class ReverseAmazonHunter:
             "vendor": vendor, "prep_hub": logistics["facility"],
             "confidence_tier": confidence_tier, "sales_rank": current_bsr,
             "buy_box_price": buy_box_price, "current_bb": current_bb, "avg90_bb": avg90_bb,
-            "wholesale_cost": wholesale_cost,
+            "lowest_fbm_price": lowest_fbm, "wholesale_cost": wholesale_cost,
             "max_allowable_buy_cost": round(buy_box_price - total_overhead - profit_floor, 2),
             "net_profit": net_profit, "roi_percent": roi_percent, "profit_floor": profit_floor,
             "req_roi": req_roi, "profit_per_dollar": round(net_profit / max(0.01, wholesale_cost), 2),
             "suggested_order_size": suggested_order, "expected_order_profit": round(net_profit * suggested_order, 2),
             "monthly_profit_pool": monthly_profit_pool,
             "monthly_units": monthly_units, "our_share_velocity": int(effective_share_velocity),
-            "competitive_fba": competitive_fba, "drops_90": drops_90, "pack_count": amazon_pack_qty,
+            "competitive_fba": competitive_fba, "total_sellers": total_sellers,
+            "drops_90": drops_90, "pack_count": amazon_pack_qty,
             "days_to_fba": days_to_fba, "is_hazmat": is_hazmat, "weight_lbs": weight_lbs,
             "order_url": f"https://www.amazon.com/dp/{asin}",
             "seller_check_url": f"https://sellercentral.amazon.com/product-search/search?q={asin}",
@@ -671,17 +681,19 @@ class ReverseAmazonHunter:
             brand_esc = html.escape(deal["brand"])
             vendor_esc = html.escape(deal["vendor"])
             hazmat_tag = "⚠️ <b>HAZMAT</b> | " if deal.get("is_hazmat") else ""
+            steal_tag = f"🏆 <b>0-FBA BUY BOX STEAL ({deal['total_sellers']} FBM Sellers)</b>\n" if deal["competitive_fba"] == 0 else ""
 
             msg = (
                 f"💎 <b>VERIFIED WHOLESALE DEAL</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{steal_tag}"
                 f"📦 <a href=\"{deal['order_url']}\">{title_esc}</a>\n"
                 f"🏷 <b>Brand:</b> <code>{brand_esc}</code> | <b>ASIN:</b> <code>{deal['asin']}</code>\n"
                 f"🏢 <b>Vendor:</b> {vendor_esc} ({deal['prep_hub']})\n"
                 f"⚡ {hazmat_tag}<b>Pack:</b> {deal['pack_count']}x | <b>Days:</b> {deal['days_to_fba']}d | <b>Weight:</b> {deal['weight_lbs']} lbs\n"
                 f"📈 <b>True Velocity:</b> <b>{deal['monthly_units']} u/mo</b> | <b>Share:</b> {deal['our_share_velocity']} u/mo\n"
-                f"👥 <b>FBA Sellers:</b> {deal['competitive_fba']} | <b>BSR:</b> #{deal['sales_rank']:,}\n"
-                f"💰 <b>Buy Box:</b> ${deal['buy_box_price']:.2f} | <b>Cost:</b> ${deal['wholesale_cost']:.2f}\n"
+                f"👥 <b>FBA Sellers:</b> {deal['competitive_fba']} (Total: {deal['total_sellers']}) | <b>BSR:</b> #{deal['sales_rank']:,}\n"
+                f"💰 <b>Target Price:</b> ${deal['buy_box_price']:.2f} | <b>Cost:</b> ${deal['wholesale_cost']:.2f}\n"
                 f"🚀 <b>Net Profit:</b> <b>${deal['net_profit']:.2f} / unit</b> ({deal['roi_percent']}% ROI)\n"
                 f"🏊 <b>Monthly Pool:</b> <b>${deal['monthly_profit_pool']:.2f} / mo</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━"
@@ -704,17 +716,20 @@ class ReverseAmazonHunter:
                     "asin": deal["asin"],
                     "title": deal["title"],
                     "brand": deal["brand"],
+                    "confidence_tier": deal["confidence_tier"],
                     "vendor": deal["vendor"],
                     "prep_center": deal["prep_hub"],
                     "sales_rank": deal["sales_rank"],
                     "monthly_velocity": deal["monthly_units"],
                     "competitive_fba": deal["competitive_fba"],
+                    "total_sellers": deal["total_sellers"],
                     "our_share_velocity": deal["our_share_velocity"],
                     "pack_count": deal["pack_count"],
                     "days_to_fba": deal["days_to_fba"],
                     "buy_box_price": deal["buy_box_price"],
                     "current_bb": deal["current_bb"],
                     "avg90_bb": deal["avg90_bb"],
+                    "lowest_fbm_price": deal["lowest_fbm_price"],
                     "wholesale_cost": deal["wholesale_cost"],
                     "net_profit": deal["net_profit"],
                     "roi_percent": deal["roi_percent"],
@@ -724,7 +739,7 @@ class ReverseAmazonHunter:
                     "order_url": deal["order_url"],
                     "seller_check_url": deal["seller_check_url"],
                     "seller_approval_url": deal["seller_approval_url"],
-                    "notes": f"Pool: ${deal['monthly_profit_pool']:.2f}/mo | FBA: {deal['competitive_fba']} | Share: {deal['our_share_velocity']}u/mo | Days: {deal['days_to_fba']}d",
+                    "notes": f"Pool: ${deal['monthly_profit_pool']:.2f}/mo | FBA: {deal['competitive_fba']} / Total: {deal['total_sellers']} | Share: {deal['our_share_velocity']}u/mo",
                     "status": "Ready for Order"
                 }
                 requests.post(webhook_url, json=payload, timeout=15, allow_redirects=True)
@@ -809,7 +824,7 @@ class ReverseAmazonHunter:
                         logger.debug(f"Slice query error: {e}")
 
     def start(self):
-        logger.info("Hunter Engine v16.8 Active with Suppressed-BuyBox & Private-Label Trap Shield.")
+        logger.info("Hunter Engine v16.9 Active with 0-FBA Buy Box Steal (50+/mo, >=2 FBM) & Sole-Manufacturer Shield.")
         while True:
             try:
                 self.run_sweep()
@@ -822,13 +837,6 @@ class ReverseAmazonHunter:
 
 
 def apply_cost_certainty_penalty(raw_score: float, status: str, has_verified_distributor_sku: bool) -> float:
-    """
-    Enforces scoring integrity based on wholesale cost certainty:
-    - Verified distributor catalog SKU (SCOUTED_DEAL / VERIFIED_CATALOG): 1.0x (Score 80-100)
-    - Unlinked / reverse estimate (NO_CATALOG_MATCH): Hard capped at 25.0
-    - Filtered competitive saturation: Capped at 10.0
-    - Structural rejects: 0.0
-    """
     if status == 'STRUCTURAL_REJECT':
         return 0.0
     if status == 'FILTERED':
