@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-tools/ingest_eedistribution_catalog.py (Checklist Item #333)
-------------------------------------------------------------
-Authenticated EE Distribution Wholesale Portal Scraper.
-Writes normalized Parquet directly to:
-  /app/data/catalogs/wholesale_catalogs/indexed/ee_distribution_normalized.parquet
-so IndustrialCatalogEngine (core/engine.py) and CrossCatalogMatcherBot
-(tools/auto_cross_catalog_matcher_daemon.py) automatically index and match every UPC & MPN.
+tools/ingest_eedistribution_catalog.py
+--------------------------------------
+Authenticated EE Distribution Catalog & Marketplace-Restriction Scraper
+- Authenticates with EE_DIST_EMAIL & EE_DIST_PASSWORD from Railway / .env
+- Crawls In-Stock brand listings across target toy/collectible brands
+- Visits EVERY product detail page (PDP) to verify EE Distribution's
+  3rd-Party / Amazon / eBay marketplace eligibility notices
+- Immediately drops any SKU flagged with Amazon, eBay, or 3rd-party restrictions
+- Normalizes Case Price / Pack Qty to true per-unit COGS (+ inbound freight)
+- Filters out IP-blocked brands (data/ip_blocklist.json) & oversized items (> 45 lbs)
+- Writes clean CSV to data/catalogs/wholesale_catalogs/incoming/EEDistribution_Catalog.csv
 """
 
 import os
@@ -14,332 +18,364 @@ import re
 import sys
 import json
 import time
-import random
 import logging
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
-import httpx
+import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-load_dotenv(ROOT_DIR / ".env", override=True)
-
-from core.engine import is_over_weight_limit
+load_dotenv(ROOT_DIR / ".env", override=False)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] EEDistScraper: %(message)s"
+    format="%(asctime)s [%(levelname)s] EEDistIngest: %(message)s"
 )
-logger = logging.getLogger("EEDistScraper")
+logger = logging.getLogger("EEDistIngest")
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+if not DATA_DIR.exists():
+    DATA_DIR = ROOT_DIR / "data"
+
+INCOMING_DIR = DATA_DIR / "catalogs" / "wholesale_catalogs" / "incoming"
+INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV = INCOMING_DIR / "EEDistribution_Catalog.csv"
+REJECT_LOG_CSV = DATA_DIR / "reports" / "ee_marketplace_restricted_skipped.csv"
+REJECT_LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
+BLOCKLIST_PATH = DATA_DIR / "ip_blocklist.json"
 
 BASE_URL = "https://www.eedistribution.com"
 LOGIN_URL = f"{BASE_URL}/Login"
 
-DEFAULT_INDEXED_DIR = Path(os.getenv("INDEXED_CATALOG_DIR", "/app/data/catalogs/wholesale_catalogs/indexed"))
-if not DEFAULT_INDEXED_DIR.parent.exists():
-    DEFAULT_INDEXED_DIR = ROOT_DIR / "data" / "catalogs" / "wholesale_catalogs" / "indexed"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-DEFAULT_BLOCKLIST_PATH = Path(os.getenv("IP_BLOCKLIST_PATH", "/app/data/ip_blocklist.json"))
-if not DEFAULT_BLOCKLIST_PATH.exists():
-    DEFAULT_BLOCKLIST_PATH = ROOT_DIR / "data" / "ip_blocklist.json"
-
-TARGET_BRAND_SLUGS = [
-    "funko",
-    "hasbro",
-    "mattel",
-    "bandai",
-    "mcfarlane-toys",
-    "neca",
-    "jazwares",
-    "spin-master",
-    "super7",
-    "diamond-select-toys",
+# Explicit phrases EE Distribution uses when a brand/SKU prohibits Amazon or 3rd-party sales
+EE_RESTRICTION_PATTERNS = [
+    r"not\s+(?:eligible|allowed|permitted|authorized)\s+(?:for|to\s+sell\s+on)\s+(?:amazon|3rd\s*party|third\s*party)",
+    r"no\s+(?:amazon|ebay|3rd\s*party|third\s*party|online\s+marketplace)",
+    r"prohibited\s+(?:from|on)\s+(?:amazon|ebay|3rd\s*party|third\s*party)",
+    r"restricted\s+(?:from|on)\s+(?:amazon|3rd\s*party|third\s*party)",
+    r"brick\s*(?:&|and)\s*mortar\s+only",
+    r"amazon\s+restriction",
+    r"3rd\s*party\s+marketplace\s+restriction",
+    r"cannot\s+be\s+sold\s+on\s+amazon",
 ]
 
 
 def load_blocked_brands() -> set:
-    if not DEFAULT_BLOCKLIST_PATH.exists():
+    if not BLOCKLIST_PATH.exists():
         return set()
     try:
-        raw = json.loads(DEFAULT_BLOCKLIST_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(BLOCKLIST_PATH.read_text(encoding="utf-8"))
         items = raw if isinstance(raw, list) else raw.get("brands", [])
         return {str(b).upper().strip() for b in items if b}
-    except Exception as exc:
-        logger.warning(f"Failed loading ip_blocklist.json: {exc}")
+    except Exception:
         return set()
 
 
-def clean_alnum(val: Any) -> str:
-    if val is None:
-        return ""
-    s = str(val).strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    return re.sub(r"[^A-Z0-9]", "", s.upper())
+def is_brand_blocked(brand: str, blocked: set) -> bool:
+    b = brand.upper().strip()
+    if not b or b in blocked:
+        return True
+    return any(blk in b or b in blk for blk in blocked if len(blk) >= 4)
 
 
-def parse_pack_qty(text: str) -> int:
-    if not text:
-        return 1
-    m = re.search(r"(?:case\s*of|pack\s*of|qty[:\s]*)(\d+)", text, re.IGNORECASE)
-    if m:
-        qty = int(m.group(1))
-        return qty if 1 <= qty <= 48 else 1
-    m2 = re.search(r"\b(\d+)[-\s]?pack\b", text, re.IGNORECASE)
-    if m2:
-        qty = int(m2.group(1))
-        return qty if 1 <= qty <= 48 else 1
-    return 1
-
-
-def parse_price(text: str) -> Optional[float]:
-    if not text:
-        return None
-    m = re.search(r"\$\s*([0-9,]+\.\d{2})", text)
-    if not m:
-        return None
-    return float(m.group(1).replace(",", ""))
-
-
-def authenticate_eedistribution(email: str, password: str) -> httpx.Client:
-    logger.info(f"Launching Playwright auth session for {email}...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            )
-        )
-        page = context.new_page()
-        page.goto(LOGIN_URL, wait_until="networkidle", timeout=45000)
-
-        page.locator("input[name*='Email'], input[type='email'], #Email").first.fill(email)
-        page.locator("input[name*='Password'], input[type='password'], #Password").first.fill(password)
-        page.locator("button[type='submit'], input[type='submit']").first.click()
-        page.wait_for_load_state("networkidle", timeout=45000)
-        time.sleep(2.0)
-
-        if "/login" in page.url.lower():
-            browser.close()
-            raise RuntimeError("EE Distribution login failed. Verify EE_DIST_EMAIL and EE_DIST_PASSWORD.")
-
-        cookies = context.cookies()
-        browser.close()
-
-    jar = httpx.Cookies()
-    for c in cookies:
-        jar.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
-
-    client = httpx.Client(
-        cookies=jar,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        follow_redirects=True,
-        timeout=30.0,
-    )
-    logger.info("Authenticated EE Distribution httpx session active.")
-    return client
-
-
-def parse_product_card(
-    card: BeautifulSoup,
-    default_brand: str,
-    est_freight_per_unit: float,
-    blocked_brands: set,
-) -> Optional[Dict[str, Any]]:
-    full_text = card.get_text(" ", strip=True)
-    upper_text = full_text.upper()
-
-    # Strictly filter to IN-STOCK items only
-    if any(flag in upper_text for flag in ("PRE-ORDER", "PREORDER", "COMING SOON", "SOLD OUT", "OUT OF STOCK", "BACKORDER")):
-        return None
-    if "IN STOCK" not in upper_text and "ADD TO CART" not in upper_text:
-        return None
-
-    link_el = card.select_one("a[href*='/Product/'], a.product-title, h2 a, h3 a")
-    if not link_el:
-        return None
-    title = link_el.get_text(" ", strip=True)
-    product_url = urljoin(BASE_URL, link_el.get("href", ""))
-
-    # 45-lb standard parcel guardrail (core/engine.py)
-    over_wt, _ = is_over_weight_limit(title=title)
-    if over_wt:
-        return None
-
-    brand_el = card.select_one(".brand, .manufacturer, [class*='brand']")
-    brand = (brand_el.get_text(" ", strip=True) if brand_el else default_brand.replace("-", " ").title()).strip()
-    if brand.upper() in blocked_brands:
-        return None
-
-    sku_match = re.search(r"(?:Item\s*#?|SKU[:\s]*)([A-Z0-9\-]{4,20})", full_text, re.IGNORECASE)
-    sku = sku_match.group(1).upper() if sku_match else product_url.rstrip("/").split("/")[-1].upper()
-
-    upc_match = re.search(r"\b(\d{12,13})\b", full_text)
-    upc = upc_match.group(1) if upc_match else ""
-
-    price_el = card.select_one(".price, .wholesale-price, .your-price, [class*='price']")
-    case_price = parse_price(price_el.get_text(" ", strip=True) if price_el else full_text)
-    if not case_price or case_price <= 0:
-        return None
-
-    pack_qty = parse_pack_qty(full_text)
-    unit_cost = round((case_price / pack_qty) + est_freight_per_unit, 2)
-    clean_m = clean_alnum(sku)
-
-    return {
-        "vendor": "EE DISTRIBUTION",
-        "brand": brand,
-        "title": title,
-        "sku": sku,
-        "mpn": sku,
-        "clean_mpn": clean_m,
-        "root_mpn": clean_m,
-        "upc_raw": upc,
-        "upc": upc,
-        "gtin14": upc.zfill(14) if upc else "",
-        "pack_qty": pack_qty,
-        "case_price": case_price,
-        "unit_cost": unit_cost,
-        "raw_cost": unit_cost,
-        "weight": 1.0,
-        "availability": "IN_STOCK",
-        "product_url": product_url,
-    }
-
-
-def enrich_detail_page(client: httpx.Client, item: Dict[str, Any], est_freight: float) -> Dict[str, Any]:
-    if item.get("upc") and item.get("pack_qty", 1) > 1:
-        return item
-    try:
-        time.sleep(random.uniform(1.2, 2.2))
-        resp = client.get(item["product_url"])
-        if resp.status_code != 200:
-            return item
-        soup = BeautifulSoup(resp.text, "html.parser")
-        body_text = soup.get_text(" ", strip=True)
-
-        upc_m = re.search(r"UPC[:\s#]*(\d{12,13})", body_text, re.IGNORECASE)
-        if upc_m:
-            u = upc_m.group(1)
-            item["upc_raw"] = u
-            item["upc"] = u
-            item["gtin14"] = u.zfill(14)
-
-        mpn_m = re.search(r"(?:Manufacturer\s*#?|MPN[:\s]*)([A-Z0-9\-]{3,25})", body_text, re.IGNORECASE)
-        if mpn_m:
-            mpn_val = mpn_m.group(1).upper()
-            item["mpn"] = mpn_val
-            item["clean_mpn"] = clean_alnum(mpn_val)
-            item["root_mpn"] = clean_alnum(mpn_val)
-
-        pack_qty = parse_pack_qty(body_text)
-        if pack_qty > 1:
-            item["pack_qty"] = pack_qty
-            item["unit_cost"] = round((item["case_price"] / pack_qty) + est_freight, 2)
-            item["raw_cost"] = item["unit_cost"]
-    except Exception as exc:
-        logger.debug(f"Detail enrichment notice for {item['sku']}: {exc}")
-    return item
-
-
-def scrape_ee_catalog(
-    brands: List[str],
-    max_pages: int = 4,
-    est_freight_per_unit: float = 0.85,
-    enrich_missing_upc: bool = True,
-    output_parquet: Optional[Path] = None,
-) -> Path:
+def create_authenticated_session() -> requests.Session:
     email = os.getenv("EE_DIST_EMAIL", "").strip()
     password = os.getenv("EE_DIST_PASSWORD", "").strip()
     if not email or not password:
-        raise EnvironmentError("Missing EE_DIST_EMAIL or EE_DIST_PASSWORD in .env / Railway environment.")
+        raise RuntimeError("Missing EE_DIST_EMAIL or EE_DIST_PASSWORD in environment variables.")
 
-    blocked_brands = load_blocked_brands()
-    client = authenticate_eedistribution(email, password)
-    all_rows: List[Dict[str, Any]] = []
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    try:
-        for slug in brands:
-            for page_num in range(1, max_pages + 1):
-                url = f"{BASE_URL}/Brand/{slug}?inStockOnly=true&page={page_num}"
-                logger.info(f"Scraping {slug} page {page_num}: {url}")
-                resp = client.get(url)
-                if resp.status_code != 200:
-                    logger.warning(f"Stopping {slug} at page {page_num} (HTTP {resp.status_code})")
-                    break
+    # Fetch login page to capture hidden anti-forgery / ASP.NET form tokens
+    resp = session.get(LOGIN_URL, timeout=20)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    payload: Dict[str, str] = {}
+    for inp in soup.find_all("input"):
+        name = inp.get("name")
+        if name:
+            payload[name] = inp.get("value", "")
 
-                soup = BeautifulSoup(resp.text, "html.parser")
-                cards = soup.select(".product-item, .product-card, .item-box, [data-product-id]")
-                if not cards:
-                    break
+    # Populate common EE Distribution login field names
+    payload["Email"] = email
+    payload["Password"] = password
+    payload["email"] = email
+    payload["password"] = password
+    payload["RememberMe"] = "true"
 
-                page_hits = 0
-                for card in cards:
-                    parsed = parse_product_card(card, slug, est_freight_per_unit, blocked_brands)
-                    if not parsed:
-                        continue
-                    if enrich_missing_upc and not parsed.get("upc"):
-                        parsed = enrich_detail_page(client, parsed, est_freight_per_unit)
-                    if parsed.get("upc") or parsed.get("clean_mpn"):
-                        all_rows.append(parsed)
-                        page_hits += 1
+    post_resp = session.post(LOGIN_URL, data=payload, timeout=20, allow_redirects=True)
+    if "logout" not in post_resp.text.lower() and "my account" not in post_resp.text.lower():
+        logger.warning("EE Distribution login response did not show 'Logout' — verify credentials if prices are hidden.")
+    else:
+        logger.info("Authenticated EE Distribution wholesale session active.")
+    return session
 
-                logger.info(f"{slug} page {page_num}: captured {page_hits} in-stock items.")
-                time.sleep(random.uniform(1.5, 2.8))
-    finally:
-        client.close()
 
-    DEFAULT_INDEXED_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = output_parquet or (DEFAULT_INDEXED_DIR / "ee_distribution_normalized.parquet")
+def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tuple[bool, str]:
+    """
+    Inspects the EE Distribution product page for any Amazon, eBay, or 3rd-party
+    marketplace selling prohibition. Returns (is_allowed, reason).
+    """
+    # 1. Check dedicated restriction badge / alert containers first
+    alert_selectors = [
+        ".restriction", ".restrictions", ".marketplace-restriction",
+        ".product-restrictions", ".alert-warning", ".alert-danger",
+        "[class*='restrict']", "[id*='restrict']", "[data-restriction]"
+    ]
+    for sel in alert_selectors:
+        for el in soup.select(sel):
+            txt = " ".join(el.get_text(" ", strip=True).split())
+            if not txt:
+                continue
+            for pat in EE_RESTRICTION_PATTERNS:
+                if re.search(pat, txt, re.IGNORECASE):
+                    return False, f"Badge/Alert: {txt[:120]}"
 
-    if not all_rows:
-        logger.warning("No new in-stock rows scraped; existing Parquet left untouched.")
-        return out_path
+    # 2. Check product specification rows (e.g., "3rd Party Allowed: No" / "Amazon: Restricted")
+    for row in soup.select("tr, li, .spec-row, .product-attribute"):
+        row_txt = " ".join(row.get_text(" ", strip=True).split())
+        if len(row_txt) > 220:
+            continue
+        if re.search(r"\b(?:amazon|3rd\s*party|third\s*party|marketplace)\b", row_txt, re.IGNORECASE):
+            if re.search(r"\b(?:no|not\s+allowed|prohibited|restricted|blocked|ineligible)\b", row_txt, re.IGNORECASE):
+                return False, f"Spec Attribute: {row_txt[:120]}"
 
-    df_new = pd.DataFrame(all_rows)
-    if out_path.exists():
+    # 3. Full-page scan against explicit EE Distribution restriction phrases
+    visible_text = " ".join(soup.get_text(" ", strip=True).split())
+    for pat in EE_RESTRICTION_PATTERNS:
+        m = re.search(pat, visible_text, re.IGNORECASE)
+        if m:
+            start = max(0, m.start() - 30)
+            end = min(len(visible_text), m.end() + 50)
+            return False, f"Page Notice: {visible_text[start:end]}"
+
+    # 4. Check structured JSON / data attributes embedded in page scripts
+    if re.search(r'"(?:amazonRestricted|thirdPartyRestricted|noAmazon)"\s*:\s*true', raw_html, re.IGNORECASE):
+        return False, "JSON Flag: thirdPartyRestricted=true"
+
+    return True, "ALLOWED_3RD_PARTY"
+
+
+def discover_brand_product_urls(session: requests.Session, brand_slug: str, max_pages: int = 4) -> List[str]:
+    urls: List[str] = []
+    for page in range(1, max_pages + 1):
+        list_url = f"{BASE_URL}/s/{brand_slug}?instock=1&page={page}"
         try:
-            df_old = pd.read_parquet(out_path)
-            df_new = pd.concat([df_old, df_new], ignore_index=True).drop_duplicates(subset=["sku"], keep="last")
+            r = session.get(list_url, timeout=20)
+            if r.status_code != 200:
+                break
+            soup = BeautifulSoup(r.text, "html.parser")
+            found_on_page = 0
+            for a in soup.select("a[href*='/p/'], a.product-title, .product-item a"):
+                href = a.get("href", "").strip()
+                if "/p/" in href:
+                    full = urljoin(BASE_URL, href.split("?")[0])
+                    if full not in urls:
+                        urls.append(full)
+                        found_on_page += 1
+            if found_on_page == 0:
+                break
+            time.sleep(0.4)
         except Exception as exc:
-            logger.warning(f"Could not merge existing {out_path.name}: {exc}")
-
-    df_new.to_parquet(out_path, index=False)
-    logger.info(f"Saved {len(df_new):,} normalized EE Distribution SKUs to {out_path}")
-    return out_path
+            logger.warning(f"Listing scan error ({list_url}): {exc}")
+            break
+    return urls
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Scrape In-Stock EE Distribution catalog into normalized Parquet.")
-    parser.add_argument("--brands", nargs="*", default=TARGET_BRAND_SLUGS, help="EE Distribution brand slugs")
-    parser.add_argument("--max-pages", type=int, default=4, help="Max pages per brand")
-    parser.add_argument("--freight-per-unit", type=float, default=0.85, help="Estimated inbound freight/unit ($)")
-    parser.add_argument("--no-detail-enrich", action="store_true", help="Skip detail page lookups for missing UPCs")
-    args = parser.parse_args()
+def parse_ee_product_page(
+    url: str,
+    session: requests.Session,
+    blocked_brands: set,
+    freight_per_unit: float
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
+    """
+    Fetches and parses a single EE Distribution product page.
+    Returns (valid_record, None) if eligible, or (None, reject_record) if blocked/restricted.
+    """
+    try:
+        resp = session.get(url, timeout=20)
+        if resp.status_code != 200:
+            return None, None
 
-    scrape_ee_catalog(
-        brands=args.brands,
-        max_pages=args.max_pages,
-        est_freight_per_unit=args.freight_per_unit,
-        enrich_missing_upc=not args.no_detail_enrich,
-    )
+        raw_html = resp.text
+        soup = BeautifulSoup(raw_html, "html.parser")
+
+        # 1. Verify In-Stock status
+        page_upper = soup.get_text(" ", strip=True).upper()
+        if "OUT OF STOCK" in page_upper and "IN STOCK" not in page_upper:
+            return None, None
+
+        # 2. Mandatory EE Distribution 3rd-Party / Amazon Restriction Check
+        allowed, reason = check_ee_marketplace_eligibility(soup, raw_html)
+        if not allowed:
+            sku_guess = url.rstrip("/").split("/")[-1]
+            return None, {"sku": sku_guess, "url": url, "reason": reason}
+
+        # 3. Extract product details via JSON-LD + PDP selectors
+        title, brand, mpn, upc, raw_price = "", "", "", "", 0.0
+        for script in soup.find_all("script", type="application/ld+json"):
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                items = data if isinstance(data, list) else [data]
+                for it in items:
+                    if isinstance(it, dict) and it.get("@type") == "Product":
+                        title = str(it.get("name", "")).strip()
+                        b_val = it.get("brand", "")
+                        brand = str(b_val.get("name") if isinstance(b_val, dict) else b_val or "").strip()
+                        mpn = str(it.get("sku") or it.get("mpn") or "").strip()
+                        raw_upc = str(it.get("gtin12") or it.get("gtin13") or it.get("upc") or "")
+                        upc = re.sub(r"\D", "", raw_upc)
+                        offers = it.get("offers", {})
+                        if isinstance(offers, dict):
+                            raw_price = float(offers.get("price", 0.0) or 0.0)
+                        elif isinstance(offers, list) and offers:
+                            raw_price = float(offers[0].get("price", 0.0) or 0.0)
+                        break
+            except Exception:
+                continue
+
+        if not title:
+            h1 = soup.find("h1")
+            title = h1.get_text(strip=True) if h1 else ""
+
+        if not brand:
+            b_el = soup.select_one(".brand-name, [itemprop='brand'], .manufacturer")
+            brand = b_el.get_text(strip=True) if b_el else ""
+
+        if not brand or is_brand_blocked(brand, blocked_brands):
+            return None, None
+
+        if raw_price <= 0:
+            p_el = soup.select_one(".your-price, .wholesale-price, .product-price, [data-price]")
+            if p_el:
+                m = re.search(r"\$([0-9,]+\.[0-9]{2})", p_el.get_text())
+                if m:
+                    raw_price = float(m.group(1).replace(",", ""))
+
+        if not upc:
+            m_upc = re.search(r"\b(?:UPC|GTIN)[:\s#]*([0-9]{12,13})\b", raw_html, re.IGNORECASE)
+            if m_upc:
+                upc = m_upc.group(1)
+
+        if not mpn:
+            m_sku = re.search(r"\b(?:Item|SKU|Model)\s*#?\s*:?\s*([A-Za-z0-9_-]+)\b", raw_html, re.IGNORECASE)
+            mpn = m_sku.group(1) if m_sku else url.rstrip("/").split("/")[-1].upper()
+
+        if not title or raw_price <= 0:
+            return None, None
+
+        # 4. Enforce 45-lb parcel limit
+        m_wt = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:lbs?|pounds?)\b", raw_html, re.IGNORECASE)
+        if m_wt and float(m_wt.group(1)) > 45.0:
+            return None, None
+
+        # 5. Detect Case Pack Qty and calculate true per-unit COGS
+        pack_qty = 1
+        m_case = re.search(
+            r"(?:case\s*(?:of|pack|qty)|master\s*carton|pack\s*of)\s*:?\s*(\d+)|\b(\d+)\s*(?:pcs|pieces|units)\s*/\s*case\b",
+            f"{title} {soup.get_text(' ', strip=True)[:1500]}",
+            re.IGNORECASE,
+        )
+        if m_case:
+            qty_val = int(m_case.group(1) or m_case.group(2))
+            if 1 < qty_val <= 48:
+                pack_qty = qty_val
+
+        unit_cogs = round((raw_price / pack_qty) + freight_per_unit, 2)
+
+        return {
+            "vendor": "EE DISTRIBUTION",
+            "brand": brand.upper(),
+            "mpn": mpn.upper(),
+            "upc": upc if len(upc) in (12, 13) else "",
+            "title": title[:180],
+            "wholesale_cost": unit_cogs,
+            "case_cost": round(raw_price, 2),
+            "uom": "EA",
+            "pack_qty": pack_qty,
+            "marketplace_status": "ALLOWED_3RD_PARTY",
+            "direct_url": url,
+        }, None
+    except Exception:
+        return None, None
+
+
+def run_ee_ingestion(brands: List[str], max_pages: int = 4, freight_per_unit: float = 0.85) -> int:
+    session = create_authenticated_session()
+    blocked_brands = load_blocked_brands()
+
+    all_urls: List[str] = []
+    for b in brands:
+        logger.info(f"Scanning EE Distribution In-Stock listings for brand: {b}")
+        b_urls = discover_brand_product_urls(session, b, max_pages=max_pages)
+        logger.info(f"  -> Found {len(b_urls)} product URLs for '{b}'")
+        all_urls.extend(b_urls)
+
+    all_urls = list(dict.fromkeys(all_urls))
+    logger.info(f"Inspecting {len(all_urls)} total EE Distribution product pages for 3rd-party eligibility & COGS...")
+
+    approved_records: List[Dict[str, Any]] = []
+    rejected_records: List[Dict[str, str]] = []
+
+    for url in all_urls:
+        rec, rej = parse_ee_product_page(url, session, blocked_brands, freight_per_unit)
+        if rec:
+            approved_records.append(rec)
+            if len(approved_records) % 25 == 0:
+                logger.info(f"Verified {len(approved_records)} Amazon-eligible EE SKUs...")
+        elif rej:
+            rejected_records.append(rej)
+            logger.info(f"[SKIPPED - 3RD PARTY RESTRICTED] {rej['sku']} -> {rej['reason']}")
+        time.sleep(0.35)
+
+    if rejected_records:
+        pd.DataFrame(rejected_records).to_csv(REJECT_LOG_CSV, index=False)
+        logger.info(f"Logged {len(rejected_records)} EE 3rd-party restricted SKUs -> {REJECT_LOG_CSV.name}")
+
+    if not approved_records:
+        logger.warning("No Amazon-eligible EE Distribution SKUs extracted.")
+        return 0
+
+    df = pd.DataFrame(approved_records).drop_duplicates(subset=["mpn"])
+    df.to_csv(OUT_CSV, index=False)
+    logger.info(f"Exported {len(df)} Amazon-eligible EE Distribution SKUs -> {OUT_CSV}")
+    return len(df)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper with Marketplace Gate")
+    parser.add_argument(
+        "--brands",
+        nargs="+",
+        default=["funko", "hasbro", "mattel", "bandai", "mcfarlane-toys", "neca"],
+        help="Brand slugs to crawl on eedistribution.com"
+    )
+    parser.add_argument("--max-pages", type=int, default=4, help="Max pagination pages per brand")
+    parser.add_argument("--freight-per-unit", type=float, default=0.85, help="Estimated inbound freight per unit")
+    args = parser.parse_args()
+
+    count = run_ee_ingestion(
+        brands=args.brands,
+        max_pages=args.max_pages,
+        freight_per_unit=args.freight_per_unit
+    )
+    sys.exit(0 if count > 0 else 1)
