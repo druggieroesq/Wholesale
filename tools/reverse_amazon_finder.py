@@ -1,46 +1,8 @@
-
-# ==============================================================================
-# ACCESSORY MISMATCH & EXTREME ROI (>800%) FLOOR SHIELD
-# ==============================================================================
-ACCESSORY_TOKENS = {
-    'bracket', 'screw', 'screws', 'bolt', 'bolts', 'gasket', 'seal', 
-    'plate', 'cover', 'adapter', 'harness', 'hardware kit', 'mounting kit',
-    'faceplate', 'strike', 'shim', 'clip', 'spring', 'spacer'
-}
-
-PRIMARY_EQUIPMENT_TOKENS = {
-    'closer', 'motor', 'pump', 'actuator', 'compressor', 'tool', 'drill',
-    'saw', 'sensor', 'detector', 'lockset', 'exit device', 'valve'
-}
-
-def is_accessory_mismatch(amz_title: str, dist_title: str, cogs: float, bb: float) -> tuple[bool, str]:
-    cogs = float(cogs or 0.0)
-    bb = float(bb or 0.0)
-    
-    # 1. Price Floor Ratio Check for items > 5
-    if bb > 25.0 and cogs > 0:
-        cost_ratio = cogs / bb
-        if cost_ratio < 0.18:
-            return True, f'SUB_FLOOR_COST_RATIO ({cost_ratio:.1%} < 18% floor | Potential accessory mismatch)'
-
-    # 2. Equipment vs Accessory Token Check
-    amz_t = str(amz_title).lower()
-    dist_t = str(dist_title).lower()
-    
-    has_amz_equip = any(eq in amz_t for eq in PRIMARY_EQUIPMENT_TOKENS)
-    has_dist_accessory = any(acc in dist_t for acc in ACCESSORY_TOKENS)
-    has_amz_accessory = any(acc in amz_t for acc in ACCESSORY_TOKENS)
-    
-    if has_amz_equip and has_dist_accessory and not has_amz_accessory:
-        return True, 'ACCESSORY_MISMATCH (Distributor title matches accessory token but Amazon listing is parent equipment)'
-        
-    return False, 'VALID'
-
 #!/usr/bin/env python3
 """
 tools/reverse_amazon_finder.py
 ------------------------------
-Reverse Amazon Hunter & Autonomous Sourcing Daemon (v16.7 Continuous Velocity Master).
+Reverse Amazon Hunter & Autonomous Sourcing Daemon (v16.8 Suppressed-BuyBox & Private-Label Shield).
 """
 
 import os
@@ -54,7 +16,7 @@ import sqlite3
 import html
 from contextlib import closing
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, Tuple
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -105,6 +67,20 @@ STRICT_MAX_WHOLESALE_COST = 65.00
 MIN_REVIEW_RATING = 3.8
 MAX_SEARCH_PAGE_DEPTH = 100
 
+# ==============================================================================
+# ACCESSORY MISMATCH & EXTREME ROI FLOOR SHIELD
+# ==============================================================================
+ACCESSORY_TOKENS = {
+    'bracket', 'screw', 'screws', 'bolt', 'bolts', 'gasket', 'seal',
+    'plate', 'cover', 'adapter', 'harness', 'hardware kit', 'mounting kit',
+    'faceplate', 'strike', 'shim', 'clip', 'spring', 'spacer'
+}
+
+PRIMARY_EQUIPMENT_TOKENS = {
+    'closer', 'motor', 'pump', 'actuator', 'compressor', 'tool', 'drill',
+    'saw', 'sensor', 'detector', 'lockset', 'exit device', 'valve'
+}
+
 DATED_RE = re.compile(
     r"\b(calendar|planner|agenda|dated|desk pad calendar|wall calendar|"
     r"weekly planner|monthly planner|daily planner|academic year|fiscal year|"
@@ -130,11 +106,83 @@ SECTOR_DEFINITIONS: Dict[int, Dict[str, Any]] = {
 }
 
 SEARCH_SLICES = [
-    {"price_min": 25, "price_max": 95, "bsr_min": 500, "bsr_max": 15000, "min_sellers": 0, "max_sellers": 4, "sort": "salesRankDrops30", "asc": False},
-    {"price_min": 20, "price_max": 80, "bsr_min": 15001, "bsr_max": 35000, "min_sellers": 0, "max_sellers": 4, "sort": "salesRankDrops30", "asc": False},
-    {"price_min": 18, "price_max": 60, "bsr_min": 35001, "bsr_max": 60000, "min_sellers": 0, "max_sellers": 3, "sort": "salesRankDrops30", "asc": False},
-    {"price_min": 65, "price_max": 160, "bsr_min": 1000, "bsr_max": 40000, "min_sellers": 0, "max_sellers": 5, "sort": "salesRankDrops90", "asc": False}
+    {"price_min": 25, "price_max": 95, "bsr_min": 500, "bsr_max": 15000, "min_sellers": 2, "max_sellers": 5, "sort": "salesRankDrops30", "asc": False},
+    {"price_min": 20, "price_max": 80, "bsr_min": 15001, "bsr_max": 35000, "min_sellers": 2, "max_sellers": 5, "sort": "salesRankDrops30", "asc": False},
+    {"price_min": 18, "price_max": 60, "bsr_min": 35001, "bsr_max": 60000, "min_sellers": 2, "max_sellers": 4, "sort": "salesRankDrops30", "asc": False},
+    {"price_min": 65, "price_max": 160, "bsr_min": 1000, "bsr_max": 40000, "min_sellers": 2, "max_sellers": 6, "sort": "salesRankDrops90", "asc": False}
 ]
+
+
+def is_accessory_mismatch(amz_title: str, dist_title: str, cogs: float, bb: float) -> Tuple[bool, str]:
+    cogs = float(cogs or 0.0)
+    bb = float(bb or 0.0)
+
+    # 1. Price Floor Ratio Check for items > $25
+    if bb > 25.0 and cogs > 0:
+        cost_ratio = cogs / bb
+        if cost_ratio < 0.22:
+            return True, f"SUB_FLOOR_COST_RATIO ({cost_ratio:.1%} < 22% floor | Potential accessory mismatch)"
+
+    # 2. Equipment vs Accessory Token Check
+    amz_t = str(amz_title).lower()
+    dist_t = str(dist_title).lower()
+
+    has_amz_equip = any(eq in amz_t for eq in PRIMARY_EQUIPMENT_TOKENS)
+    has_dist_accessory = any(acc in dist_t for acc in ACCESSORY_TOKENS)
+    has_amz_accessory = any(acc in amz_t for acc in ACCESSORY_TOKENS)
+
+    if has_amz_equip and has_dist_accessory and not has_amz_accessory:
+        return True, "ACCESSORY_MISMATCH (Distributor title matches accessory token but Amazon listing is parent equipment)"
+
+    return False, "VALID"
+
+
+def validate_real_buybox_and_brand_safety(
+    current_bb: float,
+    avg90_bb: float,
+    lowest_fba: float,
+    lowest_fbm: float,
+    fba_sellers: int,
+    total_sellers: int,
+    brand: str
+) -> Tuple[bool, float, str]:
+    """
+    Eliminates phantom '0-FBA Prime Steal' hallucinations caused by suppressed Buy Boxes
+    and blocks single-seller private-label IP traps (e.g., OSLTWI / B0GFTK78F2).
+    Returns: (is_valid, true_effective_price, status_reason)
+    """
+    if not brand or str(brand).strip().upper() in ("", "UNKNOWN", "GENERIC", "N/A"):
+        return False, 0.0, "MISSING_OR_GENERIC_BRAND"
+
+    # 1. Block Single-Seller Private-Label Traps (< 2 FBA sellers or <= 2 total sellers with 0 FBA)
+    if fba_sellers < 2:
+        return False, 0.0, f"SINGLE_SELLER_PRIVATE_LABEL_TRAP (FBA sellers: {fba_sellers} < 2)"
+
+    if fba_sellers == 0 and total_sellers <= 2:
+        return False, 0.0, "SINGLE_SELLER_PRIVATE_LABEL_TRAP (0 FBA & <=2 total sellers)"
+
+    # 2. Require an active, unsuppressed Buy Box or real active FBA/FBM offer (never fall back to MSRP)
+    if current_bb <= 0 and lowest_fba <= 0:
+        return False, 0.0, "BUYBOX_SUPPRESSED_NO_ACTIVE_FBA_OFFER"
+
+    active_offers = [p for p in (current_bb, lowest_fba, lowest_fbm) if p and p > 0]
+    if not active_offers:
+        return False, 0.0, "NO_ACTIVE_OFFERS_BUYBOX_SUPPRESSED"
+
+    # Anchor strictly to the lowest real active offer
+    real_market_price = min(active_offers)
+
+    # 3. Detect Suppressed Buy Box Price Spike (active offer > 35% above 90-day Buy Box average)
+    if avg90_bb and avg90_bb > 0 and real_market_price > (avg90_bb * 1.35):
+        return False, 0.0, f"SUPPRESSED_BUYBOX_PRICE_SPIKE (${real_market_price:.2f} vs 90d ${avg90_bb:.2f})"
+
+    # If 90d average exists and is lower than current active offer, use conservative min(real_market_price, avg90_bb)
+    if avg90_bb and avg90_bb > 0:
+        effective_price = min(real_market_price, avg90_bb)
+    else:
+        effective_price = real_market_price
+
+    return True, round(effective_price, 2), "VERIFIED_ACTIVE_BUYBOX"
 
 
 def acquire_singleton_lock():
@@ -148,7 +196,8 @@ def acquire_singleton_lock():
 
 
 def clean_brand_name(brand: str) -> str:
-    if not brand: return ""
+    if not brand:
+        return ""
     b = str(brand).upper().strip()
     b = re.sub(r'[^A-Z0-9\s]', ' ', b)
     b = re.sub(r'\b(LLC|INC|CORP|CORPORATION|CO|COMPANY|LTD|HOLDINGS|USA|ENTERPRISES)\b', '', b)
@@ -156,7 +205,8 @@ def clean_brand_name(brand: str) -> str:
 
 
 def extract_root_mpn(mpn: str) -> str:
-    if not mpn: return ""
+    if not mpn:
+        return ""
     clean = re.sub(r'[^A-Z0-9]', '', str(mpn).upper().strip())
     return clean.lstrip('0') or clean
 
@@ -171,7 +221,7 @@ def normalize_barcode(code: str) -> str:
 def parse_pack_quantity(text: str, keepa_product: Optional[Dict[str, Any]] = None) -> int:
     if keepa_product:
         kp_qty = keepa_product.get("packageQuantity") or keepa_product.get("numberOfItems")
-        if kp_qty and isinstance(kp_qty, int) and 1 < kp_qty <= 100:
+        if kp_qty and isinstance(kp_qty, int) and 1 < kp_qty <= 48:
             return kp_qty
 
     if not text:
@@ -181,17 +231,20 @@ def parse_pack_quantity(text: str, keepa_product: Optional[Dict[str, Any]] = Non
     m_pack = re.search(r'\b(?:pack|pk|box|case|set|bundle|lot)\s*(?:of|-|–|\s)\s*([0-9]{1,3})\b', t)
     if m_pack:
         val = int(m_pack.group(1))
-        if 1 < val <= 100: return val
+        if 1 < val <= 48:
+            return val
 
     m_hyphen = re.search(r'\b([0-9]{1,3})\s*(?:-|–|\s)?\s*(?:pack|pk|piece|pc|count|ct|bundle)\b', t)
     if m_hyphen:
         val = int(m_hyphen.group(1))
-        if 1 < val <= 100: return val
+        if 1 < val <= 48:
+            return val
 
     m_lead = re.search(r'\b([2-9]|1[0-2])\s*[xX]\s+[a-zA-Z0-9]', t)
     if m_lead:
         val = int(m_lead.group(1))
-        if 1 < val <= 24: return val
+        if 1 < val <= 24:
+            return val
 
     if re.search(r'\b(?:pair|two pack|2-pack|twin pack|double pack)\b', t):
         return 2
@@ -259,10 +312,11 @@ class DatabaseManager:
             cur = conn.cursor()
             cur.execute("SELECT status, last_evaluated FROM candidate_cache WHERE asin = ?", (asin,))
             row = cur.fetchone()
-            if not row: return True
+            if not row:
+                return True
             status = row["status"]
             elapsed = now - (row["last_evaluated"] or 0)
-            if status in ("STRUCTURAL_REJECT", "POOR_REVIEWS", "OVERWEIGHT", "EXPENSIVE_BUY", "RESTRICTED_BRAND"):
+            if status in ("STRUCTURAL_REJECT", "POOR_REVIEWS", "OVERWEIGHT", "EXPENSIVE_BUY", "RESTRICTED_BRAND", "PRIVATE_LABEL_TRAP"):
                 return elapsed > (30 * 86400)
             return elapsed > (3 * 86400)
 
@@ -351,25 +405,39 @@ class IndustrialCatalogEngine:
                 df = pd.read_parquet(cat_file) if cat_file.suffix == ".parquet" else pd.read_csv(cat_file, low_memory=False, dtype=str)
                 cols = {str(c).lower().strip(): c for c in df.columns}
                 upc_col = cols.get("gtin14") or cols.get("upc") or cols.get("barcode")
-                sku_col = cols.get("clean_mpn") or cols.get("sku") or cols.get("part_number") or cols.get("item_number")
+                sku_col = cols.get("clean_mpn") or cols.get("sku") or cols.get("part_number") or cols.get("item_number") or cols.get("mpn")
                 cost_col = cols.get("unit_cost") or cols.get("wholesale_cost") or cols.get("cost")
                 brand_col = cols.get("brand") or cols.get("manufacturer")
+                title_col = cols.get("title") or cols.get("product_title") or cols.get("description")
 
-                if not cost_col: continue
+                if not cost_col:
+                    continue
 
                 for _, row in df.iterrows():
                     raw_val = row.get(cost_col)
-                    if pd.isna(raw_val): continue
-                    try: cost = float(str(raw_val).replace("$", "").replace(",", "").strip())
-                    except ValueError: continue
-                    if cost <= 0: continue
+                    if pd.isna(raw_val):
+                        continue
+                    try:
+                        cost = float(str(raw_val).replace("$", "").replace(",", "").strip())
+                    except ValueError:
+                        continue
+                    if cost <= 0:
+                        continue
 
                     brand_clean = clean_brand_name(str(row.get(brand_col, vendor_name)))
-                    entry = {"vendor": vendor_name, "tier": tier, "unit_cost": cost, "brand": brand_clean}
+                    dist_title = str(row.get(title_col, "")).strip() if title_col else ""
+                    entry = {
+                        "vendor": vendor_name,
+                        "tier": tier,
+                        "unit_cost": cost,
+                        "brand": brand_clean,
+                        "dist_title": dist_title,
+                    }
 
                     if upc_col and pd.notna(row.get(upc_col)):
                         norm = normalize_barcode(row[upc_col])
-                        if norm: self.catalog_barcodes[norm] = entry
+                        if norm:
+                            self.catalog_barcodes[norm] = entry
 
                     sku_raw = str(row.get(sku_col, "")).strip().upper()
                     root_val = extract_root_mpn(sku_raw)
@@ -382,9 +450,7 @@ class IndustrialCatalogEngine:
         logger.info(f"Strict Index ready: {len(self.catalog_barcodes):,} barcodes | {len(self.catalog_brand_mpns):,} brand-coupled MPNs.")
 
     def match(self, codes: List[str], brand: str, part_num: str) -> Optional[Dict[str, Any]]:
-        # GUARD: Reject uncoupled short numeric MPNs (e.g. '8511') without brand match
         if part_num and str(part_num).strip().isdigit() and len(str(part_num).strip()) <= 5:
-            # Allow only if we have high-confidence barcode or brand identity
             if not codes and not brand:
                 return None
         for c in codes:
@@ -422,21 +488,11 @@ class ReverseAmazonHunter:
 
     def is_brand_blocked(self, brand: str) -> bool:
         clean = clean_brand_name(brand)
-        if not clean: return True
+        if not clean:
+            return True
         return clean in self.blocked_brands
 
     def evaluate_product(self, product: Dict[str, Any], sector_id: int) -> Optional[Dict[str, Any]]:
-        # GUARD: 22% Price Floor & Short MPN Collision Shield
-        try:
-            _bb = float(product.get('current_bb') or product.get('buy_box') or product.get('price') or 0)
-            _cost = float(product.get('wholesale_cost') or product.get('cost') or 0)
-            _mpn = str(product.get('mpn') or product.get('part_number') or '').strip()
-            if _bb > 25.0 and _cost > 0 and (_cost / _bb) < 0.22:
-                return None
-            if _mpn.isdigit() and len(_mpn) <= 5 and _bb > 0 and (_cost / _bb) < 0.25:
-                return None
-        except Exception:
-            pass
         asin = product.get("asin", "")
         title = product.get("title") or ""
         brand = (product.get("brand") or "").strip()
@@ -451,6 +507,8 @@ class ReverseAmazonHunter:
 
         stats = product.get("stats") or {}
         current_prices = stats.get("current") or []
+        avg90_prices = stats.get("avg90") or []
+
         rating_val = current_prices[16] / 10.0 if len(current_prices) > 16 and current_prices[16] and current_prices[16] > 0 else 4.0
         if rating_val < MIN_REVIEW_RATING:
             return None
@@ -458,7 +516,7 @@ class ReverseAmazonHunter:
         keepa_monthly_sold = product.get("monthlySold") or 0
         drops_90 = stats.get("salesRankDrops90") or 0
         drops_30 = stats.get("salesRankDrops30") or 0
-        current_bsr = current_prices[3] if len(current_prices) > 3 and current_prices[3] and current_prices[3] > 0 else (stats.get("avg90") or [0,0,0,0])[3]
+        current_bsr = current_prices[3] if len(current_prices) > 3 and current_prices[3] and current_prices[3] > 0 else (avg90_prices[3] if len(avg90_prices) > 3 else 0)
 
         monthly_units = calculate_continuous_velocity(
             sales_rank=current_bsr,
@@ -475,16 +533,39 @@ class ReverseAmazonHunter:
         if weight_lbs > STRICT_MAX_WEIGHT_LBS:
             return None
 
-        avg90_prices = stats.get("avg90") or []
-        effective_bb_cents = avg90_prices[18] if len(avg90_prices) > 18 and avg90_prices[18] and avg90_prices[18] > 0 else current_prices[18]
-        if not effective_bb_cents or effective_bb_cents <= 0: return None
-        buy_box_price = round(effective_bb_cents / 100.0, 2)
-        if buy_box_price < 13.50: return None
+        # Extract real active offers (cents -> dollars), NEVER falling back to MSRP
+        curr_bb_cents = current_prices[18] if len(current_prices) > 18 and current_prices[18] and current_prices[18] > 0 else 0
+        avg90_bb_cents = avg90_prices[18] if len(avg90_prices) > 18 and avg90_prices[18] and avg90_prices[18] > 0 else 0
+        lowest_fba_cents = current_prices[10] if len(current_prices) > 10 and current_prices[10] and current_prices[10] > 0 else 0
+        lowest_fbm_cents = current_prices[7] if len(current_prices) > 7 and current_prices[7] and current_prices[7] > 0 else 0
+
+        current_bb = round(curr_bb_cents / 100.0, 2)
+        avg90_bb = round(avg90_bb_cents / 100.0, 2)
+        lowest_fba = round(lowest_fba_cents / 100.0, 2)
+        lowest_fbm = round(lowest_fbm_cents / 100.0, 2)
 
         fba_stat = current_prices[11] if len(current_prices) > 11 and current_prices[11] is not None and current_prices[11] >= 0 else 0
         offers = product.get("offers") or []
         offers_fba = sum(1 for o in offers if o.get("isFBA") and o.get("condition") == 1)
         competitive_fba = max(fba_stat, offers_fba)
+        total_sellers = current_prices[11] if len(current_prices) > 11 and current_prices[11] and current_prices[11] > 0 else len(offers)
+
+        # Enforce Suppressed Buy Box & Single-Seller Private-Label Trap Shield
+        is_bb_safe, buy_box_price, bb_reason = validate_real_buybox_and_brand_safety(
+            current_bb=current_bb,
+            avg90_bb=avg90_bb,
+            lowest_fba=lowest_fba,
+            lowest_fbm=lowest_fbm,
+            fba_sellers=competitive_fba,
+            total_sellers=total_sellers,
+            brand=brand
+        )
+        if not is_bb_safe:
+            self.db.cache_candidate(asin, {"title": title, "brand": brand, "current_bb": current_bb, "avg90_bb": avg90_bb, "num_sellers": competitive_fba}, "PRIVATE_LABEL_TRAP", bb_reason)
+            return None
+
+        if buy_box_price < 13.50:
+            return None
 
         upc_list = product.get("upcList") or []
         ean_list = product.get("eanList") or []
@@ -493,6 +574,29 @@ class ReverseAmazonHunter:
         part_num = product.get("model") or product.get("partNumber") or ""
 
         amazon_pack_qty = parse_pack_quantity(title, product)
+        if amazon_pack_qty > 48:
+            self.db.cache_candidate(asin, {"title": title, "brand": brand}, "STRUCTURAL_REJECT", f"Pack qty {amazon_pack_qty} exceeds 48-unit ceiling")
+            return None
+
+        # Require verified distributor catalog match (never invent 40% estimated COGS)
+        cat_match = self.catalog.match(codes=codes, brand=brand, part_num=part_num)
+        if not cat_match:
+            return None
+
+        wholesale_cost = round(cat_match["unit_cost"] * amazon_pack_qty, 2)
+        vendor = cat_match["vendor"]
+        dist_title = cat_match.get("dist_title", "")
+        confidence_tier = "VERIFIED_WHOLESALE"
+
+        # Enforce Accessory Mismatch & Extreme ROI Floor Shield
+        mismatch, mismatch_reason = is_accessory_mismatch(title, dist_title, wholesale_cost, buy_box_price)
+        if mismatch:
+            self.db.cache_candidate(asin, {"title": title, "brand": brand, "current_bb": buy_box_price}, "STRUCTURAL_REJECT", mismatch_reason)
+            return None
+
+        if wholesale_cost < STRICT_MIN_WHOLESALE_COST or wholesale_cost > STRICT_MAX_WHOLESALE_COST:
+            self.db.cache_candidate(asin, {"title": title, "brand": brand}, "FILTERED", f"Cost ${wholesale_cost} out of bounds")
+            return None
 
         days_to_fba = estimate_days_to_fba(brand, is_hazmat=is_hazmat, pack_qty=amazon_pack_qty)
         if days_to_fba > MAX_DAYS_TO_FBA:
@@ -502,8 +606,8 @@ class ReverseAmazonHunter:
         base_meta = {
             "title": title, "brand": brand, "category_id": sector_id,
             "upc": primary_upc, "is_hazmat": is_hazmat, "monthly_sold": monthly_units,
-            "drops_90": drops_90, "avg90_bb": buy_box_price, "num_sellers": competitive_fba,
-            "amazon_pack_qty": amazon_pack_qty
+            "drops_90": drops_90, "avg90_bb": avg90_bb, "current_bb": current_bb,
+            "num_sellers": competitive_fba, "amazon_pack_qty": amazon_pack_qty
         }
 
         is_valid_comp, comp_reason, effective_share_velocity = validate_fba_competition(monthly_units, competitive_fba)
@@ -512,20 +616,6 @@ class ReverseAmazonHunter:
             return None
 
         profit_floor, req_roi = calculate_sliding_profit_floor(effective_share_velocity)
-        cat_match = self.catalog.match(codes=codes, brand=brand, part_num=part_num)
-
-        if cat_match:
-            wholesale_cost = round(cat_match["unit_cost"] * amazon_pack_qty, 2)
-            vendor = cat_match["vendor"]
-            confidence_tier = "VERIFIED_WHOLESALE"
-        else:
-            wholesale_cost = round(buy_box_price * 0.40, 2)
-            vendor = f"Target Brand: {brand}"
-            confidence_tier = "TARGET_ACQUISITION"
-
-        if wholesale_cost < STRICT_MIN_WHOLESALE_COST or wholesale_cost > STRICT_MAX_WHOLESALE_COST:
-            self.db.cache_candidate(asin, base_meta, "FILTERED", f"Cost ${wholesale_cost} out of bounds")
-            return None
 
         logistics = get_logistics_profile(vendor)
         multipack_prep_buffer = 0.45 if amazon_pack_qty > 1 else 0.00
@@ -557,7 +647,8 @@ class ReverseAmazonHunter:
             "asin": asin, "title": title, "brand": brand,
             "vendor": vendor, "prep_hub": logistics["facility"],
             "confidence_tier": confidence_tier, "sales_rank": current_bsr,
-            "buy_box_price": buy_box_price, "wholesale_cost": wholesale_cost,
+            "buy_box_price": buy_box_price, "current_bb": current_bb, "avg90_bb": avg90_bb,
+            "wholesale_cost": wholesale_cost,
             "max_allowable_buy_cost": round(buy_box_price - total_overhead - profit_floor, 2),
             "net_profit": net_profit, "roi_percent": roi_percent, "profit_floor": profit_floor,
             "req_roi": req_roi, "profit_per_dollar": round(net_profit / max(0.01, wholesale_cost), 2),
@@ -580,12 +671,10 @@ class ReverseAmazonHunter:
             brand_esc = html.escape(deal["brand"])
             vendor_esc = html.escape(deal["vendor"])
             hazmat_tag = "⚠️ <b>HAZMAT</b> | " if deal.get("is_hazmat") else ""
-            vacant_tag = "🏆 <b>0 FBA SELLERS (100% BUY BOX)</b>\n" if deal["competitive_fba"] == 0 else ""
 
             msg = (
-                f"💎 <b>CONTINUOUS VELOCITY DEAL</b>\n"
+                f"💎 <b>VERIFIED WHOLESALE DEAL</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"{vacant_tag}"
                 f"📦 <a href=\"{deal['order_url']}\">{title_esc}</a>\n"
                 f"🏷 <b>Brand:</b> <code>{brand_esc}</code> | <b>ASIN:</b> <code>{deal['asin']}</code>\n"
                 f"🏢 <b>Vendor:</b> {vendor_esc} ({deal['prep_hub']})\n"
@@ -624,6 +713,8 @@ class ReverseAmazonHunter:
                     "pack_count": deal["pack_count"],
                     "days_to_fba": deal["days_to_fba"],
                     "buy_box_price": deal["buy_box_price"],
+                    "current_bb": deal["current_bb"],
+                    "avg90_bb": deal["avg90_bb"],
                     "wholesale_cost": deal["wholesale_cost"],
                     "net_profit": deal["net_profit"],
                     "roi_percent": deal["roi_percent"],
@@ -642,7 +733,8 @@ class ReverseAmazonHunter:
 
     def fetch_product_batch(self, asins: List[str]) -> List[Dict[str, Any]]:
         clean = [a.strip().upper() for a in asins if a and len(a.strip()) == 10 and self.db.should_evaluate(a.strip())]
-        if not clean: return []
+        if not clean:
+            return []
         batch = clean[:100]
         try:
             r = requests.get(
@@ -688,12 +780,15 @@ class ReverseAmazonHunter:
                     }
 
                     s_def = SECTOR_DEFINITIONS.get(sector_id, {"is_root": True})
-                    if s_def["is_root"]: selection["rootCategory"] = [sector_id]
-                    else: selection["categories_include"] = [sector_id]
+                    if s_def["is_root"]:
+                        selection["rootCategory"] = [sector_id]
+                    else:
+                        selection["categories_include"] = [sector_id]
 
                     try:
                         res = requests.post("https://api.keepa.com/query", data={"key": KEEPA_API_KEY, "domain": 1, "selection": json.dumps(selection)}, timeout=30)
-                        if res.status_code != 200: continue
+                        if res.status_code != 200:
+                            continue
                         asins = res.json().get("asinList", [])
 
                         if not asins:
@@ -714,7 +809,7 @@ class ReverseAmazonHunter:
                         logger.debug(f"Slice query error: {e}")
 
     def start(self):
-        logger.info("Hunter Engine v16.7 Active with Continuous Velocity Modeling.")
+        logger.info("Hunter Engine v16.8 Active with Suppressed-BuyBox & Private-Label Trap Shield.")
         while True:
             try:
                 self.run_sweep()
@@ -724,12 +819,6 @@ class ReverseAmazonHunter:
             except Exception as e:
                 logger.critical(f"Daemon fatal loop error: {e}")
                 time.sleep(15)
-
-
-if __name__ == "__main__":
-    _lock = acquire_singleton_lock()
-    hunter = ReverseAmazonHunter()
-    hunter.start()
 
 
 def apply_cost_certainty_penalty(raw_score: float, status: str, has_verified_distributor_sku: bool) -> float:
@@ -745,6 +834,11 @@ def apply_cost_certainty_penalty(raw_score: float, status: str, has_verified_dis
     if status == 'FILTERED':
         return min(float(raw_score) * 0.10, 10.0)
     if not has_verified_distributor_sku or status == 'NO_CATALOG_MATCH':
-        # Hard ceiling at 25 for any estimated COGS
         return min(float(raw_score) * 0.25, 25.0)
     return float(raw_score)
+
+
+if __name__ == "__main__":
+    _lock = acquire_singleton_lock()
+    hunter = ReverseAmazonHunter()
+    hunter.start()
