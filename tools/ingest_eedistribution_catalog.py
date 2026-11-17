@@ -64,7 +64,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Explicit phrases EE Distribution uses when a brand/SKU prohibits Amazon or 3rd-party sales
 EE_RESTRICTION_PATTERNS = [
     r"not\s+(?:eligible|allowed|permitted|authorized)\s+(?:for|to\s+sell\s+on)\s+(?:amazon|3rd\s*party|third\s*party)",
     r"no\s+(?:amazon|ebay|3rd\s*party|third\s*party|online\s+marketplace)",
@@ -104,7 +103,6 @@ def create_authenticated_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # Fetch login page to capture hidden anti-forgery / ASP.NET form tokens
     resp = session.get(LOGIN_URL, timeout=20)
     soup = BeautifulSoup(resp.text, "html.parser")
     payload: Dict[str, str] = {}
@@ -113,7 +111,6 @@ def create_authenticated_session() -> requests.Session:
         if name:
             payload[name] = inp.get("value", "")
 
-    # Populate common EE Distribution login field names
     payload["Email"] = email
     payload["Password"] = password
     payload["email"] = email
@@ -133,7 +130,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
     Inspects the EE Distribution product page for any Amazon, eBay, or 3rd-party
     marketplace selling prohibition. Returns (is_allowed, reason).
     """
-    # 1. Check dedicated restriction badge / alert containers first
     alert_selectors = [
         ".restriction", ".restrictions", ".marketplace-restriction",
         ".product-restrictions", ".alert-warning", ".alert-danger",
@@ -148,7 +144,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
                 if re.search(pat, txt, re.IGNORECASE):
                     return False, f"Badge/Alert: {txt[:120]}"
 
-    # 2. Check product specification rows (e.g., "3rd Party Allowed: No" / "Amazon: Restricted")
     for row in soup.select("tr, li, .spec-row, .product-attribute"):
         row_txt = " ".join(row.get_text(" ", strip=True).split())
         if len(row_txt) > 220:
@@ -157,7 +152,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
             if re.search(r"\b(?:no|not\s+allowed|prohibited|restricted|blocked|ineligible)\b", row_txt, re.IGNORECASE):
                 return False, f"Spec Attribute: {row_txt[:120]}"
 
-    # 3. Full-page scan against explicit EE Distribution restriction phrases
     visible_text = " ".join(soup.get_text(" ", strip=True).split())
     for pat in EE_RESTRICTION_PATTERNS:
         m = re.search(pat, visible_text, re.IGNORECASE)
@@ -166,7 +160,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
             end = min(len(visible_text), m.end() + 50)
             return False, f"Page Notice: {visible_text[start:end]}"
 
-    # 4. Check structured JSON / data attributes embedded in page scripts
     if re.search(r'"(?:amazonRestricted|thirdPartyRestricted|noAmazon)"\s*:\s*true', raw_html, re.IGNORECASE):
         return False, "JSON Flag: thirdPartyRestricted=true"
 
@@ -205,10 +198,6 @@ def parse_ee_product_page(
     blocked_brands: set,
     freight_per_unit: float
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
-    """
-    Fetches and parses a single EE Distribution product page.
-    Returns (valid_record, None) if eligible, or (None, reject_record) if blocked/restricted.
-    """
     try:
         resp = session.get(url, timeout=20)
         if resp.status_code != 200:
@@ -217,18 +206,15 @@ def parse_ee_product_page(
         raw_html = resp.text
         soup = BeautifulSoup(raw_html, "html.parser")
 
-        # 1. Verify In-Stock status
         page_upper = soup.get_text(" ", strip=True).upper()
         if "OUT OF STOCK" in page_upper and "IN STOCK" not in page_upper:
             return None, None
 
-        # 2. Mandatory EE Distribution 3rd-Party / Amazon Restriction Check
         allowed, reason = check_ee_marketplace_eligibility(soup, raw_html)
         if not allowed:
             sku_guess = url.rstrip("/").split("/")[-1]
             return None, {"sku": sku_guess, "url": url, "reason": reason}
 
-        # 3. Extract product details via JSON-LD + PDP selectors
         title, brand, mpn, upc, raw_price = "", "", "", "", 0.0
         for script in soup.find_all("script", type="application/ld+json"):
             if not script.string:
@@ -283,12 +269,10 @@ def parse_ee_product_page(
         if not title or raw_price <= 0:
             return None, None
 
-        # 4. Enforce 45-lb parcel limit
         m_wt = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:lbs?|pounds?)\b", raw_html, re.IGNORECASE)
         if m_wt and float(m_wt.group(1)) > 45.0:
             return None, None
 
-        # 5. Detect Case Pack Qty and calculate true per-unit COGS
         pack_qty = 1
         m_case = re.search(
             r"(?:case\s*(?:of|pack|qty)|master\s*carton|pack\s*of)\s*:?\s*(\d+)|\b(\d+)\s*(?:pcs|pieces|units)\s*/\s*case\b",
