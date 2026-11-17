@@ -38,11 +38,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Playwright browser engine & system dependencies permanently
 RUN playwright install --with-deps chromium
 
-# Create data directory tree
-RUN mkdir -p /app/data/catalogs/incoming /app/data/logs
+# Create data directory tree (including indexed Parquet & reports folders)
+RUN mkdir -p /app/data/catalogs/incoming \
+             /app/data/catalogs/wholesale_catalogs/incoming \
+             /app/data/catalogs/wholesale_catalogs/indexed \
+             /app/data/catalogs/manufacturer_catalogs/incoming \
+             /app/data/catalogs/manufacturer_catalogs/indexed \
+             /app/data/reports \
+             /app/data/purchase_orders \
+             /app/data/logs
 
 # Copy application source code
 COPY . .
 
 # Run master pipeline supervisor
-CMD ["python", "run_master_pipeline.py"]
+CMD ["python", "-u", "master_orchestrator.py"]
