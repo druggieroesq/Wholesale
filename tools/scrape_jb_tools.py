@@ -3,7 +3,7 @@
 tools/scrape_jb_tools.py
 ------------------------
 Live Product-Page Catalog Scraper for JB Tools (jbtools.com)
-- Crawls target tool/automotive/shop categories or XML product sitemaps
+- Crawls XML product sitemaps for automotive/shop/diagnostic SKUs
 - Extracts live pricing, UPC/GTIN, Brand, and MPN from JSON-LD & PDP markup
 - Strictly filters out all 226+ IP-blocked conglomerate brands (Milwaukee, DeWalt, Stanley, etc.)
   and oversized shop equipment (> 45 lbs)
@@ -44,7 +44,6 @@ INCOMING_DIR.mkdir(parents=True, exist_ok=True)
 OUT_CSV = INCOMING_DIR / "Jb_Tools_Catalog.csv"
 BLOCKLIST_PATH = DATA_DIR / "ip_blocklist.json"
 
-BASE_URL = "https://www.jbtools.com"
 SITEMAP_INDEX = "https://www.jbtools.com/xmlsitemap.php"
 XML_NS = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
@@ -161,7 +160,6 @@ def parse_product_page(url: str, session: requests.Session, blocked: set) -> Opt
         if not title or price <= 0:
             return None
 
-        # Reject overweight shop equipment (> 45 lbs)
         m_wt = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:lbs?|pounds?)\b", html, re.IGNORECASE)
         if m_wt and float(m_wt.group(1)) > 45.0:
             return None
