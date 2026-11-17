@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Master Orchestrator & Centralized Telegram Gateway (v7.7 Self-Healing Engine)
+Master Orchestrator & Centralized Telegram Gateway (v7.8 Self-Healing Engine)
 -----------------------------------------------------------------------------
-Supervises eight dedicated background workers:
+Supervises dedicated background workers and automated catalog ingestion:
 1. ReverseAmazonHunter       (tools/reverse_amazon_finder.py)
 2. SheetSyncDaemon           (tools/sync_today_leads_to_sheet.py --daemon)
 3. WebDistributorScout       (tools/web_distributor_scout.py)
@@ -10,7 +10,12 @@ Supervises eight dedicated background workers:
 5. DriveManufacturerSync     (tools/sync_drive_manufacturer_catalogs.py --daemon)
 6. AntiRegateDaemon          (tools/anti_regating_pulse_daemon.py --daemon)
 7. SPAPIRestrictionsDaemon   (tools/sp_api_restrictions_daemon.py) -> 6-hour SP-API eligibility & Q4/CPC gatekeeper
-8. Embedded Threads: HealthServer, MasterTelegramListener, TwoTierCatalogWatcher, PeriodicReorderWorker
+8. Embedded Threads:
+   - HealthServer
+   - MasterTelegramListener
+   - TwoTierCatalogWatcher (auto-routes motion*.csv/xlsx to ingest_motion_catalog.py)
+   - PeriodicEEDistributionWorker (auto-scrapes EE Distribution every 12h & triggers cross-match)
+   - PeriodicReorderWorker
 """
 
 import os
@@ -86,6 +91,7 @@ ANTI_REGATE_LOG_FILE = DATA_DIR / "anti_regate.log"
 SP_API_RESTRICTIONS_LOG_FILE = DATA_DIR / "sp_api_restrictions.log"
 
 REORDER_INTERVAL_SECONDS = int(os.getenv("REORDER_INTERVAL_SECONDS", 21600))
+EE_DIST_INTERVAL_SECONDS = int(os.getenv("EE_DIST_INTERVAL_SECONDS", 43200))
 
 for p in [REPORTS_DIR, DATA_DIR, CATALOG_DIR, PO_DIR, WHOLESALE_INCOMING, WHOLESALE_INDEXED, MFR_INCOMING, MFR_INDEXED]:
     p.mkdir(parents=True, exist_ok=True)
@@ -113,7 +119,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_7_self_healing_orchestrator"}')
+            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_8_self_healing_orchestrator"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -621,7 +627,14 @@ def sync_distributor_database():
 
 
 def trigger_candidate_rescore():
-    logger.info("Triggering candidate re-score against updated two-tier catalog index...")
+    logger.info("Triggering cross-catalog matcher and candidate re-score against updated catalog index...")
+    matcher_script = ROOT_DIR / "tools" / "auto_cross_catalog_matcher_daemon.py"
+    if matcher_script.exists():
+        try:
+            subprocess.Popen([sys.executable, "-u", str(matcher_script), "--run-once"])
+        except Exception as exc:
+            logger.warning(f"Cross-catalog matcher trigger notice: {exc}")
+
     script = (
         "import sys; sys.path.insert(0, '.'); "
         "from tools.reverse_amazon_finder import ReverseAmazonHunter; "
@@ -634,9 +647,59 @@ def trigger_candidate_rescore():
         logger.warning(f"Failed to trigger background re-score: {e}")
 
 
+def run_periodic_ee_distribution_worker():
+    """Automatically scrapes In-Stock EE Distribution SKUs on startup and every 12h."""
+    ee_script = ROOT_DIR / "tools" / "ingest_eedistribution_catalog.py"
+    if not ee_script.exists():
+        logger.info("tools/ingest_eedistribution_catalog.py not found. EE Distribution worker in standby.")
+        return
+
+    logger.info(f"Periodic EE Distribution Catalog Scraper ACTIVE (Interval: {EE_DIST_INTERVAL_SECONDS}s).")
+    time.sleep(45)
+
+    while True:
+        try:
+            if not os.getenv("EE_DIST_EMAIL") or not os.getenv("EE_DIST_PASSWORD"):
+                logger.warning("EE_DIST_EMAIL or EE_DIST_PASSWORD not set in Railway Variables; skipping EE scrape.")
+            else:
+                logger.info("Running scheduled EE Distribution In-Stock catalog ingestion pass...")
+                res = subprocess.run(
+                    [
+                        sys.executable,
+                        "-u",
+                        str(ee_script),
+                        "--brands",
+                        "funko",
+                        "hasbro",
+                        "mattel",
+                        "bandai",
+                        "mcfarlane-toys",
+                        "neca",
+                        "--max-pages",
+                        "4",
+                        "--freight-per-unit",
+                        "0.85",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=900,
+                )
+                if res.returncode == 0:
+                    logger.info("EE Distribution catalog ingestion pass completed successfully.")
+                    trigger_candidate_rescore()
+                else:
+                    logger.warning(f"EE Distribution scraper exited with code {res.returncode}:\n{res.stderr or res.stdout}")
+        except Exception as e:
+            logger.warning(f"EE Distribution worker exception: {e}")
+
+        time.sleep(EE_DIST_INTERVAL_SECONDS)
+
+
 def run_catalog_watcher():
     logger.info("Two-Tier Catalog Hot-Reload Watcher is ACTIVE.")
     normalizer_script = ROOT_DIR / "tools" / "catalog_normalizer.py"
+    motion_script = ROOT_DIR / "ingest_motion_catalog.py"
 
     watch_targets = [
         (MFR_INCOMING, MFR_INDEXED, "MANUFACTURER"),
@@ -660,9 +723,22 @@ def run_catalog_watcher():
                             mtime = f.stat().st_mtime
                             f_key = str(f.resolve())
                             if f_key not in _KNOWN_CATALOG_MTIMES or _KNOWN_CATALOG_MTIMES[f_key] < mtime:
-                                logger.info(f"[{tier} TIER] New price list detected: {f.name}. Auto-normalizing to {out_dir.name}...")
                                 time.sleep(1)
 
+                                # Auto-route Motion.com spreadsheets through standalone OEM normalizer
+                                if "motion" in f.name.lower() and motion_script.exists():
+                                    logger.info(f"[MOTION OEM TIER] Motion feed detected: {f.name}. Routing to ingest_motion_catalog.py...")
+                                    cmd = [sys.executable, str(motion_script), "--feed", str(f)]
+                                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                                    if res.returncode == 0:
+                                        logger.info(f"Successfully normalized Motion OEM catalog: {f.name}")
+                                        _KNOWN_CATALOG_MTIMES[f_key] = mtime
+                                        detected_changes = True
+                                    else:
+                                        logger.error(f"Failed normalizing Motion feed {f.name}:\n{res.stderr or res.stdout}")
+                                    continue
+
+                                logger.info(f"[{tier} TIER] New price list detected: {f.name}. Auto-normalizing to {out_dir.name}...")
                                 if normalizer_script.exists():
                                     cmd = [sys.executable, str(normalizer_script), str(f), str(out_dir)]
                                     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -772,7 +848,7 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
 
 
 def main():
-    logger.info(f"Initializing Master Pipeline Orchestrator v7.7 (Target Webhook: {get_verified_webhook_url()})...")
+    logger.info(f"Initializing Master Pipeline Orchestrator v7.8 (Target Webhook: {get_verified_webhook_url()})...")
 
     load_ip_blocklist_cached()
 
@@ -786,6 +862,9 @@ def main():
 
     watcher_thread = threading.Thread(target=run_catalog_watcher, daemon=True)
     watcher_thread.start()
+
+    ee_dist_thread = threading.Thread(target=run_periodic_ee_distribution_worker, daemon=True)
+    ee_dist_thread.start()
 
     reorder_thread = threading.Thread(target=run_periodic_reorder_worker, daemon=True)
     reorder_thread.start()
