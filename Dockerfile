@@ -52,4 +52,4 @@ RUN mkdir -p /app/data/catalogs/incoming \
 COPY . .
 
 # Run master pipeline supervisor
-CMD ["python", "-u", "master_orchestrator.py"]
+CMD ["python", "run_master_pipeline.py"]
