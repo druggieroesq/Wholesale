@@ -80,7 +80,6 @@ def parse_product_page(url: str, session: requests.Session) -> Optional[Dict[str
         soup = BeautifulSoup(html, "html.parser")
         title, brand, mpn, upc, price = "", "ATLANTIC SPICE", "", "", 0.0
 
-        # 1. JSON-LD Structured Data
         for script in soup.find_all("script", type="application/ld+json"):
             if not script.string:
                 continue
@@ -109,7 +108,6 @@ def parse_product_page(url: str, session: requests.Session) -> Optional[Dict[str
             except Exception:
                 continue
 
-        # 2. HTML Fallback Selectors
         if not title:
             h1 = soup.find("h1")
             title = h1.get_text(strip=True) if h1 else ""
@@ -133,13 +131,12 @@ def parse_product_page(url: str, session: requests.Session) -> Optional[Dict[str
         if not title or price <= 0:
             return None
 
-        # Detect bulk weight/pack quantity
         pack_qty = 1
         m_lb = re.search(r"\b(\d+)\s*(?:lb|pound)s?\b", title, re.IGNORECASE)
         if m_lb:
             w = int(m_lb.group(1))
             if w > 45:
-                return None  # Enforce 45-lb parcel weight cap
+                return None
             pack_qty = max(1, min(w, 48))
 
         return {
