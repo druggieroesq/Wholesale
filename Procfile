@@ -1,1 +1,1 @@
-web: python run_master_pipeline.py
+web: python -u master_orchestrator.py
