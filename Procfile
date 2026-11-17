@@ -1,1 +1,1 @@
-web: python -u master_orchestrator.py
+web: bash -c 'python -u tools/sp_api_restrictions_daemon.py --loop --max-brands 100 & RESTRICTIONS_PID=$!; trap "kill $RESTRICTIONS_PID 2>/dev/null || true" EXIT INT TERM; python -u master_orchestrator.py'
