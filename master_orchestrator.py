@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Master Orchestrator & Centralized Telegram Gateway (v7.8 Self-Healing Engine)
+Master Orchestrator & Centralized Telegram Gateway (v7.9 Self-Healing Engine)
 -----------------------------------------------------------------------------
 Supervises dedicated background workers and automated catalog ingestion:
 1. ReverseAmazonHunter       (tools/reverse_amazon_finder.py)
@@ -15,6 +15,7 @@ Supervises dedicated background workers and automated catalog ingestion:
    - MasterTelegramListener
    - TwoTierCatalogWatcher (auto-routes motion*.csv/xlsx to ingest_motion_catalog.py)
    - PeriodicEEDistributionWorker (auto-scrapes EE Distribution every 12h & triggers cross-match)
+   - PeriodicZoroScoutWorker (auto-scans Zoro.com MRO portal every 12h with SP-API verification)
    - PeriodicReorderWorker
 """
 
@@ -92,6 +93,7 @@ SP_API_RESTRICTIONS_LOG_FILE = DATA_DIR / "sp_api_restrictions.log"
 
 REORDER_INTERVAL_SECONDS = int(os.getenv("REORDER_INTERVAL_SECONDS", 21600))
 EE_DIST_INTERVAL_SECONDS = int(os.getenv("EE_DIST_INTERVAL_SECONDS", 43200))
+ZORO_INTERVAL_SECONDS = int(os.getenv("ZORO_INTERVAL_SECONDS", 43200))
 
 for p in [REPORTS_DIR, DATA_DIR, CATALOG_DIR, PO_DIR, WHOLESALE_INCOMING, WHOLESALE_INDEXED, MFR_INCOMING, MFR_INDEXED]:
     p.mkdir(parents=True, exist_ok=True)
@@ -119,7 +121,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_8_self_healing_orchestrator"}')
+            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_self_healing_orchestrator"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -696,6 +698,44 @@ def run_periodic_ee_distribution_worker():
         time.sleep(EE_DIST_INTERVAL_SECONDS)
 
 
+def run_periodic_zoro_scout_worker():
+    """Automatically scans Zoro.com MRO portal on startup (staggered 90s) and every 12h."""
+    zoro_script = ROOT_DIR / "tools" / "zoro_target_scout.py"
+    if not zoro_script.exists():
+        logger.info("tools/zoro_target_scout.py not found. Zoro scout worker in standby.")
+        return
+
+    logger.info(f"Periodic Zoro.com MRO Portal Scanner ACTIVE (Interval: {ZORO_INTERVAL_SECONDS}s).")
+    time.sleep(90)
+
+    while True:
+        try:
+            logger.info("Running scheduled Zoro.com MRO web portal scan pass...")
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-u",
+                    str(zoro_script),
+                    "--max-items",
+                    "250",
+                    "--min-roi",
+                    "15.0",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=900,
+            )
+            if res.returncode == 0:
+                logger.info("Zoro.com MRO portal scan pass completed successfully.")
+            else:
+                logger.warning(f"Zoro scout exited with code {res.returncode}:\n{res.stderr or res.stdout}")
+        except Exception as e:
+            logger.warning(f"Zoro scout worker exception: {e}")
+
+        time.sleep(ZORO_INTERVAL_SECONDS)
+
+
 def run_catalog_watcher():
     logger.info("Two-Tier Catalog Hot-Reload Watcher is ACTIVE.")
     normalizer_script = ROOT_DIR / "tools" / "catalog_normalizer.py"
@@ -848,7 +888,7 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
 
 
 def main():
-    logger.info(f"Initializing Master Pipeline Orchestrator v7.8 (Target Webhook: {get_verified_webhook_url()})...")
+    logger.info(f"Initializing Master Pipeline Orchestrator v7.9 (Target Webhook: {get_verified_webhook_url()})...")
 
     load_ip_blocklist_cached()
 
@@ -865,6 +905,9 @@ def main():
 
     ee_dist_thread = threading.Thread(target=run_periodic_ee_distribution_worker, daemon=True)
     ee_dist_thread.start()
+
+    zoro_scout_thread = threading.Thread(target=run_periodic_zoro_scout_worker, daemon=True)
+    zoro_scout_thread.start()
 
     reorder_thread = threading.Thread(target=run_periodic_reorder_worker, daemon=True)
     reorder_thread.start()
