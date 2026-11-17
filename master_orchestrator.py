@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Master Orchestrator & Centralized Telegram Gateway (v7.9 Self-Healing Engine)
------------------------------------------------------------------------------
+Master Orchestrator & Centralized Telegram Gateway (v7.9.1 Self-Healing Engine)
+-------------------------------------------------------------------------------
 Supervises dedicated background workers and automated catalog ingestion:
-1. ReverseAmazonHunter       (tools/reverse_amazon_finder.py)
-2. SheetSyncDaemon           (tools/sync_today_leads_to_sheet.py --daemon)
-3. WebDistributorScout       (tools/web_distributor_scout.py)
-4. AutonomousRecruiter       (tools/autonomous_recruiter.py)
-5. DriveManufacturerSync     (tools/sync_drive_manufacturer_catalogs.py --daemon)
-6. AntiRegateDaemon          (tools/anti_regating_pulse_daemon.py --daemon)
-7. SPAPIRestrictionsDaemon   (tools/sp_api_restrictions_daemon.py) -> 6-hour SP-API eligibility & Q4/CPC gatekeeper
+1. ReverseAmazonHunter         (tools/reverse_amazon_finder.py)
+2. SheetSyncDaemon             (tools/sync_today_leads_to_sheet.py --daemon)
+3. WebDistributorScout         (tools/web_distributor_scout.py)
+4. AutonomousRecruiter         (tools/autonomous_recruiter.py)
+5. DriveManufacturerSync       (tools/sync_drive_manufacturer_catalogs.py --daemon)
+6. AntiRegateDaemon            (tools/anti_regating_pulse_daemon.py --daemon)
+7. SPAPIRestrictionsDaemon     (tools/sp_api_restrictions_daemon.py --loop --max-brands 100)
 8. Embedded Threads:
    - HealthServer
    - MasterTelegramListener
@@ -123,7 +123,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_self_healing_orchestrator"}')
+            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_1_self_healing_orchestrator"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -803,7 +803,6 @@ def run_catalog_watcher():
                             if f_key not in _KNOWN_CATALOG_MTIMES or _KNOWN_CATALOG_MTIMES[f_key] < mtime:
                                 time.sleep(1)
 
-                                # Auto-route Motion.com spreadsheets through standalone OEM normalizer
                                 if "motion" in f.name.lower() and motion_script.exists():
                                     logger.info(f"[MOTION OEM TIER] Motion feed detected: {f.name}. Routing to ingest_motion_catalog.py...")
                                     cmd = [sys.executable, str(motion_script), "--feed", str(f)]
@@ -926,7 +925,7 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
 
 
 def main():
-    logger.info(f"Initializing Master Pipeline Orchestrator v7.9 (Target Webhook: {get_verified_webhook_url()})...")
+    logger.info(f"Initializing Master Pipeline Orchestrator v7.9.1 (Target Webhook: {get_verified_webhook_url()})...")
 
     load_ip_blocklist_cached()
 
@@ -960,7 +959,7 @@ def main():
         ("AutonomousRecruiter", [sys.executable, "-u", str(ROOT_DIR / "tools" / "autonomous_recruiter.py")], RECRUITER_LOG_FILE),
         ("DriveManufacturerSync", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sync_drive_manufacturer_catalogs.py"), "--daemon"], DRIVE_SYNC_LOG_FILE),
         ("AntiRegateDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "anti_regating_pulse_daemon.py"), "--daemon"], ANTI_REGATE_LOG_FILE),
-        ("SPAPIRestrictionsDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sp_api_restrictions_daemon.py")], SP_API_RESTRICTIONS_LOG_FILE),
+        ("SPAPIRestrictionsDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sp_api_restrictions_daemon.py"), "--loop", "--max-brands", "100"], SP_API_RESTRICTIONS_LOG_FILE),
     ]
     procs = {name: None for name, _, _ in workers}
 
