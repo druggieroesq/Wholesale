@@ -1,29 +1,16 @@
 #!/usr/bin/env python3
 """
-Master Orchestrator & Centralized Telegram Gateway (v7.6 Self-Healing Engine)
+Master Orchestrator & Centralized Telegram Gateway (v7.7 Self-Healing Engine)
 -----------------------------------------------------------------------------
-Supervises seven dedicated background workers:
-1. ReverseAmazonHunter       (tools/reverse_amazon_finder.py)            -> Evaluates Keepa demand with sliding scale & $1,000/mo net profit pool floor
-2. SheetSyncDaemon           (tools/sync_today_leads_to_sheet.py --daemon)-> Continuous automated 15-minute Google Sheets Buy List synchronization
-3. WebDistributorScout       (tools/web_distributor_scout.py)            -> Live portal price crawler (Zoro, Midland)
-4. AutonomousRecruiter       (tools/autonomous_recruiter.py)             -> Scrapes brand websites for wholesale dealer forms
-5. DriveManufacturerSync     (tools/sync_drive_manufacturer_catalogs.py) -> Syncs shared Google Drive Manufacturer folder
-6. ReorderPOGenerator        (tools/reorder_po_generator.py)             -> Fair share DoSR runway, price-scrub, & decoupled 3PL routing
-7. AntiRegateDaemon          (tools/anti_regating_pulse_daemon.py)       -> Staggered FBM dormancy keeper for ungated brand permissions
-
-Key Features:
-- Self-Healing Webhook Routing: Automatically detects broken /library/ links and uses verified deployment /exec endpoint.
-- Native HTTP health check server on $PORT with SO_REUSEADDR and retry backoff.
-- Single-point exclusive Telegram polling worker with verified identity and inline button locking.
-- Upstream IP Pre-Filter Shield with normalized corporate suffix matching.
-- Embedded Two-Tier Catalog Hot-Reload Watcher:
-    * Manufacturer tier (Priority 1): data/catalogs/manufacturer_catalogs/incoming/ -> indexed/
-    * Wholesale tier (Priority 2):    data/catalogs/wholesale_catalogs/incoming/    -> indexed/
-- Decoupled Logistics Routing: Makki Prep strictly for BCI; Detroit Metro 3PL ($1.10 TBD estimate) for Marlo / JB Tools.
-- Enforced Sourcing Tiers (50-99: <=1 FBA | 100-249: <=2 FBA | 250+: share > 250 & <=5 FBA).
-- Hard $1,000/Month Net Profit Pool per SKU requirement on all lead approvals.
-- Auto-seeds ungated brand anchors into brand_ungate_registry.json upon Telegram BUYLIST approval.
-- Persistent local CSV logging and Google Sheets Webhook synchronization.
+Supervises eight dedicated background workers:
+1. ReverseAmazonHunter       (tools/reverse_amazon_finder.py)
+2. SheetSyncDaemon           (tools/sync_today_leads_to_sheet.py --daemon)
+3. WebDistributorScout       (tools/web_distributor_scout.py)
+4. AutonomousRecruiter       (tools/autonomous_recruiter.py)
+5. DriveManufacturerSync     (tools/sync_drive_manufacturer_catalogs.py --daemon)
+6. AntiRegateDaemon          (tools/anti_regating_pulse_daemon.py --daemon)
+7. SPAPIRestrictionsDaemon   (tools/sp_api_restrictions_daemon.py) -> 6-hour SP-API eligibility & Q4/CPC gatekeeper
+8. Embedded Threads: HealthServer, MasterTelegramListener, TwoTierCatalogWatcher, PeriodicReorderWorker
 """
 
 import os
@@ -47,7 +34,6 @@ ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Force .env override so container-level stale variables are replaced
 load_dotenv(ROOT_DIR / ".env", override=True)
 
 from config import (
@@ -66,7 +52,6 @@ logger = logging.getLogger("MasterGateway")
 
 KEEPA_KEY = os.getenv("KEEPA_API_KEY", "").strip()
 
-# Robust Token Sanitization (Prevents 401 Unauthorized from quotes or duplicate 'bot' prefix)
 _raw_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
 if _raw_token.lower().startswith("bot"):
     TELEGRAM_BOT_TOKEN = _raw_token[3:]
@@ -86,13 +71,11 @@ PRIMARY_IP_FILE = DATA_DIR / "ip_blocklist.json"
 FALLBACK_IP_FILE = ROOT_DIR / "data" / "ip_blocklist.json"
 SAVED_BUY_LIST_CSV = DATA_DIR / "saved_buy_list.csv"
 
-# Two-Tier Directory Structure
 WHOLESALE_INCOMING = CATALOG_DIR / "wholesale_catalogs" / "incoming"
 WHOLESALE_INDEXED = CATALOG_DIR / "wholesale_catalogs" / "indexed"
 MFR_INCOMING = CATALOG_DIR / "manufacturer_catalogs" / "incoming"
 MFR_INDEXED = CATALOG_DIR / "manufacturer_catalogs" / "indexed"
 
-# Log files for supervised workers
 HUNTER_LOG_FILE = DATA_DIR / "hunter_live.log"
 SHEET_SYNC_LOG_FILE = DATA_DIR / "sheet_sync.log"
 SCOUT_LOG_FILE = DATA_DIR / "scout_live.log"
@@ -100,6 +83,7 @@ RECRUITER_LOG_FILE = DATA_DIR / "recruiter_live.log"
 DRIVE_SYNC_LOG_FILE = DATA_DIR / "drive_sync.log"
 REORDER_LOG_FILE = DATA_DIR / "reorder_po.log"
 ANTI_REGATE_LOG_FILE = DATA_DIR / "anti_regate.log"
+SP_API_RESTRICTIONS_LOG_FILE = DATA_DIR / "sp_api_restrictions.log"
 
 REORDER_INTERVAL_SECONDS = int(os.getenv("REORDER_INTERVAL_SECONDS", 21600))
 
@@ -115,9 +99,6 @@ _KNOWN_CATALOG_MTIMES = {}
 _PROCESSED_PO_FILES = set()
 
 
-# ==========================================
-# 1. REUSABLE HTTP SERVER FOR HEALTH CHECKS
-# ==========================================
 class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
 
@@ -132,7 +113,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_6_self_healing_orchestrator"}')
+            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_7_self_healing_orchestrator"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -154,9 +135,6 @@ def run_health_server():
             time.sleep(2)
 
 
-# ==========================================
-# 2. STORAGE & UPSTREAM IP SHIELD
-# ==========================================
 def get_ip_blocklist_path() -> Path:
     if PRIMARY_IP_FILE.parent.exists():
         return PRIMARY_IP_FILE
@@ -165,7 +143,8 @@ def get_ip_blocklist_path() -> Path:
 
 
 def clean_brand_text(brand: str) -> str:
-    if not brand: return ""
+    if not brand:
+        return ""
     b = str(brand).upper().strip()
     b = re.sub(r'[^A-Z0-9\s]', ' ', b)
     b = re.sub(r'\b(LLC|INC|CORP|CORPORATION|CO|COMPANY|LTD|HOLDINGS|USA|ENTERPRISES)\b', '', b)
@@ -175,7 +154,8 @@ def clean_brand_text(brand: str) -> str:
 def load_ip_blocklist_cached() -> set:
     global _IP_CACHE_DATA, _IP_CACHE_MTIME
     target = get_ip_blocklist_path()
-    if not target.exists(): return set()
+    if not target.exists():
+        return set()
 
     try:
         mtime = target.stat().st_mtime
@@ -197,9 +177,11 @@ def load_ip_blocklist_cached() -> set:
 
 def is_brand_ip_blocked(brand_name: str) -> bool:
     clean = clean_brand_text(brand_name)
-    if not clean: return False
+    if not clean:
+        return False
     blocked = load_ip_blocklist_cached()
-    if clean in blocked: return True
+    if clean in blocked:
+        return True
     for b in blocked:
         if b and (b == clean or b in clean.split() or clean in b.split()):
             return True
@@ -208,9 +190,10 @@ def is_brand_ip_blocked(brand_name: str) -> bool:
 
 def append_brand_to_blocklist(brand: str) -> bool:
     brand_raw = (brand or "").strip()
-    if not brand_raw: return False
+    if not brand_raw:
+        return False
     target = get_ip_blocklist_path()
-    data = {"version": "6.0.0", "updated_at": "2026-11-02", "brands": [], "skus": []}
+    data = {"version": "6.0.0", "updated_at": "2026-11-16", "brands": [], "skus": []}
 
     if target.exists():
         try:
@@ -242,7 +225,8 @@ def load_telegram_decisions() -> dict:
     if TELEGRAM_DECISIONS_FILE.exists():
         try:
             d = json.loads(TELEGRAM_DECISIONS_FILE.read_text(encoding="utf-8"))
-            if isinstance(d, dict): return d
+            if isinstance(d, dict):
+                return d
         except Exception:
             pass
     return {}
@@ -262,14 +246,17 @@ def find_lead_metadata(asin: str) -> dict:
     ]
 
     for sf in search_files[:3]:
-        if not sf.exists(): continue
+        if not sf.exists():
+            continue
         try:
             raw = json.loads(sf.read_text(encoding="utf-8"))
             if isinstance(raw, list):
                 match = next((item for item in raw if isinstance(item, dict) and item.get("asin") == asin), None)
-                if match: return match
+                if match:
+                    return match
             elif isinstance(raw, dict):
-                if asin in raw: return raw[asin]
+                if asin in raw:
+                    return raw[asin]
                 for v in raw.values():
                     if isinstance(v, dict) and v.get("asin") == asin:
                         return v
@@ -365,7 +352,7 @@ def auto_seed_anti_regate_anchor(asin: str, brand: str, ref_price: float, vendor
                 "pulse_end_date": None
             }
             save_registry(registry)
-            logger.info(f"🛡️ Auto-registered brand anchor for Anti-Regate protection: {clean_brand} ({asin})")
+            logger.info(f"Auto-registered brand anchor for Anti-Regate protection: {clean_brand} ({asin})")
     except Exception as e:
         logger.debug(f"Anti-regate auto-seed notice: {e}")
 
@@ -441,9 +428,6 @@ def append_to_buy_list_sheet(asin: str, status: str = "PENDING_VERIFICATION"):
             logger.warning(f"Google Sheet Webhook Sync Notice: {w_err}")
 
 
-# ==========================================
-# 3. EXCLUSIVE MASTER TELEGRAM WORKER
-# ==========================================
 def verify_telegram_bot_identity() -> bool:
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("No TELEGRAM_BOT_TOKEN configured.")
@@ -465,7 +449,8 @@ def verify_telegram_bot_identity() -> bool:
 
 
 def purge_lingering_webhooks():
-    if not TELEGRAM_BOT_TOKEN: return
+    if not TELEGRAM_BOT_TOKEN:
+        return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
         res = requests.post(url, json={"drop_pending_updates": True}, timeout=10)
@@ -476,7 +461,8 @@ def purge_lingering_webhooks():
 
 
 def send_telegram_alert(text: str, reply_markup: dict = None) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -512,7 +498,8 @@ def run_master_telegram_listener():
             for update in r.get("result", []):
                 last_update_id = update["update_id"]
                 cb = update.get("callback_query")
-                if not cb: continue
+                if not cb:
+                    continue
 
                 cb_id = cb.get("id")
                 data = cb.get("data", "")
@@ -530,7 +517,8 @@ def run_master_telegram_listener():
                     continue
 
                 parts = data.split(":", 2)
-                if len(parts) < 2: continue
+                if len(parts) < 2:
+                    continue
 
                 action = parts[0]
                 asin = parts[1].strip().upper()
@@ -548,7 +536,7 @@ def run_master_telegram_listener():
                             "verified": False,
                             "expires_ts": None
                         }
-                        status_text = "⏳ QUEUED FOR BUY LIST"
+                        status_text = "QUEUED FOR BUY LIST"
                         append_to_buy_list_sheet(asin, status="PENDING_VERIFICATION")
 
                         lead_meta = find_lead_metadata(asin)
@@ -568,7 +556,7 @@ def run_master_telegram_listener():
                         }
                         if brand_context:
                             append_brand_to_blocklist(brand_context)
-                        tag = "🚫 BLOCKED AMAZON DIRECT" if action == "BLOCKAMAZON" else "🚫 BLOCKED IP"
+                        tag = "BLOCKED AMAZON DIRECT" if action == "BLOCKAMAZON" else "BLOCKED IP"
                         status_text = f"{tag} ({brand_context})" if brand_context else tag
 
                     elif action in ["DENY", "PASS"]:
@@ -577,7 +565,7 @@ def run_master_telegram_listener():
                             "timestamp": now_ts,
                             "expires_ts": now_ts + (180 * 86400)
                         }
-                        status_text = "⛔ DECLINED (Muted 180 Days)"
+                        status_text = "DECLINED (Muted 180 Days)"
                     else:
                         status_text = "REVIEWED"
 
@@ -589,7 +577,7 @@ def run_master_telegram_listener():
                         timeout=5
                     )
 
-                    locked_text = f"🔒 *[DECISION LOCKED: {status_text}]*\n━━━━━━━━━━━━━━━━━━━━\n" + orig_text
+                    locked_text = f"*[DECISION LOCKED: {status_text}]*\n--------------------\n" + orig_text
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
                         json={
@@ -599,7 +587,7 @@ def run_master_telegram_listener():
                             "parse_mode": "Markdown",
                             "reply_markup": {
                                 "inline_keyboard": [
-                                    [{"text": f"✅ {status_text}", "callback_data": "noop"}]
+                                    [{"text": f"{status_text}", "callback_data": "noop"}]
                                 ]
                             }
                         },
@@ -612,9 +600,6 @@ def run_master_telegram_listener():
             time.sleep(5)
 
 
-# =========================================================================
-# 4. SEGREGATED TWO-TIER CATALOG WATCHER & AUTO-NORMALIZER (DYNAMIC ROUTING)
-# =========================================================================
 def sync_distributor_database():
     drive_sync = ROOT_DIR / "tools" / "sync_drive_manufacturer_catalogs.py"
     if drive_sync.exists():
@@ -636,7 +621,7 @@ def sync_distributor_database():
 
 
 def trigger_candidate_rescore():
-    logger.info("⚡ Triggering candidate re-score against updated two-tier catalog index...")
+    logger.info("Triggering candidate re-score against updated two-tier catalog index...")
     script = (
         "import sys; sys.path.insert(0, '.'); "
         "from tools.reverse_amazon_finder import ReverseAmazonHunter; "
@@ -664,7 +649,8 @@ def run_catalog_watcher():
         try:
             detected_changes = False
             for in_dir, out_dir, tier in watch_targets:
-                if not in_dir.exists(): continue
+                if not in_dir.exists():
+                    continue
                 for ext in ("*.xlsx", "*.xls", "*.csv"):
                     for f in in_dir.glob(ext):
                         if "indexed" in f.parts or "normalized" in f.name.lower() or "processed" in f.parts:
@@ -674,18 +660,18 @@ def run_catalog_watcher():
                             mtime = f.stat().st_mtime
                             f_key = str(f.resolve())
                             if f_key not in _KNOWN_CATALOG_MTIMES or _KNOWN_CATALOG_MTIMES[f_key] < mtime:
-                                logger.info(f"⚡ [{tier} TIER] New price list detected: {f.name}. Auto-normalizing to {out_dir.name}...")
+                                logger.info(f"[{tier} TIER] New price list detected: {f.name}. Auto-normalizing to {out_dir.name}...")
                                 time.sleep(1)
 
                                 if normalizer_script.exists():
                                     cmd = [sys.executable, str(normalizer_script), str(f), str(out_dir)]
                                     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
                                     if res.returncode == 0:
-                                        logger.info(f"✅ Successfully normalized [{tier}]: {f.name} -> {out_dir.name}")
+                                        logger.info(f"Successfully normalized [{tier}]: {f.name} -> {out_dir.name}")
                                         _KNOWN_CATALOG_MTIMES[f_key] = mtime
                                         detected_changes = True
                                     else:
-                                        logger.error(f"❌ Failed normalizing {f.name}:\n{res.stderr or res.stdout}")
+                                        logger.error(f"Failed normalizing {f.name}:\n{res.stderr or res.stdout}")
                         except Exception as file_err:
                             logger.debug(f"Catalog scan file error: {file_err}")
 
@@ -698,15 +684,14 @@ def run_catalog_watcher():
             time.sleep(15)
 
 
-# =========================================================================
-# 5. PERIODIC REORDER & PRE-PO GENERATOR DAEMON (DECOUPLED LOGISTICS ROUTING)
-# =========================================================================
 def check_and_notify_new_purchase_orders():
     global _PROCESSED_PO_FILES
-    if not PO_DIR.exists(): return
+    if not PO_DIR.exists():
+        return
 
     for po_file in PO_DIR.glob("PO-*.json"):
-        if po_file.name in _PROCESSED_PO_FILES: continue
+        if po_file.name in _PROCESSED_PO_FILES:
+            continue
 
         try:
             data = json.loads(po_file.read_text(encoding="utf-8"))
@@ -721,19 +706,19 @@ def check_and_notify_new_purchase_orders():
 
             item_preview = ""
             for item in line_items[:3]:
-                strategy_tag = "📦 Optimized Split" if item.get("inbound_strategy") == "AMAZON_OPTIMIZED_SPLIT" else f"📍 Hub: {destination_3pl}"
-                item_preview += f"\n• `{item.get('sku')}`: {item.get('reorder_quantity')} units ({item.get('case_breakdown')})\n  ↳ _{strategy_tag}_"
+                strategy_tag = "Optimized Split" if item.get("inbound_strategy") == "AMAZON_OPTIMIZED_SPLIT" else f"Hub: {destination_3pl}"
+                item_preview += f"\n- `{item.get('sku')}`: {item.get('reorder_quantity')} units ({item.get('case_breakdown')})\n  _{strategy_tag}_"
 
             msg = (
-                f"🚨 *NEW PURCHASE ORDER GENERATED*\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"*NEW PURCHASE ORDER GENERATED*\n"
+                f"--------------------\n"
                 f"*PO Number:* `{po_num}`\n"
                 f"*Distributor:* `{distributor}`\n"
                 f"*Total Volume:* `{total_units}` units (${total_cost:,.2f})\n"
                 f"*Routing 3PL:* `{destination_3pl}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"--------------------\n"
                 f"*Line Items:* {item_preview}\n\n"
-                f"📄 Work order JSON ready in `data/purchase_orders/{po_file.name}`."
+                f"Work order JSON ready in `data/purchase_orders/{po_file.name}`."
             )
             send_telegram_alert(msg)
             _PROCESSED_PO_FILES.add(po_file.name)
@@ -753,7 +738,7 @@ def run_periodic_reorder_worker():
 
     while True:
         try:
-            logger.info("🔄 Running scheduled Inventory Reorder & Pre-PO Price-Scrub pass...")
+            logger.info("Running scheduled Inventory Reorder & Pre-PO Price-Scrub pass...")
             res = subprocess.run(
                 [sys.executable, str(reorder_script)],
                 capture_output=True,
@@ -772,14 +757,10 @@ def run_periodic_reorder_worker():
         time.sleep(REORDER_INTERVAL_SECONDS)
 
 
-# ==========================================
-# 6. SUPERVISOR WATCHDOG (SEVEN-WORKER)
-# ==========================================
 def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
     log_fp = open(log_file, "a")
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    # Ensure correct webhook URL is propagated to every subprocess
     env["BUY_LIST_WEBHOOK_URL"] = get_verified_webhook_url()
     env["GOOGLE_SHEET_WEBHOOK_URL"] = get_verified_webhook_url()
     return subprocess.Popen(
@@ -791,42 +772,35 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
 
 
 def main():
-    logger.info(f"Initializing Master Pipeline Orchestrator v7.6 (Target Webhook: {get_verified_webhook_url()})...")
+    logger.info(f"Initializing Master Pipeline Orchestrator v7.7 (Target Webhook: {get_verified_webhook_url()})...")
 
-    # 1. Warm up the in-memory IP blacklist
     load_ip_blocklist_cached()
 
-    # 2. Start HTTP Health Server on $PORT
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
-    # 3. Start Exclusive Telegram Polling Loop
     telegram_thread = threading.Thread(target=run_master_telegram_listener, daemon=True)
     telegram_thread.start()
 
-    # 4. Run Startup Catalog Sync Pass
     sync_distributor_database()
 
-    # 5. Start Embedded Hot-Reload Catalog Watcher Thread
     watcher_thread = threading.Thread(target=run_catalog_watcher, daemon=True)
     watcher_thread.start()
 
-    # 6. Start Embedded Periodic Reorder & Pre-PO Worker Thread
     reorder_thread = threading.Thread(target=run_periodic_reorder_worker, daemon=True)
     reorder_thread.start()
 
-    # 7. Configure Supervised Background Workers
     workers = [
         ("ReverseAmazonHunter", [sys.executable, "-u", str(ROOT_DIR / "tools" / "reverse_amazon_finder.py")], HUNTER_LOG_FILE),
         ("SheetSyncDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sync_today_leads_to_sheet.py"), "--daemon"], SHEET_SYNC_LOG_FILE),
         ("WebDistributorScout", [sys.executable, "-u", str(ROOT_DIR / "tools" / "web_distributor_scout.py")], SCOUT_LOG_FILE),
         ("AutonomousRecruiter", [sys.executable, "-u", str(ROOT_DIR / "tools" / "autonomous_recruiter.py")], RECRUITER_LOG_FILE),
         ("DriveManufacturerSync", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sync_drive_manufacturer_catalogs.py"), "--daemon"], DRIVE_SYNC_LOG_FILE),
-        ("AntiRegateDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "anti_regating_pulse_daemon.py"), "--daemon"], ANTI_REGATE_LOG_FILE)
+        ("AntiRegateDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "anti_regating_pulse_daemon.py"), "--daemon"], ANTI_REGATE_LOG_FILE),
+        ("SPAPIRestrictionsDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sp_api_restrictions_daemon.py")], SP_API_RESTRICTIONS_LOG_FILE),
     ]
     procs = {name: None for name, _, _ in workers}
 
-    # 8. Persistent Watchdog Loop
     while True:
         try:
             for name, cmd, log_f in workers:
