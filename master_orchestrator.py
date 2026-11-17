@@ -16,6 +16,7 @@ Supervises dedicated background workers and automated catalog ingestion:
    - TwoTierCatalogWatcher (auto-routes motion*.csv/xlsx to ingest_motion_catalog.py)
    - PeriodicEEDistributionWorker (auto-scrapes EE Distribution every 12h & triggers cross-match)
    - PeriodicZoroScoutWorker (auto-scans Zoro.com MRO portal every 12h with SP-API verification)
+   - PeriodicSpecialtyScrapersWorker (auto-scrapes Atlantic Spice, JB Tools & Marlo Beauty every 12h)
    - PeriodicReorderWorker
 """
 
@@ -94,6 +95,7 @@ SP_API_RESTRICTIONS_LOG_FILE = DATA_DIR / "sp_api_restrictions.log"
 REORDER_INTERVAL_SECONDS = int(os.getenv("REORDER_INTERVAL_SECONDS", 21600))
 EE_DIST_INTERVAL_SECONDS = int(os.getenv("EE_DIST_INTERVAL_SECONDS", 43200))
 ZORO_INTERVAL_SECONDS = int(os.getenv("ZORO_INTERVAL_SECONDS", 43200))
+SPECIALTY_INTERVAL_SECONDS = int(os.getenv("SPECIALTY_INTERVAL_SECONDS", 43200))
 
 for p in [REPORTS_DIR, DATA_DIR, CATALOG_DIR, PO_DIR, WHOLESALE_INCOMING, WHOLESALE_INDEXED, MFR_INCOMING, MFR_INDEXED]:
     p.mkdir(parents=True, exist_ok=True)
@@ -620,12 +622,11 @@ def sync_distributor_database():
     for name in ["sync_distributor_catalogs.py", "distributor_credential_sync.py"]:
         sync_script = ROOT_DIR / "tools" / name
         if sync_script.exists():
-            logger.info(f"Executing distributor catalog sync via {name}...")
+            logger.info(f"Executing distributor sync via {name}...")
             try:
                 subprocess.run([sys.executable, str(sync_script)], check=False, timeout=60)
-                break
             except Exception as exc:
-                logger.warning(f"Distributor sync notice: {exc}")
+                logger.warning(f"Distributor sync notice ({name}): {exc}")
 
 
 def trigger_candidate_rescore():
@@ -734,6 +735,43 @@ def run_periodic_zoro_scout_worker():
             logger.warning(f"Zoro scout worker exception: {e}")
 
         time.sleep(ZORO_INTERVAL_SECONDS)
+
+
+def run_periodic_specialty_scrapers_worker():
+    """Automatically runs Atlantic Spice, JB Tools, and Marlo Beauty live scrapers every 12h."""
+    scrapers = [
+        ("AtlanticSpice", ROOT_DIR / "tools" / "scrape_atlantic_spice.py"),
+        ("JBTools", ROOT_DIR / "tools" / "scrape_jb_tools.py"),
+        ("MarloBeauty", ROOT_DIR / "tools" / "scrape_marlo_beauty.py"),
+    ]
+    active = [(name, path) for name, path in scrapers if path.exists()]
+    if not active:
+        logger.info("No specialty web scrapers found. Specialty scraper worker in standby.")
+        return
+
+    logger.info(f"Periodic Specialty Web Scrapers ACTIVE ({len(active)} sources, Interval: {SPECIALTY_INTERVAL_SECONDS}s).")
+    time.sleep(150)
+
+    while True:
+        for name, script_path in active:
+            try:
+                logger.info(f"Running scheduled live web scrape pass for {name}...")
+                res = subprocess.run(
+                    [sys.executable, "-u", str(script_path), "--max-items", "350"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=900,
+                )
+                if res.returncode == 0:
+                    logger.info(f"{name} live catalog scrape completed; CSV queued for auto-normalization.")
+                else:
+                    logger.warning(f"{name} scraper exited with code {res.returncode}:\n{res.stderr or res.stdout}")
+            except Exception as exc:
+                logger.warning(f"{name} scraper exception: {exc}")
+            time.sleep(10)
+
+        time.sleep(SPECIALTY_INTERVAL_SECONDS)
 
 
 def run_catalog_watcher():
@@ -908,6 +946,9 @@ def main():
 
     zoro_scout_thread = threading.Thread(target=run_periodic_zoro_scout_worker, daemon=True)
     zoro_scout_thread.start()
+
+    specialty_thread = threading.Thread(target=run_periodic_specialty_scrapers_worker, daemon=True)
+    specialty_thread.start()
 
     reorder_thread = threading.Thread(target=run_periodic_reorder_worker, daemon=True)
     reorder_thread.start()
