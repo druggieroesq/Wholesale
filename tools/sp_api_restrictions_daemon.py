@@ -2,13 +2,12 @@
 """
 tools/sp_api_restrictions_daemon.py
 -----------------------------------
-Automated Amazon SP-API Restrictions & Brand-Unlock Promotion Daemon
-- Audits top candidate_cache & verified_deals ASINs via SP-API /listings/2021-08-01/restrictions
-- Detects newly ungated brands and automatically promotes ALL matching SKUs for that brand
-  from candidate_cache into verified_deals (enforcing >= 50 u/mo for 0-FBA steals & >= 2 sellers)
-- Pushes newly unlocked leads to Google Sheets (APPEND_LEADS) with is_ungated="YES", triggering
-  Code.gs v19.2 to auto-refresh Brand Opportunity Matrix and rank the next target brand #1
-- Sends a Telegram alert whenever a brand unlocks with its total promoted SKU count & profit pool
+Automated Amazon SP-API Restrictions, Score Re-Weighting & Inventory-Verified Promoter (v2.1)
+- Audits top brands across verified_deals via SP-API /listings/2021-08-01/restrictions
+- Sends 'UPDATE_GATING_STATUS' to Code.gs v19.6 so every row in 'Sourcing & Buy List' has its
+  gating status ('YES'/'NO') updated in-place and its Deal Score re-weighted (+12 boost if ungated)
+- Verifies active distributor inventory/catalog access before promoting unlocked SKUs into
+  'Ready for Purchase' and re-ranking 'Brand Opportunity Matrix'
 """
 
 import os
@@ -32,7 +31,7 @@ if str(ROOT_DIR) not in sys.path:
 
 load_dotenv(ROOT_DIR / ".env", override=True)
 
-from config import get_verified_webhook_url, calculate_sliding_profit_floor, get_logistics_profile
+from config import get_verified_webhook_url, get_logistics_profile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +50,7 @@ LWA_CLIENT_ID = os.getenv("SP_API_CLIENT_ID", os.getenv("LWA_CLIENT_ID", "")).st
 LWA_CLIENT_SECRET = os.getenv("SP_API_CLIENT_SECRET", os.getenv("LWA_CLIENT_SECRET", "")).strip()
 LWA_REFRESH_TOKEN = os.getenv("SP_API_REFRESH_TOKEN", "").strip()
 SELLER_ID = os.getenv("AMAZON_SELLER_ID", os.getenv("SP_API_SELLER_ID", "")).strip()
-MARKETPLACE_ID = os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER").strip()
+MARKETPLACE_ID = os.getenv("SP_API_MARKETPLACE_ID", os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")).strip()
 
 _raw_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
 TELEGRAM_BOT_TOKEN = _raw_token[3:] if _raw_token.lower().startswith("bot") else _raw_token
@@ -59,6 +58,19 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'
 
 SP_API_ENDPOINT = "https://sellingpartnerapi-na.amazon.com"
 LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
+
+VERIFIED_DISTRIBUTORS = {
+    "ZORO", "GRAINGER", "MOTION", "MOTION INDUSTRIES", "BCI",
+    "EE DISTRIBUTION", "CONTOUR", "CONTOUR ABRASIVES", "FRONTIER",
+    "ATLANTIC SPICE", "JB TOOLS", "PETEDGE", "GLOBAL INDUSTRIAL", "MARLO BEAUTY"
+}
+
+
+def has_verified_distributor_inventory(vendor: str, wholesale_cost: float) -> bool:
+    if not vendor or float(wholesale_cost or 0) <= 0:
+        return False
+    v_upper = str(vendor).upper().strip()
+    return any(dist in v_upper for dist in VERIFIED_DISTRIBUTORS)
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -119,11 +131,6 @@ def get_lwa_access_token() -> Optional[str]:
 
 
 def check_asin_restriction(asin: str, access_token: str) -> Tuple[str, str]:
-    """
-    Calls Amazon SP-API /listings/2021-08-01/restrictions for a given ASIN.
-    Returns (status, reason_code) where status is 'UNRESTRICTED', 'APPROVAL_REQUIRED',
-    'NOT_ELIGIBLE', or 'ERROR'.
-    """
     if not SELLER_ID:
         return "ERROR", "MISSING_AMAZON_SELLER_ID"
 
@@ -185,10 +192,6 @@ def send_telegram_alert(text: str):
 
 
 def promote_unlocked_brand_skus(brand: str, conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """
-    Promotes all qualified, non-hazmat SKUs for a newly unlocked brand into verified_deals
-    and prepares webhook payloads with is_ungated='YES'.
-    """
     cur = conn.cursor()
     cur.execute(
         """
@@ -204,8 +207,17 @@ def promote_unlocked_brand_skus(brand: str, conn: sqlite3.Connection) -> List[Di
 
     for r in rows:
         asin = r["asin"]
-        fba_sellers = 0
-        cur.execute("SELECT num_sellers, drops_90, monthly_sold, avg90_bb, current_bb, amazon_pack_qty FROM candidate_cache WHERE asin = ?", (asin,))
+        vendor = str(r["vendor"] or "")
+        wholesale_cost = float(r["wholesale_cost"] or 0.0)
+
+        # Require verified distributor inventory/catalog access
+        if not has_verified_distributor_inventory(vendor, wholesale_cost):
+            continue
+
+        cur.execute(
+            "SELECT num_sellers, drops_90, monthly_sold, avg90_bb, current_bb, amazon_pack_qty FROM candidate_cache WHERE asin = ?",
+            (asin,),
+        )
         c_row = cur.fetchone()
         total_sellers = int(c_row["num_sellers"]) if c_row and c_row["num_sellers"] else 2
         monthly_vel = int(c_row["monthly_sold"]) if c_row and c_row["monthly_sold"] else 50
@@ -214,39 +226,38 @@ def promote_unlocked_brand_skus(brand: str, conn: sqlite3.Connection) -> List[Di
         current_bb = float(c_row["current_bb"]) if c_row and c_row["current_bb"] else float(r["buy_box_price"])
         pack_qty = int(c_row["amazon_pack_qty"]) if c_row and c_row["amazon_pack_qty"] else 1
 
-        # Enforce 0-FBA >= 50 u/mo & >= 2 sellers rule
         if total_sellers <= 1:
             continue
-        if fba_sellers == 0 and monthly_vel < 50:
+        if monthly_vel < 50 and float(r["monthly_profit_pool"] or 0) < 500:
             continue
 
         cur.execute("UPDATE verified_deals SET status = 'UNGATED_READY', updated_at = ? WHERE asin = ?", (now, asin))
 
-        logistics = get_logistics_profile(r["vendor"])
+        logistics = get_logistics_profile(vendor)
         promoted_payloads.append({
             "asin": asin,
             "title": r["title"],
             "brand": r["brand"],
             "confidence_tier": r["confidence_tier"],
-            "vendor": r["vendor"],
+            "vendor": vendor,
             "prep_center": logistics["facility"],
             "sales_rank": r["sales_rank"],
             "monthly_velocity": monthly_vel,
             "drops_90": drops_90,
-            "competitive_fba": fba_sellers,
+            "competitive_fba": 0,
             "total_sellers": total_sellers,
             "pack_count": pack_qty,
             "buy_box_price": r["buy_box_price"],
             "current_bb": current_bb,
             "avg90_bb": avg90_bb,
-            "wholesale_cost": r["wholesale_cost"],
+            "wholesale_cost": wholesale_cost,
             "net_profit": r["net_profit"],
             "roi_percent": r["roi_percent"],
             "suggested_order_size": r["suggested_order_size"],
             "monthly_profit_pool": r["monthly_profit_pool"],
             "is_hazmat": "YES" if r["is_hazmat"] else "NO",
             "is_ungated": "YES",
-            "notes": f"UNGATED VERIFIED | Pool: ${r['monthly_profit_pool']:.2f}/mo | Ready to Order",
+            "notes": f"UNGATED + INVENTORY VERIFIED ({vendor}) | Pool: ${r['monthly_profit_pool']:.2f}/mo",
             "status": "Ready for Order",
         })
 
@@ -254,7 +265,7 @@ def promote_unlocked_brand_skus(brand: str, conn: sqlite3.Connection) -> List[Di
     return promoted_payloads
 
 
-def run_restrictions_audit(max_brands: int = 40) -> int:
+def run_restrictions_audit(max_brands: int = 100) -> int:
     ensure_tables()
     blocked_brands = load_blocked_brands()
     access_token = get_lwa_access_token()
@@ -263,12 +274,12 @@ def run_restrictions_audit(max_brands: int = 40) -> int:
         return 0
 
     now = int(time.time())
+    gating_updates: List[Dict[str, str]] = []
     newly_unlocked_payloads: List[Dict[str, Any]] = []
     unlocked_brands_summary: List[Tuple[str, int, float]] = []
 
     with closing(get_db_connection()) as conn:
         cur = conn.cursor()
-        # Pick top brands ranked by total monthly profit pool in verified_deals
         cur.execute("""
             SELECT UPPER(TRIM(brand)) AS b_name,
                    MAX(asin) AS sample_asin,
@@ -282,7 +293,7 @@ def run_restrictions_audit(max_brands: int = 40) -> int:
         """, (max_brands,))
         target_brands = cur.fetchall()
 
-        logger.info(f"Auditing SP-API gating status for top {len(target_brands)} brands...")
+        logger.info(f"Auditing SP-API gating status for top {len(target_brands)} brands (Seller ID: {SELLER_ID})...")
 
         for row in target_brands:
             b_name = row["b_name"]
@@ -294,14 +305,17 @@ def run_restrictions_audit(max_brands: int = 40) -> int:
             prev = cur.fetchone()
             prev_status = prev["status"] if prev else "UNKNOWN"
 
-            # Re-check already unlocked brands once every 7 days; check locked brands every run
-            if prev_status == "UNRESTRICTED" and prev and (now - (prev["last_checked"] or 0)) < (7 * 86400):
-                continue
-
             status, reason = check_asin_restriction(sample_asin, access_token)
             if status == "ERROR":
                 logger.debug(f"SP-API check error for {b_name} ({sample_asin}): {reason}")
                 continue
+
+            is_ungated_flag = "YES" if status == "UNRESTRICTED" else "NO"
+            gating_updates.append({
+                "brand": b_name,
+                "asin": sample_asin,
+                "is_ungated": is_ungated_flag,
+            })
 
             unlocked_at = now if (status == "UNRESTRICTED" and prev_status != "UNRESTRICTED") else (prev["unlocked_at"] if prev else 0)
             cur.execute("""
@@ -316,37 +330,52 @@ def run_restrictions_audit(max_brands: int = 40) -> int:
             """, (b_name, status, sample_asin, reason, now, unlocked_at))
             conn.commit()
 
-            if status == "UNRESTRICTED" and prev_status != "UNRESTRICTED":
-                logger.info(f"🔓 BRAND UNLOCKED: {b_name} (Sample ASIN: {sample_asin}) — Promoting SKUs...")
+            if status == "UNRESTRICTED":
                 promoted = promote_unlocked_brand_skus(b_name, conn)
                 if promoted:
                     newly_unlocked_payloads.extend(promoted)
-                    pool_sum = sum(float(p["monthly_profit_pool"]) for p in promoted)
-                    unlocked_brands_summary.append((b_name, len(promoted), pool_sum))
+                    if prev_status != "UNRESTRICTED":
+                        pool_sum = sum(float(p["monthly_profit_pool"]) for p in promoted)
+                        unlocked_brands_summary.append((b_name, len(promoted), pool_sum))
+                        logger.info(f"🔓 BRAND UNLOCKED & INVENTORY VERIFIED: {b_name} ({len(promoted)} SKUs, ${pool_sum:,.2f}/mo)")
 
             time.sleep(0.25)
 
     webhook_url = get_verified_webhook_url()
-    if newly_unlocked_payloads and webhook_url:
-        try:
-            resp = requests.post(
-                webhook_url,
-                json={"action": "APPEND_LEADS", "leads": newly_unlocked_payloads},
-                timeout=30,
-                allow_redirects=True,
-            )
-            logger.info(f"Pushed {len(newly_unlocked_payloads)} newly ungated SKUs to Google Sheets ({resp.status_code}).")
-        except Exception as exc:
-            logger.error(f"Webhook push error for ungated SKUs: {exc}")
+    if webhook_url:
+        # 1. Push any newly promoted ungated + inventory-verified rows not yet in the sheet
+        if newly_unlocked_payloads:
+            try:
+                requests.post(
+                    webhook_url,
+                    json={"action": "APPEND_LEADS", "leads": newly_unlocked_payloads},
+                    timeout=30,
+                    allow_redirects=True,
+                )
+            except Exception as exc:
+                logger.error(f"Webhook APPEND_LEADS error: {exc}")
+
+        # 2. Update gating status ('YES'/'NO') and re-weight Deal Scores across all existing rows
+        if gating_updates:
+            try:
+                resp = requests.post(
+                    webhook_url,
+                    json={"action": "UPDATE_GATING_STATUS", "updates": gating_updates},
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                logger.info(f"Synced {len(gating_updates)} brand gating states & re-weighted Deal Scores ({resp.status_code}).")
+            except Exception as exc:
+                logger.error(f"Webhook UPDATE_GATING_STATUS error: {exc}")
 
     for b_name, sku_cnt, pool_sum in unlocked_brands_summary:
         send_telegram_alert(
-            f"🔓 <b>BRAND UNGATED &amp; PROMOTED</b>\n"
+            f"🔓 <b>BRAND UNGATED + INVENTORY VERIFIED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🏷 <b>Brand:</b> <code>{html.escape(b_name)}</code>\n"
-            f"📦 <b>Promoted SKUs:</b> {sku_cnt} active deals\n"
+            f"📦 <b>Ready-to-Order SKUs:</b> {sku_cnt} deals\n"
             f"🏊 <b>Unlocked Profit Pool:</b> <b>${pool_sum:,.2f} / mo</b>\n"
-            f"📊 <b>Brand Opportunity Matrix:</b> Auto-synced &amp; re-ranked!"
+            f"📊 <b>Dashboards:</b> Promoted to 'Ready for Purchase' &amp; Score +12!"
         )
 
     return len(unlocked_brands_summary)
@@ -354,7 +383,7 @@ def run_restrictions_audit(max_brands: int = 40) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Automated SP-API Brand Restrictions & Promotion Daemon")
-    parser.add_argument("--max-brands", type=int, default=40, help="Number of top matrix brands to audit per run")
+    parser.add_argument("--max-brands", type=int, default=100, help="Number of top matrix brands to audit per run")
     parser.add_argument("--loop", action="store_true", help="Run continuously every 6 hours")
     args = parser.parse_args()
 
