@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Master Orchestrator & Centralized Telegram Gateway (v7.9.1 Self-Healing Engine)
+Master Orchestrator & Centralized Telegram Gateway (v7.9.2 Self-Healing Engine)
 -------------------------------------------------------------------------------
 Supervises dedicated background workers and automated catalog ingestion:
 1. ReverseAmazonHunter         (tools/reverse_amazon_finder.py)
@@ -13,10 +13,11 @@ Supervises dedicated background workers and automated catalog ingestion:
 8. Embedded Threads:
    - HealthServer
    - MasterTelegramListener
-   - TwoTierCatalogWatcher (auto-routes motion*.csv/xlsx to ingest_motion_catalog.py)
+   - TwoTierCatalogWatcher (auto-routes motion* -> ingest_motion_catalog.py & bci* -> ingest_bci_catalog.py)
    - PeriodicEEDistributionWorker (auto-scrapes EE Distribution every 12h & triggers cross-match)
    - PeriodicZoroScoutWorker (auto-scans Zoro.com MRO portal every 12h with SP-API verification)
    - PeriodicSpecialtyScrapersWorker (auto-scrapes Atlantic Spice, JB Tools & Marlo Beauty every 12h)
+   - PeriodicBeautyMultipackWorker (hunts 0-FBA Beauty multipacks >=58% ROI every 12h)
    - PeriodicReorderWorker
 """
 
@@ -96,6 +97,7 @@ REORDER_INTERVAL_SECONDS = int(os.getenv("REORDER_INTERVAL_SECONDS", 21600))
 EE_DIST_INTERVAL_SECONDS = int(os.getenv("EE_DIST_INTERVAL_SECONDS", 43200))
 ZORO_INTERVAL_SECONDS = int(os.getenv("ZORO_INTERVAL_SECONDS", 43200))
 SPECIALTY_INTERVAL_SECONDS = int(os.getenv("SPECIALTY_INTERVAL_SECONDS", 43200))
+BEAUTY_MULTIPACK_INTERVAL_SECONDS = int(os.getenv("BEAUTY_MULTIPACK_INTERVAL_SECONDS", 43200))
 
 for p in [REPORTS_DIR, DATA_DIR, CATALOG_DIR, PO_DIR, WHOLESALE_INCOMING, WHOLESALE_INDEXED, MFR_INCOMING, MFR_INDEXED]:
     p.mkdir(parents=True, exist_ok=True)
@@ -123,7 +125,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_1_self_healing_orchestrator"}')
+            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_2_self_healing_orchestrator"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -619,6 +621,20 @@ def sync_distributor_database():
         except Exception as exc:
             logger.warning(f"Drive sync startup notice: {exc}")
 
+    # Ensure BCI Full Inventory workbook is indexed on startup if present
+    bci_ingest = ROOT_DIR / "tools" / "ingest_bci_catalog.py"
+    bci_index = WHOLESALE_INDEXED / "bci_normalized_index.csv"
+    if bci_ingest.exists():
+        bci_files = list(CATALOG_DIR.rglob("*BCI*.xlsx"))
+        if bci_files:
+            newest_bci = max(bci_files, key=lambda x: x.stat().st_mtime)
+            if not bci_index.exists() or bci_index.stat().st_mtime < newest_bci.stat().st_mtime:
+                logger.info(f"Indexing BCI Full Inventory workbook on startup: {newest_bci.name}...")
+                try:
+                    subprocess.run([sys.executable, str(bci_ingest), "--feed", str(newest_bci)], check=False, timeout=120)
+                except Exception as exc:
+                    logger.warning(f"BCI startup ingest notice: {exc}")
+
     for name in ["sync_distributor_catalogs.py", "distributor_credential_sync.py"]:
         sync_script = ROOT_DIR / "tools" / name
         if sync_script.exists():
@@ -774,10 +790,41 @@ def run_periodic_specialty_scrapers_worker():
         time.sleep(SPECIALTY_INTERVAL_SECONDS)
 
 
+def run_periodic_beauty_multipack_worker():
+    """Hunts 0-FBA Beauty & Salon multipacks (>= 58% ROI, >= 50 u/mo) every 12h after Marlo Beauty scrapes."""
+    beauty_script = ROOT_DIR / "tools" / "beauty_multipack_scout.py"
+    if not beauty_script.exists():
+        logger.info("tools/beauty_multipack_scout.py not found. Beauty multipack worker in standby.")
+        return
+
+    logger.info(f"Periodic Beauty Multipack Scout ACTIVE (Interval: {BEAUTY_MULTIPACK_INTERVAL_SECONDS}s).")
+    time.sleep(210)
+
+    while True:
+        try:
+            logger.info("Running scheduled Keepa + Marlo Beauty 0-FBA Multipack sweep...")
+            res = subprocess.run(
+                [sys.executable, "-u", str(beauty_script), "--max-asins", "120"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=600,
+            )
+            if res.returncode == 0:
+                logger.info("Beauty Multipack sweep completed successfully.")
+            else:
+                logger.warning(f"Beauty Multipack scout exited with code {res.returncode}:\n{res.stderr or res.stdout}")
+        except Exception as exc:
+            logger.warning(f"Beauty Multipack worker exception: {exc}")
+
+        time.sleep(BEAUTY_MULTIPACK_INTERVAL_SECONDS)
+
+
 def run_catalog_watcher():
-    logger.info("Two-Tier Catalog Hot-Reload Watcher is ACTIVE.")
+    logger.info("Two-Tier Catalog Hot-Reload Watcher is ACTIVE (Motion OEM + BCI Wholesale + Universal).")
     normalizer_script = ROOT_DIR / "tools" / "catalog_normalizer.py"
     motion_script = ROOT_DIR / "ingest_motion_catalog.py"
+    bci_script = ROOT_DIR / "tools" / "ingest_bci_catalog.py"
 
     watch_targets = [
         (MFR_INCOMING, MFR_INDEXED, "MANUFACTURER"),
@@ -803,6 +850,7 @@ def run_catalog_watcher():
                             if f_key not in _KNOWN_CATALOG_MTIMES or _KNOWN_CATALOG_MTIMES[f_key] < mtime:
                                 time.sleep(1)
 
+                                # Auto-route Motion.com spreadsheets through standalone OEM normalizer
                                 if "motion" in f.name.lower() and motion_script.exists():
                                     logger.info(f"[MOTION OEM TIER] Motion feed detected: {f.name}. Routing to ingest_motion_catalog.py...")
                                     cmd = [sys.executable, str(motion_script), "--feed", str(f)]
@@ -813,6 +861,19 @@ def run_catalog_watcher():
                                         detected_changes = True
                                     else:
                                         logger.error(f"Failed normalizing Motion feed {f.name}:\n{res.stderr or res.stdout}")
+                                    continue
+
+                                # Auto-route BCI Full Inventory workbooks through dedicated Inven5Full parser
+                                if "bci" in f.name.lower() and bci_script.exists():
+                                    logger.info(f"[BCI WHOLESALE TIER] BCI inventory detected: {f.name}. Routing to ingest_bci_catalog.py...")
+                                    cmd = [sys.executable, str(bci_script), "--feed", str(f)]
+                                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                                    if res.returncode == 0:
+                                        logger.info(f"Successfully normalized BCI catalog: {f.name}")
+                                        _KNOWN_CATALOG_MTIMES[f_key] = mtime
+                                        detected_changes = True
+                                    else:
+                                        logger.error(f"Failed normalizing BCI feed {f.name}:\n{res.stderr or res.stdout}")
                                     continue
 
                                 logger.info(f"[{tier} TIER] New price list detected: {f.name}. Auto-normalizing to {out_dir.name}...")
@@ -925,7 +986,7 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
 
 
 def main():
-    logger.info(f"Initializing Master Pipeline Orchestrator v7.9.1 (Target Webhook: {get_verified_webhook_url()})...")
+    logger.info(f"Initializing Master Pipeline Orchestrator v7.9.2 (Target Webhook: {get_verified_webhook_url()})...")
 
     load_ip_blocklist_cached()
 
@@ -948,6 +1009,9 @@ def main():
 
     specialty_thread = threading.Thread(target=run_periodic_specialty_scrapers_worker, daemon=True)
     specialty_thread.start()
+
+    beauty_multipack_thread = threading.Thread(target=run_periodic_beauty_multipack_worker, daemon=True)
+    beauty_multipack_thread.start()
 
     reorder_thread = threading.Thread(target=run_periodic_reorder_worker, daemon=True)
     reorder_thread.start()
