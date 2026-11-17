@@ -8,9 +8,10 @@ schedule>=1.2.0
 
 # --- Web Scraping & Stealth Portal Crawling ---
 requests>=2.31.0
+httpx>=0.27.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
-playwright>=1.43.0
+playwright>=1.46.0
 urllib3>=2.0.0
 
 # --- Environment, Process & Automation Utilities ---
@@ -22,6 +23,7 @@ psutil>=5.9.8
 
 # --- Catalog Data Engine, Spreadsheets & Parquet ---
 pandas>=2.2.0
+numpy>=1.26.4
 openpyxl>=3.1.2
 pyarrow>=14.0.0
 fastparquet>=2024.2.0
