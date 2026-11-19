@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-tools/push_full_backlog_to_sheet.py (v2.3 — 784-Brand Shield + Precision Wholesale Streamer)
----------------------------------------------------------------------------------------------
-Mirrors Code.gs v20.10 end-to-end when streaming leads from data/hunter_engine.db:
-  1. Full 784-Brand Shield (embedded + /app/data/ip_blocklist.json) with Unicode accent stripping
-     and space-bounded multi-word substring protection (len >= 5).
-  2. Precision Wholesale Gates:
-       - Min Buy Box: >= $13.50
-       - Min True Net Profit / Unit: >= $5.00
-       - Min Monthly Net Profit Pool (Our Realistic Split Share): >= $500.00/mo
-       - Min Real Keepa Velocity (monthly_sold or drops_90): >= 40 u/mo (>= 60 u/mo for 0-FBA steals)
-       - FBA Seller Window: 0 FBA (with >= 3 FBM sellers) OR 2 to 4 FBA sellers
-  3. Exact UPC/EAN distributor catalog matching + SP-API brand_gating_state join.
+tools/push_full_backlog_to_sheet.py (v2.4 — Multipack Loophole + Two-Tier Thresholds + 784-Brand Shield)
+---------------------------------------------------------------------------------------------------------
+Mirrors Code.gs v20.11 end-to-end when streaming leads from data/hunter_engine.db:
+  1. Tier 1A — Verified Distributor Multipack Loophole (Pack >= 2 on Marlo Beauty, Frontier Co-op,
+     Atlantic Spice, EE Distribution, BCI, Motion, Zoro, JB Tools):
+       - Min Buy Box: >= $13.50 | Min Net/Unit: >= $2.25 | Min Monthly Pool: >= $180/mo | Min Vel: >= 25 u/mo
+  2. Tier 1B — Verified Distributor Single-Unit (Pack == 1):
+       - Min Buy Box: >= $13.50 | Min Net/Unit: >= $3.00 | Min Monthly Pool: >= $250/mo | Min Vel: >= 25 u/mo
+  3. Tier 2 — Unmapped Keepa Candidates (Needs Catalog Match):
+       - Min Buy Box: >= $13.50 | Min Net/Unit: >= $5.00 | Min Monthly Pool: >= $500/mo | Min Vel: >= 40 u/mo (60 if 0-FBA)
+  4. Full 784-Brand Shield with Unicode accent stripping & space-bounded substring protection.
 """
 
 import os
@@ -57,6 +56,12 @@ PRIMARY_IP_FILE = DATA_DIR / "ip_blocklist.json"
 PACK_REGEX = re.compile(
     r"(?:(\d+)\s*[- ]*(?:pack|pk|count|ct|pcs|pieces|set|bundle)|pack\s*of\s*(\d+)|set\s*of\s*(\d+))",
     re.IGNORECASE,
+)
+
+VERIFIED_DISTRIBUTOR_KEYWORDS = (
+    "ZORO", "GRAINGER", "MOTION", "BCI", "EE DISTRIBUTION", "CONTOUR",
+    "FRONTIER", "ATLANTIC SPICE", "JB TOOLS", "PETEDGE", "GLOBAL INDUSTRIAL",
+    "MARLO BEAUTY", "MSC DIRECT", "MIDLAND METAL"
 )
 
 EMBEDDED_784_BLOCKED_BRANDS: Set[str] = {
@@ -196,6 +201,13 @@ def norm_brand(brand_str: Any) -> str:
     return s.upper().strip()
 
 
+def is_verified_vendor(vendor_str: str) -> bool:
+    v = str(vendor_str or "").upper().strip()
+    if not v or "TARGET BRAND" in v or "UNMAPPED" in v or v in ("UNKNOWN", "NONE", "LOCAL HUB", "DISTRIBUTOR CATALOG"):
+        return False
+    return any(k in v for k in VERIFIED_DISTRIBUTOR_KEYWORDS)
+
+
 def load_blocked_brands() -> Tuple[Set[str], List[str]]:
     blocked: Set[str] = {norm_brand(b) for b in EMBEDDED_784_BLOCKED_BRANDS if b}
     for p in (PRIMARY_IP_FILE, ROOT_DIR / "data" / "ip_blocklist.json"):
@@ -241,8 +253,9 @@ def estimate_real_velocity(monthly_sold: Any, drops_90: Any) -> int:
     return 0
 
 
-def is_valid_fba_window(comp_fba: int, total_sellers: int) -> bool:
-    if comp_fba == 0 and total_sellers >= 3:
+def is_valid_fba_window(comp_fba: int, total_sellers: int, is_verified_multipack: bool) -> bool:
+    min_fbm = 2 if is_verified_multipack else 3
+    if comp_fba == 0 and total_sellers >= min_fbm:
         return True
     if 2 <= comp_fba <= 4:
         return True
@@ -345,14 +358,7 @@ def get_table_columns(cur: sqlite3.Cursor, table_name: str) -> Set[str]:
         return set()
 
 
-def build_precision_pipeline_payloads(
-    min_velocity: int = 40,
-    min_zero_fba_velocity: int = 60,
-    min_net_unit: float = 5.00,
-    min_monthly_pool: float = 500.0,
-    min_roi: float = 15.0,
-    max_leads: int = 2500,
-) -> List[Dict[str, Any]]:
+def build_two_tier_pipeline_payloads(max_leads: int = 2500) -> List[Dict[str, Any]]:
     if not DB_PATH.exists():
         logger.error(f"SQLite database not found at {DB_PATH}")
         return []
@@ -379,12 +385,15 @@ def build_precision_pipeline_payloads(
                 if nb:
                     ungated_brands.add(nb)
 
-        # 1. Verified Deals first
+        # 1. Verified Deals first (includes Multipack Loophole + Reverse UPC Matches)
         if vd_cols:
             cur.execute("""
                 SELECT * FROM verified_deals
                 WHERE status IS NULL OR UPPER(TRIM(status)) NOT IN ('REJECTED', 'BLOCKED_IP_BRAND', 'DELETED')
-                ORDER BY monthly_profit_pool DESC, roi_percent DESC
+                ORDER BY
+                    CASE WHEN confidence_tier LIKE '%MULTIPACK%' OR confidence_tier LIKE '%UPC%' THEN 0 ELSE 1 END,
+                    monthly_profit_pool DESC,
+                    roi_percent DESC
             """)
             for row in cur.fetchall():
                 if len(payloads) >= max_leads:
@@ -402,41 +411,59 @@ def build_precision_pipeline_payloads(
 
                 c_row = cur.execute("SELECT * FROM candidate_cache WHERE asin = ?", (asin,)).fetchone() if cc_cols else None
                 cd = dict(c_row) if c_row else {}
+
+                vendor = str(d.get("vendor") or "").strip()
+                if not is_verified_vendor(vendor):
+                    for uf in ("upc", "ean"):
+                        u = normalize_upc(cd.get(uf))
+                        if u and u in upc_map:
+                            vendor = upc_map[u]["vendor"]
+                            break
+                if not is_verified_vendor(vendor):
+                    vendor = "Unmapped (Needs Catalog Match)"
+
+                verified_cost = is_verified_vendor(vendor)
+                title = str(d.get("title") or "").strip()
+                pack = extract_pack_qty(title, cd.get("amazon_pack_qty"))
+                is_mp_loophole = verified_cost and (pack >= 2)
+
                 fba = int(cd.get("fba_sellers") if cd.get("fba_sellers") is not None else (d.get("competitive_fba") or 0))
-                total_sellers = int(cd.get("num_sellers") or (3 if fba == 0 else fba))
-                if not is_valid_fba_window(fba, total_sellers):
+                total_sellers = int(cd.get("num_sellers") or (2 if is_mp_loophole and fba == 0 else (3 if fba == 0 else fba)))
+                if not is_valid_fba_window(fba, total_sellers, is_mp_loophole):
                     continue
 
                 drops = int(cd.get("drops_90") or 0)
                 vel = estimate_real_velocity(cd.get("monthly_sold") or d.get("monthly_velocity"), drops)
-                if vel < min_velocity or (fba == 0 and vel < min_zero_fba_velocity):
-                    continue
+                if verified_cost:
+                    if vel < 25:
+                        continue
+                else:
+                    if vel < 40 or (fba == 0 and vel < 60):
+                        continue
 
                 ref_pct = float(cd.get("referral_pct") or 0.15)
                 fba_fee = float(cd.get("fba_fee") or max(3.50, bb * 0.18))
                 net_profit = float(d.get("net_profit") or round(bb - (bb * ref_pct) - fba_fee - cost, 2))
-                if net_profit < min_net_unit or net_profit >= bb:
+                min_net = 2.25 if is_mp_loophole else (3.00 if verified_cost else 5.00)
+                if net_profit < min_net or net_profit >= bb:
                     continue
 
                 eff_comp = fba if fba > 0 else max(1, round(total_sellers * 0.45))
                 our_share = max(1, round(vel / (eff_comp + 1)))
                 monthly_pool = round(our_share * net_profit, 2)
-                if monthly_pool < min_monthly_pool:
+                min_pool = 180.0 if is_mp_loophole else (250.0 if verified_cost else 500.0)
+                if monthly_pool < min_pool:
                     continue
-
-                vendor = str(d.get("vendor") or "").strip()
-                if not vendor or "TARGET BRAND" in vendor.upper() or vendor.upper() in ("UNKNOWN", "NONE", "UNMAPPED"):
-                    vendor = "Unmapped (Needs Catalog Match)"
 
                 logistics = get_logistics_profile(vendor)
                 seen_asins.add(asin)
                 payloads.append({
                     "asin": asin,
-                    "title": str(d.get("title") or "").strip(),
+                    "title": title,
                     "brand": brand,
                     "vendor": vendor,
-                    "prep_center": logistics["facility"],
-                    "pack_count": extract_pack_qty(d.get("title"), cd.get("amazon_pack_qty")),
+                    "prep_center": "Bundle Poly-Bag + FNSKU" if is_mp_loophole else logistics["facility"],
+                    "pack_count": pack,
                     "sales_rank": int(cd.get("sales_rank") or d.get("sales_rank") or 0),
                     "monthly_velocity": vel,
                     "drops_90": drops,
@@ -453,12 +480,15 @@ def build_precision_pipeline_payloads(
                     "is_ungated": "YES" if (norm_brand(brand) in ungated_brands or str(d.get("status") or "").upper() == "UNGATED_READY") else "NO",
                 })
 
-        # 2. High-conviction candidate_cache ASINs meeting $5/unit + $500/mo pool + 0 (>=3 FBM) or 2-4 FBA
+        # 2. Candidate Cache (Two-Tier: Verified Catalog Matches >= $2.25/$3.00 vs Unmapped >= $5.00)
         if cc_cols and len(payloads) < max_leads:
             cur.execute("""
                 SELECT * FROM candidate_cache
                 WHERE status IS NULL OR UPPER(TRIM(status)) NOT IN ('BLOCKED_IP_BRAND', 'REJECTED', 'DELETED')
-                ORDER BY monthly_sold DESC, drops_90 DESC, sales_rank ASC
+                ORDER BY
+                    CASE WHEN matched_vendor IS NOT NULL AND matched_vendor != '' THEN 0 ELSE 1 END,
+                    monthly_sold DESC,
+                    drops_90 DESC
             """)
             for row in cur.fetchall():
                 if len(payloads) >= max_leads:
@@ -473,16 +503,6 @@ def build_precision_pipeline_payloads(
                 if bb < 13.50:
                     continue
 
-                fba = int(d.get("fba_sellers") or 0)
-                total_sellers = int(d.get("num_sellers") or 0)
-                if not is_valid_fba_window(fba, total_sellers):
-                    continue
-
-                drops = int(d.get("drops_90") or 0)
-                vel = estimate_real_velocity(d.get("monthly_sold"), drops)
-                if vel < min_velocity or (fba == 0 and vel < min_zero_fba_velocity):
-                    continue
-
                 title = str(d.get("title") or "").strip()
                 pack = extract_pack_qty(title, d.get("amazon_pack_qty"))
                 matched = None
@@ -494,10 +514,30 @@ def build_precision_pipeline_payloads(
 
                 if matched:
                     vendor = matched["vendor"]
-                    ws_cost = round((matched["unit_cost"] * pack) + 1.25, 2)
+                    ws_cost = round((matched["unit_cost"] * pack) + (1.25 if pack >= 2 else 0.75), 2)
+                elif is_verified_vendor(str(d.get("matched_vendor") or "")) and float(d.get("wholesale_cost") or 0) > 0.05:
+                    vendor = str(d.get("matched_vendor")).strip()
+                    ws_cost = float(d.get("wholesale_cost"))
                 else:
                     vendor = "Unmapped (Needs Catalog Match)"
                     ws_cost = round(bb * 0.36, 2)
+
+                verified_cost = is_verified_vendor(vendor)
+                is_mp_loophole = verified_cost and (pack >= 2)
+
+                fba = int(d.get("fba_sellers") or 0)
+                total_sellers = int(d.get("num_sellers") or 0)
+                if not is_valid_fba_window(fba, total_sellers, is_mp_loophole):
+                    continue
+
+                drops = int(d.get("drops_90") or 0)
+                vel = estimate_real_velocity(d.get("monthly_sold"), drops)
+                if verified_cost:
+                    if vel < 25:
+                        continue
+                else:
+                    if vel < 40 or (fba == 0 and vel < 60):
+                        continue
 
                 if ws_cost <= 0.05 or ws_cost >= bb:
                     continue
@@ -505,17 +545,19 @@ def build_precision_pipeline_payloads(
                 ref_pct = float(d.get("referral_pct") or 0.15)
                 fba_fee = float(d.get("fba_fee") or max(3.50, bb * 0.18))
                 net_profit = round(bb - (bb * ref_pct) - fba_fee - ws_cost, 2)
-                if net_profit < min_net_unit or net_profit >= bb:
+                min_net = 2.25 if is_mp_loophole else (3.00 if verified_cost else 5.00)
+                if net_profit < min_net or net_profit >= bb:
                     continue
 
                 roi_pct = round((net_profit / ws_cost) * 100.0, 1)
-                if roi_pct < min_roi or roi_pct > 350.0:
+                if roi_pct < 15.0 or roi_pct > 350.0:
                     continue
 
                 eff_comp = fba if fba > 0 else max(1, round(total_sellers * 0.45))
                 our_share = max(1, round(vel / (eff_comp + 1)))
                 monthly_pool = round(our_share * net_profit, 2)
-                if monthly_pool < min_monthly_pool:
+                min_pool = 180.0 if is_mp_loophole else (250.0 if verified_cost else 500.0)
+                if monthly_pool < min_pool:
                     continue
 
                 logistics = get_logistics_profile(vendor)
@@ -525,7 +567,7 @@ def build_precision_pipeline_payloads(
                     "title": title,
                     "brand": brand,
                     "vendor": vendor,
-                    "prep_center": logistics["facility"],
+                    "prep_center": "Bundle Poly-Bag + FNSKU" if is_mp_loophole else logistics["facility"],
                     "pack_count": pack,
                     "sales_rank": int(d.get("sales_rank") or 0),
                     "monthly_velocity": vel,
@@ -565,37 +607,18 @@ def post_batch_with_retry(webhook_url: str, action: str, batch: List[Dict[str, A
     return None
 
 
-def stream_backlog(
-    batch_size: int = 100,
-    min_velocity: int = 40,
-    min_zero_fba_velocity: int = 60,
-    min_net_unit: float = 5.00,
-    min_monthly_pool: float = 500.0,
-    min_roi: float = 15.0,
-    max_leads: int = 2500,
-    wipe_first: bool = False,
-    dry_run: bool = False,
-):
+def stream_backlog(batch_size: int = 100, max_leads: int = 2500, wipe_first: bool = False, dry_run: bool = False):
     webhook_url = get_verified_webhook_url()
     if not webhook_url and not dry_run:
         logger.error("No Google Sheets webhook URL configured.")
         sys.exit(1)
 
-    leads = build_precision_pipeline_payloads(
-        min_velocity=min_velocity,
-        min_zero_fba_velocity=min_zero_fba_velocity,
-        min_net_unit=min_net_unit,
-        min_monthly_pool=min_monthly_pool,
-        min_roi=min_roi,
-        max_leads=max_leads,
-    )
+    leads = build_two_tier_pipeline_payloads(max_leads=max_leads)
     total = len(leads)
     dist_counts = Counter(l["vendor"] for l in leads)
+    mp_count = sum(1 for l in leads if l["pack_count"] >= 2 and is_verified_vendor(l["vendor"]))
 
-    logger.info(
-        f"Prepared {total:,} precision leads (>= {min_velocity} u/mo | >= ${min_net_unit:.2f}/unit | "
-        f">= ${min_monthly_pool:,.0f}/mo pool | 0 (>=3 FBM) or 2-4 FBA | 784-Brand Shield)."
-    )
+    logger.info(f"Prepared {total:,} Two-Tier Wholesale leads ({mp_count:,} Verified Multipack Loophole leads).")
     for dist, cnt in dist_counts.most_common():
         logger.info(f"   -> {dist}: {cnt:,}")
 
@@ -626,17 +649,12 @@ def stream_backlog(
 
         time.sleep(0.9)
 
-    logger.info(f"Precision backlog sync complete! Total leads admitted: {total_admitted:,} / {total:,}.")
+    logger.info(f"Two-Tier Backlog sync complete! Total leads admitted: {total_admitted:,} / {total:,}.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="784-Brand Shield + Precision Wholesale Streamer (v2.3)")
+    parser = argparse.ArgumentParser(description="Two-Tier Multipack Loophole + 784-Brand Streamer (v2.4)")
     parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--min-velocity", type=int, default=40)
-    parser.add_argument("--min-zero-fba-velocity", type=int, default=60)
-    parser.add_argument("--min-net-unit", type=float, default=5.00)
-    parser.add_argument("--min-monthly-pool", type=float, default=500.0)
-    parser.add_argument("--min-roi", type=float, default=15.0)
     parser.add_argument("--max-leads", type=int, default=2500)
     parser.add_argument("--wipe-first", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -644,11 +662,6 @@ if __name__ == "__main__":
 
     stream_backlog(
         batch_size=args.batch_size,
-        min_velocity=args.min_velocity,
-        min_zero_fba_velocity=args.min_zero_fba_velocity,
-        min_net_unit=args.min_net_unit,
-        min_monthly_pool=args.min_monthly_pool,
-        min_roi=args.min_roi,
         max_leads=args.max_leads,
         wipe_first=args.wipe_first,
         dry_run=args.dry_run,
