@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-tools/push_full_backlog_to_sheet.py (v2.4 — Multipack Loophole + Two-Tier Thresholds + 784-Brand Shield)
----------------------------------------------------------------------------------------------------------
-Mirrors Code.gs v20.11 end-to-end when streaming leads from data/hunter_engine.db:
-  1. Tier 1A — Verified Distributor Multipack Loophole (Pack >= 2 on Marlo Beauty, Frontier Co-op,
-     Atlantic Spice, EE Distribution, BCI, Motion, Zoro, JB Tools):
+tools/push_full_backlog_to_sheet.py (v2.5 — Permanent Backlog Recovery + Multipack Loophole + 784-Brand Shield)
+-------------------------------------------------------------------------------------------------------------
+Mirrors Code.gs v20.12 end-to-end when streaming leads from data/hunter_engine.db:
+  1. Recovers and evaluates ALL valid candidate_cache records (including UNMAPPED_CANDIDATE and
+     non-manufacturer 0-FBA rows) so the pipeline never drops to 34 rows.
+  2. Tier 1A — Verified Distributor Multipack Loophole (Pack >= 2):
        - Min Buy Box: >= $13.50 | Min Net/Unit: >= $2.25 | Min Monthly Pool: >= $180/mo | Min Vel: >= 25 u/mo
-  2. Tier 1B — Verified Distributor Single-Unit (Pack == 1):
+  3. Tier 1B — Verified Distributor Single-Unit (Pack == 1):
        - Min Buy Box: >= $13.50 | Min Net/Unit: >= $3.00 | Min Monthly Pool: >= $250/mo | Min Vel: >= 25 u/mo
-  3. Tier 2 — Unmapped Keepa Candidates (Needs Catalog Match):
-       - Min Buy Box: >= $13.50 | Min Net/Unit: >= $5.00 | Min Monthly Pool: >= $500/mo | Min Vel: >= 40 u/mo (60 if 0-FBA)
-  4. Full 784-Brand Shield with Unicode accent stripping & space-bounded substring protection.
+  4. Tier 2 — Unmapped Keepa Candidates (Needs Catalog Match):
+       - Min Buy Box: >= $13.50 | Min Net/Unit: >= $5.00 | Min Monthly Pool: >= $500/mo | Min Vel: >= 60 u/mo
+  5. Full 784-Brand Shield + exact 'PRO' / 'GENERIC' block.
 """
 
 import os
@@ -63,6 +64,10 @@ VERIFIED_DISTRIBUTOR_KEYWORDS = (
     "FRONTIER", "ATLANTIC SPICE", "JB TOOLS", "PETEDGE", "GLOBAL INDUSTRIAL",
     "MARLO BEAUTY", "MSC DIRECT", "MIDLAND METAL"
 )
+
+EXACT_GENERIC_BRANDS: Set[str] = {
+    "PRO", "GENERIC", "UNKNOWN", "UNBRANDED", "N/A", "NONE", "OEM"
+}
 
 EMBEDDED_784_BLOCKED_BRANDS: Set[str] = {
     "365 BY WHOLE FOODS", "3M", "ABUS", "ACANA", "ACDELCO", "ADAFRUIT", "ADDLON",
@@ -230,12 +235,12 @@ def load_blocked_brands() -> Tuple[Set[str], List[str]]:
 
 def is_blocked_brand(brand_str: str, blocked_set: Set[str], multi_word_list: List[str]) -> bool:
     b = norm_brand(brand_str)
-    if not b or len(b) < 3:
+    if not b or len(b) < 3 or b in EXACT_GENERIC_BRANDS:
         return True
     if b in blocked_set:
         return True
     normalized = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9\s&'-]", " ", b)).strip()
-    if normalized in blocked_set:
+    if normalized in EXACT_GENERIC_BRANDS or normalized in blocked_set:
         return True
     for entry in multi_word_list:
         if normalized.startswith(entry + " ") or (" " + entry) in normalized:
@@ -358,7 +363,7 @@ def get_table_columns(cur: sqlite3.Cursor, table_name: str) -> Set[str]:
         return set()
 
 
-def build_two_tier_pipeline_payloads(max_leads: int = 2500) -> List[Dict[str, Any]]:
+def build_two_tier_pipeline_payloads(max_leads: int = 2000) -> List[Dict[str, Any]]:
     if not DB_PATH.exists():
         logger.error(f"SQLite database not found at {DB_PATH}")
         return []
@@ -480,11 +485,18 @@ def build_two_tier_pipeline_payloads(max_leads: int = 2500) -> List[Dict[str, An
                     "is_ungated": "YES" if (norm_brand(brand) in ungated_brands or str(d.get("status") or "").upper() == "UNGATED_READY") else "NO",
                 })
 
-        # 2. Candidate Cache (Two-Tier: Verified Catalog Matches >= $2.25/$3.00 vs Unmapped >= $5.00)
+        # 2. Candidate Cache (includes UNMAPPED_CANDIDATE & non-manufacturer 0-FBA discoveries)
         if cc_cols and len(payloads) < max_leads:
             cur.execute("""
                 SELECT * FROM candidate_cache
-                WHERE status IS NULL OR UPPER(TRIM(status)) NOT IN ('BLOCKED_IP_BRAND', 'REJECTED', 'DELETED')
+                WHERE (
+                    status IS NULL
+                    OR UPPER(TRIM(status)) NOT IN (
+                        'BLOCKED_IP_BRAND', 'RESTRICTED_BRAND', 'REJECTED', 'DELETED',
+                        'STRUCTURAL_REJECT', 'HIGH_RETURN_CATEGORY', 'POOR_REVIEWS', 'OVERWEIGHT'
+                    )
+                )
+                AND COALESCE(drop_reason, '') NOT LIKE '%Manufacturer/Brand Owner%'
                 ORDER BY
                     CASE WHEN matched_vendor IS NOT NULL AND matched_vendor != '' THEN 0 ELSE 1 END,
                     monthly_sold DESC,
@@ -607,7 +619,7 @@ def post_batch_with_retry(webhook_url: str, action: str, batch: List[Dict[str, A
     return None
 
 
-def stream_backlog(batch_size: int = 100, max_leads: int = 2500, wipe_first: bool = False, dry_run: bool = False):
+def stream_backlog(batch_size: int = 100, max_leads: int = 2000, wipe_first: bool = False, dry_run: bool = False):
     webhook_url = get_verified_webhook_url()
     if not webhook_url and not dry_run:
         logger.error("No Google Sheets webhook URL configured.")
@@ -653,9 +665,9 @@ def stream_backlog(batch_size: int = 100, max_leads: int = 2500, wipe_first: boo
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Two-Tier Multipack Loophole + 784-Brand Streamer (v2.4)")
+    parser = argparse.ArgumentParser(description="Permanent Two-Tier Multipack Loophole + 784-Brand Streamer (v2.5)")
     parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--max-leads", type=int, default=2500)
+    parser.add_argument("--max-leads", type=int, default=2000)
     parser.add_argument("--wipe-first", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
