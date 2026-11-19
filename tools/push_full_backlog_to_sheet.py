@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-tools/push_full_backlog_to_sheet.py (v2.0 — BSR-Aware Full Database & Catalog Streamer)
---------------------------------------------------------------------------------------
-Permanent repository script for streaming all qualifying deals from data/hunter_engine.db
-into Google Sheets (Code.gs v20.5+):
-  1. Resolves real monthly velocity via: monthly_sold -> drops_90 -> sales_rank (BSR)
-     so commercial/industrial SKUs without a retail monthlySold badge are never dropped.
-  2. Joins both verified_deals AND candidate_cache against all indexed distributor catalogs
-     (BCI, Motion Industries, Zoro, EE Distribution, Marlo Beauty, JB Tools, Atlantic Spice)
-     and brand_gating_state (SP-API UNRESTRICTED -> is_ungated='YES').
-  3. Enforces >= 50 u/mo minimum velocity floor, <= 6 FBA sellers, and IP blocklist filtering.
-  4. Streams in 100-row batches with skip_sync=True on intermediate chunks and full dashboard
-     rebuild (Brand Opportunity Matrix, Distributor Breakdown, Ready for Purchase) on final chunk.
+tools/push_full_backlog_to_sheet.py (v2.3 — 784-Brand Shield + Precision Wholesale Streamer)
+---------------------------------------------------------------------------------------------
+Mirrors Code.gs v20.10 end-to-end when streaming leads from data/hunter_engine.db:
+  1. Full 784-Brand Shield (embedded + /app/data/ip_blocklist.json) with Unicode accent stripping
+     and space-bounded multi-word substring protection (len >= 5).
+  2. Precision Wholesale Gates:
+       - Min Buy Box: >= $13.50
+       - Min True Net Profit / Unit: >= $5.00
+       - Min Monthly Net Profit Pool (Our Realistic Split Share): >= $500.00/mo
+       - Min Real Keepa Velocity (monthly_sold or drops_90): >= 40 u/mo (>= 60 u/mo for 0-FBA steals)
+       - FBA Seller Window: 0 FBA (with >= 3 FBM sellers) OR 2 to 4 FBA sellers
+  3. Exact UPC/EAN distributor catalog matching + SP-API brand_gating_state join.
 """
 
 import os
@@ -22,6 +22,7 @@ import json
 import logging
 import sqlite3
 import argparse
+import unicodedata
 from collections import Counter
 from contextlib import closing
 from pathlib import Path
@@ -58,53 +59,194 @@ PACK_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-EXTRA_DIRECT_BRAND_BLOCKS = {
-    "JAKE SALES", "TOTOLY JAKE", "ICARCOVER", "SUMMIT HYDRAULICS",
-    "OSLTWI", "LIONMAX", "JACKSON PALMER", "KKBESTPACK", "DURAMIC 3D",
-    "ESUN", "FLUKE", "HONEYWELL", "RESMED"
+EMBEDDED_784_BLOCKED_BRANDS: Set[str] = {
+    "365 BY WHOLE FOODS", "3M", "ABUS", "ACANA", "ACDELCO", "ADAFRUIT", "ADDLON",
+    "ADIDAS", "ADVANTAGE", "ADVANTAGE II", "ADVANTIX", "ADVIL", "AFINA", "AIR WICK",
+    "ALEXA", "ALITOVE", "ALL-CLAD", "ALLEN", "ALTERNA", "AMAZON", "AMAZON AWARE",
+    "AMAZON BASICS", "AMAZON COLLECTION", "AMAZON COMMERCIAL", "AMAZON ELEMENTS",
+    "AMAZON ESSENTIALS", "AMAZON FRESH", "AMAZONBASICS", "AMICO", "AMIKA",
+    "ANBOSON", "ANDIS", "ANKER", "ANTARCTIC STAR", "ANYCUBIC", "AOBEN", "AOLEMI",
+    "APEX TOOL GROUP", "APLENTY", "APOQUEL", "APPLE", "AQARA", "AQUAHOMEGROUP",
+    "ARANA", "ARCCAPTAIN", "ARDUINO", "ARLO", "ARM & HAMMER", "ARM AND HAMMER",
+    "ARM HAMMER", "ARMANI BEAUTY", "ARMOR ALL", "ASTROAI", "AUDIBLE", "AUGUST",
+    "AUKEY", "AUSSIE", "AVEDA", "AVEENO", "AXE", "BABYBJORN", "BABYLISSPRO",
+    "BAG BALM", "BALL", "BAMBU LAB", "BANG", "BARBIE", "BARILLA", "BASEUS",
+    "BASIC CARE", "BAYER", "BDELI", "BEATS", "BEETLES GEL POLISH", "BELKIN",
+    "BENADRYL", "BENCHMADE", "BENEBONE", "BENEFIT", "BEYBLADE", "BIG AGNES",
+    "BIG GREEN EGG", "BIGELOW", "BIL JAC", "BIOLAGE", "BIRKENSTOCK", "BISSELL",
+    "BLACK & DECKER", "BLACK AND DECKER", "BLACK DIAMOND", "BLACK FLAG",
+    "BLACKSTONE", "BLENDTEC", "BLINK", "BLUE BUFFALO", "BLUETTI",
+    "BOEHRINGER INGELHEIM", "BONIDE", "BOPPY", "BOSCH", "BOSE", "BOSTITCH",
+    "BOUDREAUXS", "BOUNTY", "BOWFLEX", "BRAUN", "BRAVECTO", "BREVILLE", "BRIOGEO",
+    "BRITA", "BUCK KNIVES", "BULINA", "BUMBLE AND BUMBLE", "BURT'S BEES",
+    "BURTS BEES", "BUTTONED DOWN", "CADET", "CALPHALON", "CAMELBAK", "CAMP CHEF",
+    "CANON", "CANTU", "CAPSTAR", "CAR PASS", "CARE BEARS", "CARHARTT", "CARTERS",
+    "CASCADE", "CASETIFY", "CASIO", "CASTROL", "CELESTIAL SEASONINGS", "CELLUCOR",
+    "CELSIUS", "CENTRUM", "CERAVE", "CETAPHIL", "CHANNELLOCK", "CHARMIN",
+    "CHEMICAL GUYS", "CHICCO", "CHUCKIT", "CLARITIN", "CLIF", "CLINIQUE",
+    "CLOROX", "COACH", "COCOMELON", "COLEMAN", "COLGATE", "COLOR WOW", "COLUMBIA",
+    "COMFORTIS", "COMMAND", "CONAIR", "CONTIGO", "CONVERSE", "CORE 10", "CORELLE",
+    "CORSAIR", "COSEQUIN", "COVERGIRL", "CRAFTSMAN", "CRAYOLA", "CREALITY",
+    "CREDELIO", "CRESCENT", "CREST", "CROCK-POT", "CROCS", "CRUCIAL", "CUISINART",
+    "DAILY RITUAL", "DASUQUIN", "DAWN", "DEATH WISH", "DEEPLEE", "DEEPN",
+    "DEGREE", "DEKOPRO", "DENSO", "DEPSTECH", "DERMALOGICA", "DETROIT AXLE",
+    "DEWALT", "DEWALT INDUSTRIAL", "DIABLO", "DISNEY", "DJI", "DOORES", "DOVE",
+    "DOWNY", "DR DENNIS GROSS", "DR. BROWNS", "DREMEL", "DRIFT", "DRUNK ELEPHANT",
+    "DRYBAR", "DUCK TAPE", "DUNKIN", "DURAMIC 3D", "DURO", "DYMATIZE", "DYMO",
+    "DYSON", "E.L.F.", "ECHO", "ECOFLOW", "EERO", "EGO POWER", "ELANCO", "ELEGOO",
+    "ELEMIS", "ELMERS", "ENFAMIL", "ERGOBABY", "ERYONE", "ESTEE LAUDER",
+    "ESTWING", "ESUN", "ETEKCITY", "EUCERIN", "EUFY", "EUFY SECURITY", "EUKANUBA",
+    "EUREKA", "EZVALO", "FANTTIK", "FEBREZE", "FENTY BEAUTY", "FESTOOL", "FINISH",
+    "FIRE TV", "FIRST ALERT", "FISHER-PRICE", "FITBIT", "FLASHFORGE", "FLEX SEAL",
+    "FLIR", "FLUKE", "FMHOTU", "FOLGERS", "FOODSAVER", "FORIOUS", "FOSSIL",
+    "FOXWELL", "FRAM", "FRESH ROASTED COFFEE", "FRESH STEP", "FRIDA BABY",
+    "FRIDABABY", "FRISKIES", "FRONTGUARD", "FRONTLINE", "FUJIFILM", "FULL SHINE",
+    "FURMINATOR", "G-SHOCK", "GAIAM", "GAIN", "GAMES WORKSHOP", "GARDEN OF LIFE",
+    "GARMIN", "GARNIER", "GATORADE", "GEARWRENCH", "GENERAL MILLS", "GENERIC",
+    "GERBER", "GHD", "GHOST", "GILLETTE", "GLAD", "GLADE", "GOAL ZERO",
+    "GOLD BOND", "GOO GONE", "GOO GOO", "GOODTHREADS", "GOOGLE", "GOOLOO",
+    "GOPRO", "GORILLA GRIP", "GOVEE", "GRACO", "GREENIES", "GREENLEE",
+    "GREENWORKS", "GREGORY", "GUCCI", "HAKKO", "HAMILTON BEACH", "HANOTIC", "HAPE",
+    "HAPPY BABY", "HAPPY BELLY", "HARMAN KARDON", "HARTZ", "HATCHBOX",
+    "HATCHIMALS", "HAUSSE", "HEAD & SHOULDERS", "HEARTGARD", "HEFTY", "HEINZ",
+    "HENCKELS", "HERBAL ESSENCES", "HIBBENT", "HIKOKI", "HILLS SCIENCE DIET",
+    "HILTI", "HOKA", "HONEYWELL", "HOOVER", "HOT WHEELS", "HUGGIES", "HUSKY",
+    "HUSQVARNA", "HYDRO FLASK", "HYDROXYCUT", "HYPERICE", "HYPERX", "IAMS",
+    "ICARCOVER", "IGK", "ILLY", "INSTA360", "INSTANT POT", "IROBOT", "IRWIN",
+    "IRWIN TOOLS", "IT'S A 10", "ITRUSOU", "ITS A 10", "IXIRPRO", "JABRA",
+    "JACKERY", "JACKSON PALMER", "JAKE SALES", "JBL", "JELLYCAT", "JENGA",
+    "JESVERTY", "JETBOIL", "JOBLIKEBREZ", "JOHN PAUL MITCHELL", "JOHNSONS", "K&N",
+    "K18", "K9 ADVANTIX", "KAMADO JOE", "KELLOGGS", "KELTY", "KERASTASE",
+    "KERSHAW", "KEURIG", "KEVIN MURPHY", "KEYSIGHT", "KIDDE", "KIEHLS", "KINDLE",
+    "KINGSTON", "KITCHENAID", "KKBESTPACK", "KLEIN", "KLEIN TOOLS", "KNIPEX",
+    "KOBALT", "KODAK", "KONAMI", "KONG", "KONG COMPANY", "KOOTETA", "KRAFT",
+    "KWIKSET", "L'OREAL", "L'OREAL PARIS", "LA ROCHE-POSAY", "LANCOME", "LARABAR",
+    "LARK & RO", "LASKO", "LAURA GELLER", "LAURA GELLER NEW YORK", "LAVAZZA",
+    "LE CREUSET", "LEAPFROG", "LEATHERMAN", "LEGO", "LENOX", "LEVIS", "LIFEPROOF",
+    "LIFESTRAW", "LIONMAX", "LIQUID I.V.", "LIQUID NAILS", "LISTERINE",
+    "LIVING PROOF", "LODGE", "LOGITECH", "LOREAL", "LOREAL PARIS", "LOREX",
+    "LOUIS VUITTON", "LULULEMON", "LUTRON", "LYSOL", "MAC COSMETICS",
+    "MAGIC: THE GATHERING", "MAKITA", "MAMA BEAR", "MANDUKA", "MARMOT",
+    "MARSHALL", "MARVEL", "MASTER LOCK", "MATRIX", "MAXTITE", "MAXWELL HOUSE",
+    "MAYBELLINE", "MEDELA", "MEDIX 5.5", "MEGA BLOKS", "MEGUIARS", "MEITE",
+    "MELISSA & DOUG", "MEOW MIX", "MERRICK", "META QUEST", "METABO", "METHOD",
+    "MICHAEL KORS", "MICHAEL TODD", "MICHELIN", "MICOMLAN", "MIGHTY FASTENERS",
+    "MILK-BONE", "MILWAUKEE", "MIRACLE-GRO", "MOBIL 1", "MOLESKINE", "MONOPOLY",
+    "MONSTER", "MOON AND BACK", "MOPAR", "MOPHIE", "MOROCCANOIL", "MOTORCRAFT",
+    "MOTRIN", "MR. CLEAN", "MRS MEYERS", "MRS. MEYERS", "MUCINEX", "MUGEASY",
+    "MUNCHKIN", "MUSCLETECH", "MUZOJET", "NAACOO", "NALGENE", "NANIT", "NARS",
+    "NATURE MADE", "NATURE VALLEY", "NERF", "NESPRESSO", "NEST", "NESTLE",
+    "NETGEAR", "NEUTROGENA", "NEW BALANCE", "NEXGARD", "NGK", "NICHOLSON", "NIKE",
+    "NIKON", "NINJA", "NINTENDO", "NIOXIN", "NIVEA", "NORDICTRACK",
+    "NOT YOUR MOTHERS", "NOVEX", "NUK", "NUTRAFOL", "NUTRAMAX", "NUTRO",
+    "NYLABONE", "NYX", "OAKLEY", "OBAGI MEDICAL", "OFF!", "OLAPLEX", "OLAY",
+    "OLD SPICE", "OLIGHT", "ONE A DAY", "OONI", "OPI", "OPTIMUM NUTRITION",
+    "ORAL-B", "ORIBE", "ORIJEN", "ORTHO", "OSLTWI", "OSPREY", "OSTER",
+    "OTTER PRODUCTS", "OTTERBOX", "OUAI", "OURA", "OVERTURE", "OWALA", "OWLET",
+    "OXICLEAN", "OXILAM", "OXO", "PAMPERS", "PANTENE", "PAPER MATE", "PARTICLE",
+    "PATAGONIA", "PAUL MITCHELL", "PAULAS CHOICE", "PAW PATROL", "PEDIALYTE",
+    "PEDIGREE", "PEETS", "PELOTON", "PEPTO-BISMOL", "PERSIL", "PESRAE", "PETSAFE",
+    "PETZL", "PHILIPS", "PHILIPS AVENT", "PHILIPS HUE", "PHILIPS SONICARE",
+    "PINZON", "PLAY-DOH", "PLAYMOBIL", "PLAYSTATION", "PLEDGE", "POKEMON",
+    "POLAROID", "POLYMAKER", "POPSOCKETS", "PORTER CABLE", "PORTER-CABLE",
+    "POST-IT", "POWGRN", "PRESTO", "PRESTO!", "PRESTONE", "PRIME HYDRATION",
+    "PROBRICO", "PROTO", "PRUSA", "PUMA", "PUREOLOGY", "PURINA", "PYREX", "QENOVO",
+    "QUEST", "R+CO", "RADIANS", "RADIO SYSTEMS", "RAID", "RAIN-X",
+    "RASPBERRY PI", "RAVENSBURGER", "RAY-BAN", "RAZER", "RED BULL", "REDKEN",
+    "REEBOK", "REMINGTON", "REOLINK", "RESMED", "REVLON", "REVOLUTION", "REYNOLDS",
+    "RHINO USA", "RIDGID", "RIGOL", "RING", "RIVET", "ROBITUSSIN", "ROBLOX",
+    "ROBOROCK", "ROCKWELL", "ROKU", "ROLEX", "ROOMBA", "ROSSETTA", "ROUNDUP",
+    "ROYAL CANIN", "RUBBERMAID", "RXBAR", "RYOBI", "SAMSUNG", "SANDISK",
+    "SAWSTOP", "SAWYER", "SCHICK", "SCHLAGE", "SCHNEIDER ELECTRIC", "SCHWARZKOPF",
+    "SCIENCE DIET", "SCOTCH", "SCOTCHGARD", "SCOTTS", "SEAGATE", "SEBASTIAN",
+    "SECRET", "SEIKO", "SELTERM", "SENNHEISER", "SENSODYNE", "SERESTO",
+    "SESAME STREET", "SEVENTH GENERATION", "SG TZH", "SHARK", "SHARPIE",
+    "SHARPIE PRO", "SHEA MOISTURE", "SHEBA", "SHISEIDO", "SHOUT! FACTORY",
+    "SIGLENT", "SIGNIFY", "SIMILAC", "SIMPARICA", "SIMPLE MODERN", "SIMPLISAFE",
+    "SIRAYA TECH", "SK-II", "SKECHERS", "SKIL", "SKINCEUTICALS", "SKIP HOP",
+    "SKULL SHAVER", "SKULLCANDY", "SNAP ON", "SNAP-ON", "SODASTREAM",
+    "SOL DE JANEIRO", "SOLIMO", "SOLO STOVE", "SONOS", "SONY", "SOPOBY",
+    "SPARKFUN", "SPIGEN", "SPOTTED ZEBRA", "SPRAYWAY", "SPYDERCO", "SQUARE D",
+    "SQUISHMALLOWS", "STAEDTLER", "STAHLWILLE", "STANLEY", "STANLEY BLACK & DECKER",
+    "STAR WARS", "STARBUCKS", "STEELSERIES", "STIHL", "STONE & BEAM", "STTORABOKS",
+    "STYLE EDIT", "SUMMIT HYDRAULICS", "SUNBEAM", "SUNLU", "SWANN", "SWIFFER",
+    "TAPIX", "TARTE", "TASTE OF THE WILD", "TATCHA", "TECBEARS", "TEKTRONIX",
+    "TEMPTATIONS", "THE AMAZING WHIP-IT", "THE NORTH FACE", "THE ORDINARY",
+    "THERABODY", "THERAGUN", "THERM-A-REST", "THERMOS", "THULE", "TIDE",
+    "TIDY CATS", "TILE", "TIMEX", "TINECO", "TOMMEE TIPPEE", "TOMS OF MAINE",
+    "TONKA", "TOO FACED", "TOPDON", "TORO", "TOTOLY JAKE", "TP-LINK", "TPOB",
+    "TRAEGER", "TRANSFORMERS", "TRESEMME", "TRUESEAMOSS", "TUPPERWARE",
+    "TURTLE WAX", "TWININGS", "TYLENOL", "U.S. SOLID", "UBIQUITI", "UGG", "UGREEN",
+    "ULTIMATE EARS", "UNDER ARMOUR", "UNI-T", "UNIVERSAL MUSIC GROUP",
+    "URBAN DECAY", "VALVOLINE", "VANS", "VASELINE", "VEKEN", "VENUS", "VEVOR",
+    "VICKS", "VICTORINOX", "VIRBAC", "VISE-GRIP", "VITAMIX", "VORNADO", "VOXELAB",
+    "VTECH", "WAG", "WAHL", "WARHAMMER", "WATERDROP", "WATERPIK", "WAVYTALK",
+    "WEATHERTECH", "WEBER", "WEBER-STEPHEN", "WEDDELL", "WELLA", "WELLER",
+    "WELLNESS", "WENNALIFE", "WENSILON", "WERA", "WESTERN DIGITAL", "WHIP-IT",
+    "WHISKAS", "WHOLE FOODS MARKET", "WHOOP", "WICKEDLY PRIME", "WIHA", "WILLHI",
+    "WINDEX", "WIZARDS OF THE COAST", "WOD TAPE", "WONDER BOUND", "WOOLITE", "WORX",
+    "WUSTHOF", "WYZE", "XBOX", "YAKIMA", "YALE", "YANKEE CANDLE", "YESWELDER",
+    "YETI", "YOGI", "YOOPAI", "YU-GI-OH", "ZEBRA", "ZESTY PAWS", "ZIPLOC", "ZIPPO",
+    "ZOETIS", "ZUKES", "ZWILLING", "ZYRTEC",
 }
 
 
-def load_blocked_brands() -> Set[str]:
-    blocked = set(EXTRA_DIRECT_BRAND_BLOCKS)
-    if PRIMARY_IP_FILE.exists():
-        try:
-            raw = json.loads(PRIMARY_IP_FILE.read_text(encoding="utf-8"))
-            items = raw if isinstance(raw, list) else raw.get("brands", [])
-            blocked |= {str(b).upper().strip() for b in items if b}
-        except Exception as exc:
-            logger.warning(f"Could not read IP blocklist: {exc}")
-    return blocked
+def norm_brand(brand_str: Any) -> str:
+    s = unicodedata.normalize("NFKD", str(brand_str or "")).encode("ascii", "ignore").decode("ascii")
+    return s.upper().strip()
 
 
-def estimate_real_velocity(monthly_sold: Any, drops_90: Any, bsr: Any) -> int:
+def load_blocked_brands() -> Tuple[Set[str], List[str]]:
+    blocked: Set[str] = {norm_brand(b) for b in EMBEDDED_784_BLOCKED_BRANDS if b}
+    for p in (PRIMARY_IP_FILE, ROOT_DIR / "data" / "ip_blocklist.json"):
+        if p.exists():
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                items = raw if isinstance(raw, list) else raw.get("brands", [])
+                blocked |= {norm_brand(b) for b in items if b}
+            except Exception:
+                pass
+    sorted_list = sorted(blocked)
+    try:
+        PRIMARY_IP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PRIMARY_IP_FILE.write_text(json.dumps(sorted_list, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    multi_word = [b for b in sorted_list if len(b) >= 5]
+    return blocked, multi_word
+
+
+def is_blocked_brand(brand_str: str, blocked_set: Set[str], multi_word_list: List[str]) -> bool:
+    b = norm_brand(brand_str)
+    if not b or len(b) < 3:
+        return True
+    if b in blocked_set:
+        return True
+    normalized = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9\s&'-]", " ", b)).strip()
+    if normalized in blocked_set:
+        return True
+    for entry in multi_word_list:
+        if normalized.startswith(entry + " ") or (" " + entry) in normalized:
+            return True
+    return False
+
+
+def estimate_real_velocity(monthly_sold: Any, drops_90: Any) -> int:
     ms = int(monthly_sold or 0)
     if ms > 0 and ms not in (20, 25):
         return ms
-
     d90 = int(drops_90 or 0)
     if d90 > 0:
         return max(1, round((d90 / 3.0) * 1.15))
-
-    rank = int(bsr or 0)
-    if rank > 0:
-        if rank <= 500:
-            return 450
-        if rank <= 1500:
-            return 220
-        if rank <= 5000:
-            return 110
-        if rank <= 15000:
-            return 55
-        if rank <= 35000:
-            return 28
-        if rank <= 75000:
-            return 14
-        if rank <= 150000:
-            return 6
-        if rank <= 300000:
-            return 2
     return 0
+
+
+def is_valid_fba_window(comp_fba: int, total_sellers: int) -> bool:
+    if comp_fba == 0 and total_sellers >= 3:
+        return True
+    if 2 <= comp_fba <= 4:
+        return True
+    return False
 
 
 def extract_pack_qty(title: str, db_pack: Any) -> int:
@@ -159,14 +301,13 @@ def detect_vendor_from_path(filepath: Path) -> str:
         return "Frontier Co-op"
     if "contour" in fn:
         return "Contour Abrasives"
-    return filepath.stem
+    return "Unmapped (Needs Catalog Match)"
 
 
-def load_catalog_indexes() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+def load_catalog_upc_index() -> Dict[str, Dict[str, Any]]:
     upc_map: Dict[str, Dict[str, Any]] = {}
-    brand_map: Dict[str, str] = {}
     if not CATALOG_DIR.exists():
-        return upc_map, brand_map
+        return upc_map
 
     files = list(CATALOG_DIR.rglob("*.csv")) + list(CATALOG_DIR.rglob("*.xlsx"))
     for f in files:
@@ -177,8 +318,7 @@ def load_catalog_indexes() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
             df.columns = [str(c).strip().lower() for c in df.columns]
             cost_c = next((c for c in df.columns if any(k in c for k in ("wholesale", "unit_cost", "cost", "price"))), None)
             upc_c = next((c for c in df.columns if any(k in c for k in ("upc", "ean", "gtin"))), None)
-            brand_c = next((c for c in df.columns if any(k in c for k in ("brand", "manufacturer", "mfr"))), None)
-            if not cost_c:
+            if not cost_c or not upc_c:
                 continue
 
             vendor = detect_vendor_from_path(f)
@@ -189,18 +329,13 @@ def load_catalog_indexes() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
                     continue
                 if c_val <= 0.05:
                     continue
-                if upc_c:
-                    u = normalize_upc(r.get(upc_c))
-                    if u and (u not in upc_map or c_val < upc_map[u]["unit_cost"]):
-                        upc_map[u] = {"vendor": vendor, "unit_cost": c_val}
-                if brand_c and pd.notna(r.get(brand_c)):
-                    bu = str(r.get(brand_c)).upper().strip()
-                    if len(bu) >= 2 and bu not in brand_map:
-                        brand_map[bu] = vendor
+                u = normalize_upc(r.get(upc_c))
+                if u and (u not in upc_map or c_val < upc_map[u]["unit_cost"]):
+                    upc_map[u] = {"vendor": vendor, "unit_cost": c_val}
         except Exception:
             continue
 
-    return upc_map, brand_map
+    return upc_map
 
 
 def get_table_columns(cur: sqlite3.Cursor, table_name: str) -> Set[str]:
@@ -210,13 +345,20 @@ def get_table_columns(cur: sqlite3.Cursor, table_name: str) -> Set[str]:
         return set()
 
 
-def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, max_leads: int = 5000) -> List[Dict[str, Any]]:
+def build_precision_pipeline_payloads(
+    min_velocity: int = 40,
+    min_zero_fba_velocity: int = 60,
+    min_net_unit: float = 5.00,
+    min_monthly_pool: float = 500.0,
+    min_roi: float = 15.0,
+    max_leads: int = 2500,
+) -> List[Dict[str, Any]]:
     if not DB_PATH.exists():
         logger.error(f"SQLite database not found at {DB_PATH}")
         return []
 
-    blocked_brands = load_blocked_brands()
-    upc_map, brand_map = load_catalog_indexes()
+    blocked_set, multi_word_list = load_blocked_brands()
+    upc_map = load_catalog_upc_index()
     payloads: List[Dict[str, Any]] = []
     seen_asins: Set[str] = set()
 
@@ -232,9 +374,10 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
 
         ungated_brands: Set[str] = set()
         if has_gating:
-            for gr in cur.execute("SELECT UPPER(TRIM(brand)) AS b FROM brand_gating_state WHERE status = 'UNRESTRICTED'").fetchall():
-                if gr["b"]:
-                    ungated_brands.add(gr["b"])
+            for gr in cur.execute("SELECT brand FROM brand_gating_state WHERE status = 'UNRESTRICTED'").fetchall():
+                nb = norm_brand(gr["brand"])
+                if nb:
+                    ungated_brands.add(nb)
 
         # 1. Verified Deals first
         if vd_cols:
@@ -244,11 +387,12 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                 ORDER BY monthly_profit_pool DESC, roi_percent DESC
             """)
             for row in cur.fetchall():
+                if len(payloads) >= max_leads:
+                    break
                 d = dict(row)
                 asin = str(d.get("asin") or "").strip().upper()
                 brand = str(d.get("brand") or "").strip()
-                brand_upper = brand.upper()
-                if not asin or len(asin) != 10 or asin in seen_asins or not brand or brand_upper in blocked_brands:
+                if not asin or len(asin) != 10 or asin in seen_asins or is_blocked_brand(brand, blocked_set, multi_word_list):
                     continue
 
                 bb = float(d.get("buy_box_price") or 0.0)
@@ -259,15 +403,30 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                 c_row = cur.execute("SELECT * FROM candidate_cache WHERE asin = ?", (asin,)).fetchone() if cc_cols else None
                 cd = dict(c_row) if c_row else {}
                 fba = int(cd.get("fba_sellers") if cd.get("fba_sellers") is not None else (d.get("competitive_fba") or 0))
-                rank = int(cd.get("sales_rank") or d.get("sales_rank") or 0)
+                total_sellers = int(cd.get("num_sellers") or (3 if fba == 0 else fba))
+                if not is_valid_fba_window(fba, total_sellers):
+                    continue
+
                 drops = int(cd.get("drops_90") or 0)
-                vel = estimate_real_velocity(cd.get("monthly_sold") or d.get("monthly_velocity"), drops, rank)
-                if fba > 6 or vel < min_velocity:
+                vel = estimate_real_velocity(cd.get("monthly_sold") or d.get("monthly_velocity"), drops)
+                if vel < min_velocity or (fba == 0 and vel < min_zero_fba_velocity):
+                    continue
+
+                ref_pct = float(cd.get("referral_pct") or 0.15)
+                fba_fee = float(cd.get("fba_fee") or max(3.50, bb * 0.18))
+                net_profit = float(d.get("net_profit") or round(bb - (bb * ref_pct) - fba_fee - cost, 2))
+                if net_profit < min_net_unit or net_profit >= bb:
+                    continue
+
+                eff_comp = fba if fba > 0 else max(1, round(total_sellers * 0.45))
+                our_share = max(1, round(vel / (eff_comp + 1)))
+                monthly_pool = round(our_share * net_profit, 2)
+                if monthly_pool < min_monthly_pool:
                     continue
 
                 vendor = str(d.get("vendor") or "").strip()
                 if not vendor or "TARGET BRAND" in vendor.upper() or vendor.upper() in ("UNKNOWN", "NONE", "UNMAPPED"):
-                    vendor = brand_map.get(brand_upper, "Unmapped (Needs Catalog Match)")
+                    vendor = "Unmapped (Needs Catalog Match)"
 
                 logistics = get_logistics_profile(vendor)
                 seen_asins.add(asin)
@@ -278,23 +437,23 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                     "vendor": vendor,
                     "prep_center": logistics["facility"],
                     "pack_count": extract_pack_qty(d.get("title"), cd.get("amazon_pack_qty")),
-                    "sales_rank": rank,
+                    "sales_rank": int(cd.get("sales_rank") or d.get("sales_rank") or 0),
                     "monthly_velocity": vel,
                     "drops_90": drops,
                     "competitive_fba": fba,
-                    "total_sellers": max(2, int(cd.get("num_sellers") or (fba + 1))),
+                    "total_sellers": total_sellers,
                     "buy_box_price": bb,
                     "current_bb": float(cd.get("current_bb") or bb),
                     "avg90_bb": float(cd.get("avg90_bb") or bb),
                     "wholesale_cost": cost,
                     "landed_bundle_cogs": cost,
-                    "net_profit": float(d.get("net_profit") or 0.0),
-                    "roi_percent": float(d.get("roi_percent") or 0.0),
+                    "net_profit": net_profit,
+                    "roi_percent": float(d.get("roi_percent") or round((net_profit / cost) * 100.0, 1)),
                     "is_hazmat": "YES" if d.get("is_hazmat") else "NO",
-                    "is_ungated": "YES" if (brand_upper in ungated_brands or str(d.get("status") or "").upper() == "UNGATED_READY") else "NO",
+                    "is_ungated": "YES" if (norm_brand(brand) in ungated_brands or str(d.get("status") or "").upper() == "UNGATED_READY") else "NO",
                 })
 
-        # 2. All qualifying candidate_cache ASINs (BSR / drops_90 / monthly_sold >= min_velocity)
+        # 2. High-conviction candidate_cache ASINs meeting $5/unit + $500/mo pool + 0 (>=3 FBM) or 2-4 FBA
         if cc_cols and len(payloads) < max_leads:
             cur.execute("""
                 SELECT * FROM candidate_cache
@@ -307,8 +466,7 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                 d = dict(row)
                 asin = str(d.get("asin") or "").strip().upper()
                 brand = str(d.get("brand") or "").strip()
-                brand_upper = brand.upper()
-                if not asin or len(asin) != 10 or asin in seen_asins or not brand or brand_upper in blocked_brands:
+                if not asin or len(asin) != 10 or asin in seen_asins or is_blocked_brand(brand, blocked_set, multi_word_list):
                     continue
 
                 bb = float(d.get("avg90_bb") or d.get("current_bb") or 0.0)
@@ -316,10 +474,13 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                     continue
 
                 fba = int(d.get("fba_sellers") or 0)
-                rank = int(d.get("sales_rank") or 0)
+                total_sellers = int(d.get("num_sellers") or 0)
+                if not is_valid_fba_window(fba, total_sellers):
+                    continue
+
                 drops = int(d.get("drops_90") or 0)
-                vel = estimate_real_velocity(d.get("monthly_sold"), drops, rank)
-                if fba > 6 or vel < min_velocity:
+                vel = estimate_real_velocity(d.get("monthly_sold"), drops)
+                if vel < min_velocity or (fba == 0 and vel < min_zero_fba_velocity):
                     continue
 
                 title = str(d.get("title") or "").strip()
@@ -335,7 +496,7 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                     vendor = matched["vendor"]
                     ws_cost = round((matched["unit_cost"] * pack) + 1.25, 2)
                 else:
-                    vendor = brand_map.get(brand_upper, "Unmapped (Needs Catalog Match)")
+                    vendor = "Unmapped (Needs Catalog Match)"
                     ws_cost = round(bb * 0.36, 2)
 
                 if ws_cost <= 0.05 or ws_cost >= bb:
@@ -344,11 +505,17 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                 ref_pct = float(d.get("referral_pct") or 0.15)
                 fba_fee = float(d.get("fba_fee") or max(3.50, bb * 0.18))
                 net_profit = round(bb - (bb * ref_pct) - fba_fee - ws_cost, 2)
-                if net_profit < 1.50:
+                if net_profit < min_net_unit or net_profit >= bb:
                     continue
 
                 roi_pct = round((net_profit / ws_cost) * 100.0, 1)
                 if roi_pct < min_roi or roi_pct > 350.0:
+                    continue
+
+                eff_comp = fba if fba > 0 else max(1, round(total_sellers * 0.45))
+                our_share = max(1, round(vel / (eff_comp + 1)))
+                monthly_pool = round(our_share * net_profit, 2)
+                if monthly_pool < min_monthly_pool:
                     continue
 
                 logistics = get_logistics_profile(vendor)
@@ -360,11 +527,11 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                     "vendor": vendor,
                     "prep_center": logistics["facility"],
                     "pack_count": pack,
-                    "sales_rank": rank,
+                    "sales_rank": int(d.get("sales_rank") or 0),
                     "monthly_velocity": vel,
                     "drops_90": drops,
                     "competitive_fba": fba,
-                    "total_sellers": max(2, int(d.get("num_sellers") or (fba + 1))),
+                    "total_sellers": total_sellers,
                     "buy_box_price": bb,
                     "current_bb": float(d.get("current_bb") or bb),
                     "avg90_bb": bb,
@@ -375,7 +542,7 @@ def build_full_pipeline_payloads(min_velocity: int = 50, min_roi: float = 15.0, 
                     "referral_pct": ref_pct,
                     "fba_fee": fba_fee,
                     "is_hazmat": "YES" if d.get("is_hazmat") else "NO",
-                    "is_ungated": "YES" if brand_upper in ungated_brands else "NO",
+                    "is_ungated": "YES" if norm_brand(brand) in ungated_brands else "NO",
                 })
 
     return payloads
@@ -398,17 +565,37 @@ def post_batch_with_retry(webhook_url: str, action: str, batch: List[Dict[str, A
     return None
 
 
-def stream_backlog(batch_size: int = 100, min_velocity: int = 50, min_roi: float = 15.0, max_leads: int = 5000, wipe_first: bool = False, dry_run: bool = False):
+def stream_backlog(
+    batch_size: int = 100,
+    min_velocity: int = 40,
+    min_zero_fba_velocity: int = 60,
+    min_net_unit: float = 5.00,
+    min_monthly_pool: float = 500.0,
+    min_roi: float = 15.0,
+    max_leads: int = 2500,
+    wipe_first: bool = False,
+    dry_run: bool = False,
+):
     webhook_url = get_verified_webhook_url()
     if not webhook_url and not dry_run:
         logger.error("No Google Sheets webhook URL configured.")
         sys.exit(1)
 
-    leads = build_full_pipeline_payloads(min_velocity=min_velocity, min_roi=min_roi, max_leads=max_leads)
+    leads = build_precision_pipeline_payloads(
+        min_velocity=min_velocity,
+        min_zero_fba_velocity=min_zero_fba_velocity,
+        min_net_unit=min_net_unit,
+        min_monthly_pool=min_monthly_pool,
+        min_roi=min_roi,
+        max_leads=max_leads,
+    )
     total = len(leads)
     dist_counts = Counter(l["vendor"] for l in leads)
 
-    logger.info(f"Prepared {total:,} qualifying {min_velocity}+ u/mo leads across database.")
+    logger.info(
+        f"Prepared {total:,} precision leads (>= {min_velocity} u/mo | >= ${min_net_unit:.2f}/unit | "
+        f">= ${min_monthly_pool:,.0f}/mo pool | 0 (>=3 FBM) or 2-4 FBA | 784-Brand Shield)."
+    )
     for dist, cnt in dist_counts.most_common():
         logger.info(f"   -> {dist}: {cnt:,}")
 
@@ -439,15 +626,18 @@ def stream_backlog(batch_size: int = 100, min_velocity: int = 50, min_roi: float
 
         time.sleep(0.9)
 
-    logger.info(f"Full backlog sync complete! Total leads admitted: {total_admitted:,} / {total:,}.")
+    logger.info(f"Precision backlog sync complete! Total leads admitted: {total_admitted:,} / {total:,}.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BSR-Aware Full Database & Catalog Backlog Streamer")
+    parser = argparse.ArgumentParser(description="784-Brand Shield + Precision Wholesale Streamer (v2.3)")
     parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--min-velocity", type=int, default=50)
+    parser.add_argument("--min-velocity", type=int, default=40)
+    parser.add_argument("--min-zero-fba-velocity", type=int, default=60)
+    parser.add_argument("--min-net-unit", type=float, default=5.00)
+    parser.add_argument("--min-monthly-pool", type=float, default=500.0)
     parser.add_argument("--min-roi", type=float, default=15.0)
-    parser.add_argument("--max-leads", type=int, default=5000)
+    parser.add_argument("--max-leads", type=int, default=2500)
     parser.add_argument("--wipe-first", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -455,6 +645,9 @@ if __name__ == "__main__":
     stream_backlog(
         batch_size=args.batch_size,
         min_velocity=args.min_velocity,
+        min_zero_fba_velocity=args.min_zero_fba_velocity,
+        min_net_unit=args.min_net_unit,
+        min_monthly_pool=args.min_monthly_pool,
         min_roi=args.min_roi,
         max_leads=args.max_leads,
         wipe_first=args.wipe_first,
