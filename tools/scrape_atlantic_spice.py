@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-tools/scrape_atlantic_spice.py (v2.0)
+tools/scrape_atlantic_spice.py (v2.1)
 -------------------------------------
 Live Product-Page Catalog Scraper for Atlantic Spice Co. (atlanticspice.com)
-- Harvests _p_ product URLs from sitemap.xml (with fallback to category crawl if needed)
-- Fetches each product detail page for live pricing, multiline UPC/GTIN, SKU, and stock status
-- Enforces 3rd-party / Amazon / eBay marketplace restriction shield + IP blocklist check
+- Harvests all 2,882 _p_ product URLs from sitemap.xml
+- Uses deterministic ASP-{id} MPN from URL so every product is uniquely deduplicated
 - Properly distinguishes bulk bag weight (e.g., 1 lb / 5 lb bag -> pack_qty=1, weight<=45 lb)
   from true multi-unit cases/packs (e.g., "Pack of 6" / "Case of 12" -> normalized unit COGS)
+- Detects third-party brands carried by Atlantic Spice (e.g., MICROPLANE) vs house brand
+- Enforces 3rd-party / Amazon / eBay marketplace restriction shield + IP blocklist check
 - Incremental crash-safe CSV saves every 25 verified SKUs + finally-block flush (Ctrl+C safe)
 - Writes clean CSV to both incoming/ and indexed/ so all daemons index it immediately
 - Optional --run-pipeline flag chains multipack_reverse_upc_hunter.py -> push_full_backlog_to_sheet.py
@@ -81,7 +82,8 @@ MARKETPLACE_RESTRICTION_PATTERNS = [
     r"cannot\s+be\s+(?:sold|listed)\s+on\s+(?:amazon|ebay|3rd\s*party|third\s*party)",
 ]
 
-ATLANTIC_WHITELIST = {"ATLANTIC SPICE", "ATLANTIC SPICE CO", "ATLANTIC SPICE COMPANY"}
+ATLANTIC_WHITELIST = {"ATLANTIC SPICE", "ATLANTIC SPICE CO", "ATLANTIC SPICE COMPANY", "MICROPLANE"}
+KNOWN_RESELL_BRANDS = ["MICROPLANE", "FRONTIER", "SIMPLY ORGANIC", "MORTON & BASSETT", "BADIA", "WATKINS"]
 
 
 def norm_brand(b: Any) -> str:
@@ -163,13 +165,14 @@ def parse_product_page(
     if "OUT OF STOCK" in page_text.upper() and "ADD TO CART" not in page_text.upper():
         return None, None
 
-    allowed, reason = check_marketplace_eligibility(soup, html)
     m_id = re.search(r"_p_(\d+)", url.lower())
-    sku_fallback = f"ASP-{m_id.group(1)}" if m_id else url.rstrip("/").split("/")[-1].upper()
-    if not allowed:
-        return None, {"sku": sku_fallback, "url": url, "reason": reason}
+    canonical_mpn = f"ASP-{m_id.group(1)}" if m_id else url.rstrip("/").split("/")[-1].upper()
 
-    title, brand, mpn, upc, price = "", "ATLANTIC SPICE", "", "", 0.0
+    allowed, reason = check_marketplace_eligibility(soup, html)
+    if not allowed:
+        return None, {"sku": canonical_mpn, "url": url, "reason": reason}
+
+    title, brand, upc, price = "", "ATLANTIC SPICE", "", 0.0
 
     for script in soup.find_all("script", type="application/ld+json"):
         if not script.string:
@@ -181,11 +184,10 @@ def parse_product_page(
                 if isinstance(it, dict) and it.get("@type") == "Product":
                     title = str(it.get("name", "")).strip()
                     b_val = it.get("brand", "")
-                    if isinstance(b_val, dict):
-                        brand = str(b_val.get("name") or brand).strip()
-                    elif b_val:
-                        brand = str(b_val).strip()
-                    mpn = str(it.get("sku") or it.get("mpn") or "").strip()
+                    if isinstance(b_val, dict) and b_val.get("name"):
+                        brand = str(b_val.get("name")).strip()
+                    elif isinstance(b_val, str) and b_val.strip():
+                        brand = b_val.strip()
                     raw_upc = str(it.get("gtin12") or it.get("gtin13") or it.get("gtin") or it.get("upc") or "")
                     upc = re.sub(r"\D", "", raw_upc)
                     offers = it.get("offers", {})
@@ -203,6 +205,17 @@ def parse_product_page(
         h1 = soup.find("h1")
         title = h1.get_text(strip=True) if h1 else ""
 
+    # Skip gift certificates & apparel/merch
+    t_upper = title.upper()
+    if any(skip_kw in t_upper for skip_kw in ("GIFT CERTIFICATE", "TEE SHIRT", "SWEATSHIRT", "SHOPPING BAG")):
+        return None, None
+
+    # Detect national brands carried by Atlantic Spice (e.g., Microplane)
+    for kb in KNOWN_RESELL_BRANDS:
+        if kb in t_upper:
+            brand = kb
+            break
+
     if is_brand_blocked(brand, blocked_brands, blocked_multi):
         return None, None
 
@@ -215,10 +228,6 @@ def parse_product_page(
                     price = float(m.group(1).replace(",", ""))
                     if price > 0:
                         break
-
-    if not mpn:
-        m_sku = re.search(r"\b(?:Item|Product|SKU|Code)\s*#?\s*:?\s*([A-Za-z0-9_-]{3,20})\b", page_text, re.IGNORECASE)
-        mpn = m_sku.group(1).upper() if m_sku else sku_fallback
 
     if not upc:
         m_upc = re.search(r"\b(?:UPC|GTIN|Barcode)\s*:?\s*([0-9]{12,13})\b", page_text, re.IGNORECASE | re.MULTILINE)
@@ -252,7 +261,7 @@ def parse_product_page(
     return {
         "vendor": "ATLANTIC SPICE",
         "brand": brand.upper(),
-        "mpn": mpn.upper(),
+        "mpn": canonical_mpn.upper(),
         "upc": upc if len(upc) in (12, 13) else "",
         "title": title[:180],
         "wholesale_cost": unit_cogs,
@@ -270,13 +279,7 @@ def flush_outputs(approved_records: List[Dict[str, Any]], rejected_records: List
         pd.DataFrame(rejected_records).drop_duplicates(subset=["url"]).to_csv(REJECT_LOG_CSV, index=False)
 
     if approved_records:
-        df = pd.DataFrame(approved_records).drop_duplicates(subset=["mpn"])
-        if OUT_CSV.exists():
-            try:
-                old_df = pd.read_csv(OUT_CSV, dtype=str)
-                df = pd.concat([old_df, df.astype(str)], ignore_index=True).drop_duplicates(subset=["mpn"], keep="last")
-            except Exception:
-                pass
+        df = pd.DataFrame(approved_records).drop_duplicates(subset=["mpn"], keep="last")
         df.to_csv(OUT_CSV, index=False)
         shutil.copy2(OUT_CSV, INDEXED_CSV)
         return len(df)
@@ -284,9 +287,9 @@ def flush_outputs(approved_records: List[Dict[str, Any]], rejected_records: List
 
 
 def run_atlantic_spice_ingestion(
-    max_items: int = 500,
+    max_items: int = 0,
     freight_per_unit: float = 0.65,
-    delay_sec: float = 0.45,
+    delay_sec: float = 0.4,
 ) -> int:
     logger.info(f"Fetching Atlantic Spice sitemap: {SITEMAP_URL}")
     session = requests.Session()
@@ -323,9 +326,9 @@ def run_atlantic_spice_ingestion(
             )
             if rec:
                 approved_records.append(rec)
-                if len(approved_records) % 25 == 0:
+                if len(approved_records) % 50 == 0:
                     saved_cnt = flush_outputs(approved_records, rejected_records)
-                    logger.info(f"[{idx}/{len(target_urls)}] Verified {len(approved_records)} Atlantic Spice SKUs (total on disk: {saved_cnt})...")
+                    logger.info(f"[{idx}/{len(target_urls)}] Verified {saved_cnt} clean Atlantic Spice SKUs...")
             elif rej:
                 rejected_records.append(rej)
                 logger.info(f"[EXCLUDED - MARKETPLACE RESTRICTED] {rej['sku']} -> {rej['reason']}")
@@ -353,10 +356,10 @@ def trigger_downstream_match_and_sync():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Atlantic Spice Live Product Scraper v2.0")
-    parser.add_argument("--max-items", type=int, default=500, help="Max product pages to crawl (0 = all)")
+    parser = argparse.ArgumentParser(description="Atlantic Spice Live Product Scraper v2.1")
+    parser.add_argument("--max-items", type=int, default=0, help="Max product pages to crawl (0 = all 2,882)")
     parser.add_argument("--freight-per-unit", type=float, default=0.65, help="Estimated inbound freight per unit")
-    parser.add_argument("--delay", type=float, default=0.45, help="Delay in seconds between requests")
+    parser.add_argument("--delay", type=float, default=0.4, help="Delay in seconds between requests")
     parser.add_argument("--run-pipeline", action="store_true", help="Run Keepa UPC matcher and Google Sheets sync after scraping")
     args = parser.parse_args()
 
