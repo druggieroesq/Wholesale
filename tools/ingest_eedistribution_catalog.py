@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-tools/ingest_eedistribution_catalog.py (v2.1)
+tools/ingest_eedistribution_catalog.py (v2.2)
 ---------------------------------------------
 Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
-- Fail-closed authentication using EE_DIST_EMAIL & EE_DIST_PASSWORD (aborts if login fails)
+- Extracts __RequestVerificationToken from https://www.eedistribution.com/ homepage modal
+  and POSTs AccNumOrEmail + Password to https://www.eedistribution.com/Account/Login
+- Fail-closed authentication check (aborts immediately if login fails so public pages
+  without account-level restriction notices are never scraped)
 - 5-Layer 3rd-Party / Amazon / eBay Restriction Detector on both listing cards and
   every Product Detail Page (PDP):
     1. Listing grid restriction badges/icons
@@ -62,7 +65,8 @@ REJECT_LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
 BLOCKLIST_PATH = DATA_DIR / "ip_blocklist.json"
 
 BASE_URL = "https://www.eedistribution.com"
-LOGIN_URL = f"{BASE_URL}/Login"
+HOME_URL = f"{BASE_URL}/"
+LOGIN_POST_URL = f"{BASE_URL}/Account/Login"
 
 HEADERS = {
     "User-Agent": (
@@ -137,31 +141,54 @@ def create_authenticated_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    resp = session.get(LOGIN_URL, timeout=25)
+    resp = session.get(HOME_URL, timeout=25)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Locate the /Account/Login form to capture its exact __RequestVerificationToken
+    login_form = None
+    for form in soup.find_all("form"):
+        action = str(form.get("action") or "")
+        if "/account/login" in action.lower():
+            login_form = form
+            break
+
     payload: Dict[str, str] = {}
-    for inp in soup.find_all("input"):
+    target_scope = login_form if login_form is not None else soup
+    for inp in target_scope.find_all("input"):
         name = inp.get("name")
         if name:
             payload[name] = inp.get("value", "")
 
-    payload["Email"] = email
+    payload["AccNumOrEmail"] = email
     payload["Password"] = password
-    payload["email"] = email
-    payload["password"] = password
     payload["RememberMe"] = "true"
+    payload.setdefault("ReturnUrl", "/")
 
-    post_resp = session.post(LOGIN_URL, data=payload, timeout=25, allow_redirects=True)
+    post_headers = {
+        "Referer": HOME_URL,
+        "Origin": BASE_URL,
+    }
+    post_resp = session.post(LOGIN_POST_URL, data=payload, headers=post_headers, timeout=25, allow_redirects=True)
     body_lower = post_resp.text.lower()
-    is_logged_in = any(tok in body_lower for tok in ("logout", "log out", "sign out", "my account", "account/orders"))
+
+    is_logged_in = (
+        any(tok in body_lower for tok in ("logout", "log out", "sign out", "my account", "account/orders", "account/logout"))
+        and "accnumoremail" not in body_lower
+    )
+    if not is_logged_in:
+        # Double-check with a GET to homepage to verify session cookie persistence
+        check_resp = session.get(HOME_URL, timeout=20)
+        check_lower = check_resp.text.lower()
+        is_logged_in = any(tok in check_lower for tok in ("logout", "log out", "sign out", "account/logout"))
+
     if not is_logged_in:
         raise RuntimeError(
-            "FAIL-CLOSED: EE Distribution authentication failed (no Logout/My Account indicator). "
+            "FAIL-CLOSED: EE Distribution /Account/Login authentication failed (AccNumOrEmail/Password rejected or token invalid). "
             "Refusing to scrape unauthenticated pages where marketplace restrictions may be hidden."
         )
 
-    logger.info("Authenticated EE Distribution wholesale session verified (FAIL-CLOSED guard passed).")
+    logger.info("Authenticated EE Distribution wholesale session verified via /Account/Login (FAIL-CLOSED guard passed).")
     return session
 
 
@@ -451,7 +478,7 @@ def run_ee_ingestion(brands: List[str], max_pages: int = 5, freight_per_unit: fl
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.1 with 5-Layer Marketplace Gate")
+    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.2 with 5-Layer Marketplace Gate")
     parser.add_argument(
         "--brands",
         nargs="+",
