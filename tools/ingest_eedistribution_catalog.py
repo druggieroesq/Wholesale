@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-tools/ingest_eedistribution_catalog.py (v2.5)
+tools/ingest_eedistribution_catalog.py (v2.6)
 ---------------------------------------------
 Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
 - Authenticates via POST https://www.eedistribution.com/Account/Login with __RequestVerificationToken
 - Fail-closed authentication guard (aborts immediately if login fails so public pages
   without account-level restriction notices are never scraped)
+- Polite 2.2s PDP pacing + adaptive 429 backoff (stays under EE's 10 req / 20s sliding window)
 - Incremental crash-safe CSV saves every 10 verified SKUs + finally-block flush (Ctrl+C safe)
-- Polite 1.6s PDP pacing + 4s 429 backoff (prevents 15s rate-limit stalls)
 - 5-Layer 3rd-Party / Amazon / eBay Restriction Detector on both listing cards and
   every Product Detail Page (PDP):
     1. Listing grid restriction badges/icons
@@ -18,6 +18,7 @@ Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
 - Logs every excluded SKU + exact trigger phrase to data/reports/ee_marketplace_restricted_skipped.csv
 - Extracts exact Piece Price / Case Price (e.g., "6 pieces (1 case): $52.10" -> $8.68/ea) and multiline UPC
 - Writes clean CSV to both incoming/ and indexed/ so all daemons index it immediately
+- Optional --run-pipeline flag chains multipack_reverse_upc_hunter.py -> push_full_backlog_to_sheet.py
 """
 
 import os
@@ -28,6 +29,7 @@ import time
 import shutil
 import logging
 import argparse
+import subprocess
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -138,14 +140,14 @@ def get_with_backoff(session: requests.Session, url: str, timeout: int = 25) -> 
         try:
             resp = session.get(url, timeout=timeout, allow_redirects=True)
             if resp.status_code == 429:
-                wait_s = 4 * attempt
+                wait_s = 12 * attempt
                 logger.warning(f"Rate limited (HTTP 429) on {url} — sleeping {wait_s}s before retry {attempt}/3...")
                 time.sleep(wait_s)
                 continue
             return resp
         except Exception as exc:
             logger.warning(f"Request error ({url}): {exc}")
-            time.sleep(2 * attempt)
+            time.sleep(3 * attempt)
     return None
 
 
@@ -317,7 +319,7 @@ def discover_brand_product_urls(
 
         if found_on_page == 0:
             break
-        time.sleep(1.5)
+        time.sleep(2.2)
     return urls
 
 
@@ -472,9 +474,10 @@ def flush_outputs(approved_records: List[Dict[str, Any]], rejected_records: List
 def run_ee_ingestion(
     brands: List[str],
     max_pages: int = 3,
-    max_pdps_per_brand: int = 60,
+    max_pdps_per_brand: int = 40,
     freight_per_unit: float = 0.85,
     in_stock_only: bool = True,
+    pdp_delay: float = 2.2,
 ) -> int:
     session = create_authenticated_session()
     blocked_brands, blocked_multi = load_blocked_brands()
@@ -491,7 +494,7 @@ def run_ee_ingestion(
         all_urls.extend(b_urls)
 
     all_urls = list(dict.fromkeys(all_urls))
-    logger.info(f"Inspecting {len(all_urls)} EE Distribution PDPs with 5-Layer 3rd-Party Shield (1.6s polite pacing)...")
+    logger.info(f"Inspecting {len(all_urls)} EE Distribution PDPs with 5-Layer 3rd-Party Shield ({pdp_delay}s pacing)...")
 
     approved_records: List[Dict[str, Any]] = []
 
@@ -508,7 +511,7 @@ def run_ee_ingestion(
             elif rej:
                 rejected_records.append(rej)
                 logger.info(f"[EXCLUDED - MARKETPLACE RESTRICTED] {rej['sku']} -> {rej['reason']}")
-            time.sleep(1.6)
+            time.sleep(pdp_delay)
     finally:
         final_cnt = flush_outputs(approved_records, rejected_records)
         if rejected_records:
@@ -519,8 +522,20 @@ def run_ee_ingestion(
     return len(approved_records)
 
 
+def trigger_downstream_match_and_sync():
+    logger.info("Triggering Keepa UPC/Multipack matching and Google Sheets backlog sync...")
+    for cmd in (
+        [sys.executable, str(ROOT_DIR / "tools" / "multipack_reverse_upc_hunter.py")],
+        [sys.executable, str(ROOT_DIR / "tools" / "push_full_backlog_to_sheet.py"), "--wipe-first"],
+    ):
+        script_path = Path(cmd[1])
+        if script_path.exists():
+            logger.info(f"Running {script_path.name}...")
+            subprocess.run(cmd, check=False)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.5 with 5-Layer Marketplace Gate")
+    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.6 with 5-Layer Marketplace Gate")
     parser.add_argument(
         "--brands",
         nargs="+",
@@ -532,9 +547,11 @@ if __name__ == "__main__":
         help="Brand slugs to crawl on eedistribution.com"
     )
     parser.add_argument("--max-pages", type=int, default=3, help="Max pagination pages per brand (60 items/page)")
-    parser.add_argument("--max-pdps-per-brand", type=int, default=60, help="Max PDPs to inspect per brand")
+    parser.add_argument("--max-pdps-per-brand", type=int, default=40, help="Max PDPs to inspect per brand")
     parser.add_argument("--freight-per-unit", type=float, default=0.85, help="Estimated inbound freight per unit")
+    parser.add_argument("--pdp-delay", type=float, default=2.2, help="Delay in seconds between PDP requests (avoids 429)")
     parser.add_argument("--include-preorders", action="store_true", help="Include pre-order items as well as In Stock Now")
+    parser.add_argument("--run-pipeline", action="store_true", help="Run Keepa UPC matcher and Google Sheets sync after scraping")
     args = parser.parse_args()
 
     count = run_ee_ingestion(
@@ -543,5 +560,8 @@ if __name__ == "__main__":
         max_pdps_per_brand=args.max_pdps_per_brand,
         freight_per_unit=args.freight_per_unit,
         in_stock_only=(not args.include_preorders),
+        pdp_delay=args.pdp_delay,
     )
+    if args.run_pipeline and count > 0:
+        trigger_downstream_match_and_sync()
     sys.exit(0 if count > 0 else 1)
