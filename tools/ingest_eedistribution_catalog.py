@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-tools/ingest_eedistribution_catalog.py (v2.3)
+tools/ingest_eedistribution_catalog.py (v2.4)
 ---------------------------------------------
 Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
 - Authenticates via POST https://www.eedistribution.com/Account/Login with __RequestVerificationToken
 - Fail-closed authentication guard (aborts immediately if login fails so public pages
   without account-level restriction notices are never scraped)
-- Crawls EE Distribution's real brand routes (/s/{brand}/c?instock=1&page={page})
-  and real product detail pages (/product/{slug}/{sku})
+- Crawls EE Distribution's verified brand routes (/s/{brand}/c?page={page}) returning 60 PDPs/page
+- Filters for 'In Stock Now' items (skipping pre-orders / backorders / out-of-stock)
 - 5-Layer 3rd-Party / Amazon / eBay Restriction Detector on both listing cards and
   every Product Detail Page (PDP):
     1. Listing grid restriction badges/icons
@@ -15,8 +15,8 @@ Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
     3. Specification table / attribute rows (e.g., "Amazon: No", "3rd Party Sales: Not Allowed")
     4. Full visible page text regex sweep (Amazon, eBay, Walmart, 3rd Party, Brick & Mortar Only)
     5. Embedded JSON / script state flags (amazonRestricted, thirdPartyRestricted, ebayRestricted)
+- Extracts exact Piece Price / Case Price (e.g., "6 pieces (1 case): $52.10" -> $8.68/ea) and multiline UPC
 - Logs every excluded SKU + exact trigger phrase to data/reports/ee_marketplace_restricted_skipped.csv
-- Normalizes Case Price / Pack Qty to true per-unit COGS (+ inbound freight)
 - Writes clean CSV to both incoming/ and indexed/ so all daemons index it immediately
 """
 
@@ -279,56 +279,48 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
 def discover_brand_product_urls(
     session: requests.Session,
     brand_slug: str,
-    max_pages: int = 4,
+    max_pages: int = 3,
     rejected_records: Optional[List[Dict[str, str]]] = None,
 ) -> List[str]:
     urls: List[str] = []
     for page in range(1, max_pages + 1):
-        # EE Distribution brand listing route: /s/{brand_slug}/c?instock=1&page={page}
-        list_url = f"{BASE_URL}/s/{brand_slug}/c?instock=1&page={page}"
+        # Verified EE Distribution brand route (returns 60 /product/... links per page)
+        list_url = f"{BASE_URL}/s/{brand_slug}/c" if page == 1 else f"{BASE_URL}/s/{brand_slug}/c?page={page}"
         r = get_with_backoff(session, list_url, timeout=25)
         if r is None or r.status_code != 200 or "/Error/NotFound" in r.url:
-            # Fallback to search query route /s/?query1={brand}&instock=1&page={page}
-            list_url = f"{BASE_URL}/s/?query1={brand_slug}&instock=1&page={page}"
-            r = get_with_backoff(session, list_url, timeout=25)
-            if r is None or r.status_code != 200:
-                break
+            break
 
         soup = BeautifulSoup(r.text, "html.parser")
         found_on_page = 0
 
-        # Check product cards on listing page for immediate grid-level restriction badges
-        cards = soup.select(".product-item, .product-card, .item-box, .product-grid-item, [data-productid], [data-sku]")
-        if cards:
-            for card in cards:
-                a = card.select_one("a[href*='/product/']")
-                if not a:
-                    continue
-                full = urljoin(BASE_URL, a.get("href", "").split("?")[0])
-                card_txt = " ".join(card.get_text(" ", strip=True).split())
-                card_restricted = False
-                for pat in EE_RESTRICTION_PATTERNS:
-                    if re.search(pat, card_txt, re.IGNORECASE):
-                        card_restricted = True
-                        if rejected_records is not None:
-                            rejected_records.append({
-                                "sku": full.rstrip("/").split("/")[-1].upper(),
-                                "url": full,
-                                "reason": f"Grid Card Badge: {card_txt[:120]}"
-                            })
-                        break
-                if not card_restricted and full not in urls:
-                    urls.append(full)
-                    found_on_page += 1
-        else:
-            for a in soup.select("a[href*='/product/']"):
-                href = a.get("href", "").strip()
-                if "/product/" not in href:
-                    continue
-                full = urljoin(BASE_URL, href.split("?")[0])
-                if full not in urls:
-                    urls.append(full)
-                    found_on_page += 1
+        for a in soup.select("a[href*='/product/']"):
+            href = a.get("href", "").strip()
+            if "/product/" not in href:
+                continue
+            full = urljoin(BASE_URL, href.split("?")[0])
+            if full in urls:
+                continue
+
+            # Check immediate parent container for listing-level restriction notices
+            parent_card = a.find_parent(["div", "li", "article"])
+            card_restricted = False
+            if parent_card:
+                card_txt = " ".join(parent_card.get_text(" ", strip=True).split())
+                if len(card_txt) < 500:
+                    for pat in EE_RESTRICTION_PATTERNS:
+                        if re.search(pat, card_txt, re.IGNORECASE):
+                            card_restricted = True
+                            if rejected_records is not None:
+                                rejected_records.append({
+                                    "sku": full.rstrip("/").split("/")[-1].upper(),
+                                    "url": full,
+                                    "reason": f"Grid Card Badge: {card_txt[:120]}"
+                                })
+                            break
+
+            if not card_restricted:
+                urls.append(full)
+                found_on_page += 1
 
         if found_on_page == 0:
             break
@@ -341,7 +333,8 @@ def parse_ee_product_page(
     session: requests.Session,
     blocked_brands: Set[str],
     blocked_multi: List[str],
-    freight_per_unit: float
+    freight_per_unit: float,
+    in_stock_only: bool = True,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
     resp = get_with_backoff(session, url, timeout=25)
     if resp is None or resp.status_code != 200:
@@ -350,19 +343,21 @@ def parse_ee_product_page(
     raw_html = resp.text
     soup = BeautifulSoup(raw_html, "html.parser")
 
-    # Verify session is still authenticated on PDP (never evaluate unauthenticated HTML)
+    # Fail-closed session check on every PDP
     if "logout" not in raw_html.lower() and "log out" not in raw_html.lower() and "sign out" not in raw_html.lower():
         logger.warning(f"Session lost on {url} — skipping.")
         return None, None
 
-    page_upper = soup.get_text(" ", strip=True).upper()
-    if "OUT OF STOCK" in page_upper and "IN STOCK" not in page_upper:
-        return None, None
-
+    # 1. Run 5-Layer Marketplace Restriction Shield FIRST before any parsing
     allowed, reason = check_ee_marketplace_eligibility(soup, raw_html)
     sku_from_url = url.rstrip("/").split("/")[-1].upper()
     if not allowed:
         return None, {"sku": sku_from_url, "url": url, "reason": reason}
+
+    # 2. Check stock status ("In Stock Now" vs Pre-Order / Out of Stock)
+    page_text = soup.get_text("\n", strip=True)
+    if in_stock_only and "In Stock Now" not in page_text:
+        return None, None
 
     title, brand, mpn, upc, raw_price = "", "", sku_from_url, "", 0.0
     for script in soup.find_all("script", type="application/ld+json"):
@@ -396,21 +391,50 @@ def parse_ee_product_page(
         b_el = soup.select_one(".brand-name, [itemprop='brand'], .manufacturer")
         brand = b_el.get_text(strip=True) if b_el else ""
 
+    if not brand and title:
+        for known in EE_WHITELIST_OVERRIDE:
+            if known in title.upper():
+                brand = known
+                break
+
     if not brand or is_brand_blocked(brand, blocked_brands, blocked_multi):
         return None, None
 
-    if raw_price <= 0:
-        for sel in (".your-price", ".wholesale-price", ".product-price", ".price", "[data-price]"):
-            p_el = soup.select_one(sel)
-            if p_el:
-                m = re.search(r"\$([0-9,]+\.[0-9]{2})", p_el.get_text())
-                if m:
-                    raw_price = float(m.group(1).replace(",", ""))
-                    if raw_price > 0:
-                        break
+    # 3. Extract exact 1-case / single-unit wholesale price (e.g., "6 pieces (1 case): $52.10")
+    pack_qty = 1
+    m_tier = re.search(r"\b(\d+)\s+pieces?\s*\(1\s*case\)\s*:\s*\$([0-9,]+\.[0-9]{2})", page_text, re.IGNORECASE)
+    if m_tier:
+        q_val = int(m_tier.group(1))
+        c_val = float(m_tier.group(2).replace(",", ""))
+        if 1 <= q_val <= 48 and c_val > 0:
+            pack_qty = q_val
+            raw_price = c_val
+    else:
+        m_case = re.search(
+            r"(?:case\s*(?:of|pack|qty)|master\s*carton|pack\s*of)\s*:?\s*(\d+)|\b(\d+)\s*(?:pcs|pieces|units)\s*/\s*case\b",
+            f"{title} {page_text[:1500]}",
+            re.IGNORECASE,
+        )
+        if m_case:
+            qty_val = int(m_case.group(1) or m_case.group(2))
+            if 1 < qty_val <= 48:
+                pack_qty = qty_val
 
+        if raw_price <= 0:
+            for sel in (".your-price", ".wholesale-price", ".product-price", ".price", "[data-price]"):
+                p_el = soup.select_one(sel)
+                if p_el:
+                    m = re.search(r"\$([0-9,]+\.[0-9]{2})", p_el.get_text())
+                    if m:
+                        raw_price = float(m.group(1).replace(",", ""))
+                        if raw_price > 0:
+                            break
+
+    # 4. Multiline UPC extraction ("UPC:\n889698...")
     if not upc:
-        m_upc = re.search(r"\b(?:UPC|GTIN)[:\s#]*([0-9]{12,13})\b", raw_html, re.IGNORECASE)
+        m_upc = re.search(r"\b(?:UPC|GTIN)\s*:?\s*([0-9]{12,13})\b", page_text, re.IGNORECASE | re.MULTILINE)
+        if not m_upc:
+            m_upc = re.search(r"\b(?:UPC|GTIN)[^0-9]{0,25}([0-9]{12,13})\b", raw_html, re.IGNORECASE | re.DOTALL)
         if m_upc:
             upc = m_upc.group(1)
 
@@ -420,17 +444,6 @@ def parse_ee_product_page(
     m_wt = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:lbs?|pounds?)\b", raw_html, re.IGNORECASE)
     if m_wt and float(m_wt.group(1)) > 45.0:
         return None, None
-
-    pack_qty = 1
-    m_case = re.search(
-        r"(?:case\s*(?:of|pack|qty)|master\s*carton|pack\s*of)\s*:?\s*(\d+)|\b(\d+)\s*(?:pcs|pieces|units)\s*/\s*case\b",
-        f"{title} {soup.get_text(' ', strip=True)[:1500]}",
-        re.IGNORECASE,
-    )
-    if m_case:
-        qty_val = int(m_case.group(1) or m_case.group(2))
-        if 1 < qty_val <= 48:
-            pack_qty = qty_val
 
     unit_cogs = round((raw_price / pack_qty) + freight_per_unit, 2)
 
@@ -450,7 +463,13 @@ def parse_ee_product_page(
     }, None
 
 
-def run_ee_ingestion(brands: List[str], max_pages: int = 4, freight_per_unit: float = 0.85) -> int:
+def run_ee_ingestion(
+    brands: List[str],
+    max_pages: int = 3,
+    max_pdps_per_brand: int = 60,
+    freight_per_unit: float = 0.85,
+    in_stock_only: bool = True,
+) -> int:
     session = create_authenticated_session()
     blocked_brands, blocked_multi = load_blocked_brands()
 
@@ -458,9 +477,11 @@ def run_ee_ingestion(brands: List[str], max_pages: int = 4, freight_per_unit: fl
     rejected_records: List[Dict[str, str]] = []
 
     for b in brands:
-        logger.info(f"Scanning EE Distribution In-Stock listings for brand: {b}")
+        logger.info(f"Scanning EE Distribution listings for brand: {b}")
         b_urls = discover_brand_product_urls(session, b, max_pages=max_pages, rejected_records=rejected_records)
-        logger.info(f"  -> Found {len(b_urls)} candidate product URLs for '{b}'")
+        if max_pdps_per_brand > 0:
+            b_urls = b_urls[:max_pdps_per_brand]
+        logger.info(f"  -> Queued {len(b_urls)} candidate product URLs for '{b}'")
         all_urls.extend(b_urls)
 
     all_urls = list(dict.fromkeys(all_urls))
@@ -468,16 +489,18 @@ def run_ee_ingestion(brands: List[str], max_pages: int = 4, freight_per_unit: fl
 
     approved_records: List[Dict[str, Any]] = []
 
-    for url in all_urls:
-        rec, rej = parse_ee_product_page(url, session, blocked_brands, blocked_multi, freight_per_unit)
+    for idx, url in enumerate(all_urls, 1):
+        rec, rej = parse_ee_product_page(
+            url, session, blocked_brands, blocked_multi, freight_per_unit, in_stock_only=in_stock_only
+        )
         if rec:
             approved_records.append(rec)
-            if len(approved_records) % 25 == 0:
-                logger.info(f"Verified {len(approved_records)} Amazon/3rd-party-eligible EE SKUs...")
+            if len(approved_records) % 15 == 0:
+                logger.info(f"[{idx}/{len(all_urls)}] Verified {len(approved_records)} Amazon/3rd-party-eligible EE SKUs...")
         elif rej:
             rejected_records.append(rej)
             logger.info(f"[EXCLUDED - MARKETPLACE RESTRICTED] {rej['sku']} -> {rej['reason']}")
-        time.sleep(0.65)
+        time.sleep(0.55)
 
     if rejected_records:
         pd.DataFrame(rejected_records).drop_duplicates(subset=["url"]).to_csv(REJECT_LOG_CSV, index=False)
@@ -495,7 +518,7 @@ def run_ee_ingestion(brands: List[str], max_pages: int = 4, freight_per_unit: fl
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.3 with 5-Layer Marketplace Gate")
+    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.4 with 5-Layer Marketplace Gate")
     parser.add_argument(
         "--brands",
         nargs="+",
@@ -506,13 +529,17 @@ if __name__ == "__main__":
         ],
         help="Brand slugs to crawl on eedistribution.com"
     )
-    parser.add_argument("--max-pages", type=int, default=4, help="Max pagination pages per brand")
+    parser.add_argument("--max-pages", type=int, default=3, help="Max pagination pages per brand (60 items/page)")
+    parser.add_argument("--max-pdps-per-brand", type=int, default=60, help="Max PDPs to inspect per brand")
     parser.add_argument("--freight-per-unit", type=float, default=0.85, help="Estimated inbound freight per unit")
+    parser.add_argument("--include-preorders", action="store_true", help="Include pre-order items as well as In Stock Now")
     args = parser.parse_args()
 
     count = run_ee_ingestion(
         brands=args.brands,
         max_pages=args.max_pages,
-        freight_per_unit=args.freight_per_unit
+        max_pdps_per_brand=args.max_pdps_per_brand,
+        freight_per_unit=args.freight_per_unit,
+        in_stock_only=(not args.include_preorders),
     )
     sys.exit(0 if count > 0 else 1)
