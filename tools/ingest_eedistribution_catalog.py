@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-tools/ingest_eedistribution_catalog.py (v2.4)
+tools/ingest_eedistribution_catalog.py (v2.5)
 ---------------------------------------------
 Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
 - Authenticates via POST https://www.eedistribution.com/Account/Login with __RequestVerificationToken
 - Fail-closed authentication guard (aborts immediately if login fails so public pages
   without account-level restriction notices are never scraped)
-- Crawls EE Distribution's verified brand routes (/s/{brand}/c?page={page}) returning 60 PDPs/page
-- Filters for 'In Stock Now' items (skipping pre-orders / backorders / out-of-stock)
+- Incremental crash-safe CSV saves every 10 verified SKUs + finally-block flush (Ctrl+C safe)
+- Polite 1.6s PDP pacing + 4s 429 backoff (prevents 15s rate-limit stalls)
 - 5-Layer 3rd-Party / Amazon / eBay Restriction Detector on both listing cards and
   every Product Detail Page (PDP):
     1. Listing grid restriction badges/icons
@@ -15,8 +15,8 @@ Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
     3. Specification table / attribute rows (e.g., "Amazon: No", "3rd Party Sales: Not Allowed")
     4. Full visible page text regex sweep (Amazon, eBay, Walmart, 3rd Party, Brick & Mortar Only)
     5. Embedded JSON / script state flags (amazonRestricted, thirdPartyRestricted, ebayRestricted)
-- Extracts exact Piece Price / Case Price (e.g., "6 pieces (1 case): $52.10" -> $8.68/ea) and multiline UPC
 - Logs every excluded SKU + exact trigger phrase to data/reports/ee_marketplace_restricted_skipped.csv
+- Extracts exact Piece Price / Case Price (e.g., "6 pieces (1 case): $52.10" -> $8.68/ea) and multiline UPC
 - Writes clean CSV to both incoming/ and indexed/ so all daemons index it immediately
 """
 
@@ -138,7 +138,7 @@ def get_with_backoff(session: requests.Session, url: str, timeout: int = 25) -> 
         try:
             resp = session.get(url, timeout=timeout, allow_redirects=True)
             if resp.status_code == 429:
-                wait_s = 15 * attempt
+                wait_s = 4 * attempt
                 logger.warning(f"Rate limited (HTTP 429) on {url} — sleeping {wait_s}s before retry {attempt}/3...")
                 time.sleep(wait_s)
                 continue
@@ -213,7 +213,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
     Inspects the EE Distribution page for ANY Amazon, eBay, Walmart, or 3rd-party
     marketplace selling prohibition. Returns (is_allowed, reason).
     """
-    # Layer 1: Explicit restriction banners, badges, and warning boxes
     alert_selectors = [
         ".restriction", ".restrictions", ".marketplace-restriction",
         ".product-restrictions", ".alert-warning", ".alert-danger",
@@ -229,7 +228,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
                 if re.search(pat, txt, re.IGNORECASE):
                     return False, f"Layer1 Badge/Alert: {txt[:130]}"
 
-    # Layer 2: Tooltip attributes (title, aria-label, data-original-title, alt)
     for el in soup.select("[title], [aria-label], [data-original-title], img[alt]"):
         tip = " ".join(
             f"{el.get('title', '')} {el.get('aria-label', '')} {el.get('data-original-title', '')} {el.get('alt', '')}".split()
@@ -240,7 +238,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
             if re.search(pat, tip, re.IGNORECASE):
                 return False, f"Layer2 Tooltip/Icon: {tip[:130]}"
 
-    # Layer 3: Product specification rows / key-value attributes (e.g., "Amazon: No", "3rd Party: Restricted")
     for row in soup.select("tr, li, dl, .spec-row, .product-attribute, .attribute-row"):
         row_txt = " ".join(row.get_text(" ", strip=True).split())
         if not row_txt or len(row_txt) > 240:
@@ -249,7 +246,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
             if re.search(r"\b(?:no|not\s+allowed|not\s+eligible|not\s+permitted|prohibited|restricted|blocked|ineligible|brick\s*(?:&|and)\s*mortar)\b", row_txt, re.IGNORECASE):
                 return False, f"Layer3 Spec Row: {row_txt[:130]}"
 
-    # Layer 4: Full visible page text sweep
     visible_text = " ".join(soup.get_text(" ", strip=True).split())
     for pat in EE_RESTRICTION_PATTERNS:
         m = re.search(pat, visible_text, re.IGNORECASE)
@@ -258,7 +254,6 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
             end = min(len(visible_text), m.end() + 55)
             return False, f"Layer4 Page Text: {visible_text[start:end]}"
 
-    # Layer 5: Embedded JSON / script state flags
     if re.search(
         r'"(?:amazonRestricted|ebayRestricted|thirdPartyRestricted|marketplaceRestricted|noAmazon|noEbay|noThirdParty)"\s*:\s*(?:true|1|"true"|"yes")',
         raw_html,
@@ -284,7 +279,6 @@ def discover_brand_product_urls(
 ) -> List[str]:
     urls: List[str] = []
     for page in range(1, max_pages + 1):
-        # Verified EE Distribution brand route (returns 60 /product/... links per page)
         list_url = f"{BASE_URL}/s/{brand_slug}/c" if page == 1 else f"{BASE_URL}/s/{brand_slug}/c?page={page}"
         r = get_with_backoff(session, list_url, timeout=25)
         if r is None or r.status_code != 200 or "/Error/NotFound" in r.url:
@@ -301,7 +295,6 @@ def discover_brand_product_urls(
             if full in urls:
                 continue
 
-            # Check immediate parent container for listing-level restriction notices
             parent_card = a.find_parent(["div", "li", "article"])
             card_restricted = False
             if parent_card:
@@ -324,7 +317,7 @@ def discover_brand_product_urls(
 
         if found_on_page == 0:
             break
-        time.sleep(0.75)
+        time.sleep(1.5)
     return urls
 
 
@@ -343,18 +336,15 @@ def parse_ee_product_page(
     raw_html = resp.text
     soup = BeautifulSoup(raw_html, "html.parser")
 
-    # Fail-closed session check on every PDP
     if "logout" not in raw_html.lower() and "log out" not in raw_html.lower() and "sign out" not in raw_html.lower():
         logger.warning(f"Session lost on {url} — skipping.")
         return None, None
 
-    # 1. Run 5-Layer Marketplace Restriction Shield FIRST before any parsing
     allowed, reason = check_ee_marketplace_eligibility(soup, raw_html)
     sku_from_url = url.rstrip("/").split("/")[-1].upper()
     if not allowed:
         return None, {"sku": sku_from_url, "url": url, "reason": reason}
 
-    # 2. Check stock status ("In Stock Now" vs Pre-Order / Out of Stock)
     page_text = soup.get_text("\n", strip=True)
     if in_stock_only and "In Stock Now" not in page_text:
         return None, None
@@ -400,7 +390,6 @@ def parse_ee_product_page(
     if not brand or is_brand_blocked(brand, blocked_brands, blocked_multi):
         return None, None
 
-    # 3. Extract exact 1-case / single-unit wholesale price (e.g., "6 pieces (1 case): $52.10")
     pack_qty = 1
     m_tier = re.search(r"\b(\d+)\s+pieces?\s*\(1\s*case\)\s*:\s*\$([0-9,]+\.[0-9]{2})", page_text, re.IGNORECASE)
     if m_tier:
@@ -430,7 +419,6 @@ def parse_ee_product_page(
                         if raw_price > 0:
                             break
 
-    # 4. Multiline UPC extraction ("UPC:\n889698...")
     if not upc:
         m_upc = re.search(r"\b(?:UPC|GTIN)\s*:?\s*([0-9]{12,13})\b", page_text, re.IGNORECASE | re.MULTILINE)
         if not m_upc:
@@ -463,6 +451,24 @@ def parse_ee_product_page(
     }, None
 
 
+def flush_outputs(approved_records: List[Dict[str, Any]], rejected_records: List[Dict[str, str]]) -> int:
+    if rejected_records:
+        pd.DataFrame(rejected_records).drop_duplicates(subset=["url"]).to_csv(REJECT_LOG_CSV, index=False)
+
+    if approved_records:
+        df = pd.DataFrame(approved_records).drop_duplicates(subset=["mpn"])
+        if OUT_CSV.exists():
+            try:
+                old_df = pd.read_csv(OUT_CSV, dtype=str)
+                df = pd.concat([old_df, df.astype(str)], ignore_index=True).drop_duplicates(subset=["mpn"], keep="last")
+            except Exception:
+                pass
+        df.to_csv(OUT_CSV, index=False)
+        shutil.copy2(OUT_CSV, INDEXED_CSV)
+        return len(df)
+    return 0
+
+
 def run_ee_ingestion(
     brands: List[str],
     max_pages: int = 3,
@@ -485,40 +491,36 @@ def run_ee_ingestion(
         all_urls.extend(b_urls)
 
     all_urls = list(dict.fromkeys(all_urls))
-    logger.info(f"Inspecting {len(all_urls)} EE Distribution PDPs with 5-Layer 3rd-Party Shield...")
+    logger.info(f"Inspecting {len(all_urls)} EE Distribution PDPs with 5-Layer 3rd-Party Shield (1.6s polite pacing)...")
 
     approved_records: List[Dict[str, Any]] = []
 
-    for idx, url in enumerate(all_urls, 1):
-        rec, rej = parse_ee_product_page(
-            url, session, blocked_brands, blocked_multi, freight_per_unit, in_stock_only=in_stock_only
-        )
-        if rec:
-            approved_records.append(rec)
-            if len(approved_records) % 15 == 0:
-                logger.info(f"[{idx}/{len(all_urls)}] Verified {len(approved_records)} Amazon/3rd-party-eligible EE SKUs...")
-        elif rej:
-            rejected_records.append(rej)
-            logger.info(f"[EXCLUDED - MARKETPLACE RESTRICTED] {rej['sku']} -> {rej['reason']}")
-        time.sleep(0.55)
+    try:
+        for idx, url in enumerate(all_urls, 1):
+            rec, rej = parse_ee_product_page(
+                url, session, blocked_brands, blocked_multi, freight_per_unit, in_stock_only=in_stock_only
+            )
+            if rec:
+                approved_records.append(rec)
+                if len(approved_records) % 10 == 0:
+                    saved_cnt = flush_outputs(approved_records, rejected_records)
+                    logger.info(f"[{idx}/{len(all_urls)}] Verified {len(approved_records)} EE SKUs (total on disk: {saved_cnt})...")
+            elif rej:
+                rejected_records.append(rej)
+                logger.info(f"[EXCLUDED - MARKETPLACE RESTRICTED] {rej['sku']} -> {rej['reason']}")
+            time.sleep(1.6)
+    finally:
+        final_cnt = flush_outputs(approved_records, rejected_records)
+        if rejected_records:
+            logger.info(f"Saved {len(rejected_records)} excluded EE restricted SKUs -> {REJECT_LOG_CSV}")
+        if final_cnt > 0:
+            logger.info(f"Saved {final_cnt} verified 3rd-party-eligible EE Distribution SKUs -> {OUT_CSV} & {INDEXED_CSV}")
 
-    if rejected_records:
-        pd.DataFrame(rejected_records).drop_duplicates(subset=["url"]).to_csv(REJECT_LOG_CSV, index=False)
-        logger.info(f"Logged {len(rejected_records)} excluded EE restricted SKUs -> {REJECT_LOG_CSV}")
-
-    if not approved_records:
-        logger.warning("No Amazon-eligible EE Distribution SKUs extracted.")
-        return 0
-
-    df = pd.DataFrame(approved_records).drop_duplicates(subset=["mpn"])
-    df.to_csv(OUT_CSV, index=False)
-    shutil.copy2(OUT_CSV, INDEXED_CSV)
-    logger.info(f"Exported {len(df)} verified 3rd-party-eligible EE Distribution SKUs -> {OUT_CSV} & {INDEXED_CSV}")
-    return len(df)
+    return len(approved_records)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.4 with 5-Layer Marketplace Gate")
+    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.5 with 5-Layer Marketplace Gate")
     parser.add_argument(
         "--brands",
         nargs="+",
