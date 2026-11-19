@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Master Orchestrator & Centralized Telegram Gateway (v7.9.2 Self-Healing Engine)
+Master Orchestrator & Centralized Telegram Gateway (v7.9.3 Self-Healing Engine)
 -------------------------------------------------------------------------------
-Supervises dedicated background workers and automated catalog ingestion:
+Supervises dedicated background workers, persistent volume state, and automated catalog ingestion:
 1. ReverseAmazonHunter         (tools/reverse_amazon_finder.py)
 2. SheetSyncDaemon             (tools/sync_today_leads_to_sheet.py --daemon)
 3. WebDistributorScout         (tools/web_distributor_scout.py)
@@ -11,14 +11,14 @@ Supervises dedicated background workers and automated catalog ingestion:
 6. AntiRegateDaemon            (tools/anti_regating_pulse_daemon.py --daemon)
 7. SPAPIRestrictionsDaemon     (tools/sp_api_restrictions_daemon.py --loop --max-brands 100)
 8. Embedded Threads:
-   - HealthServer
-   - MasterTelegramListener
-   - TwoTierCatalogWatcher (auto-routes motion* -> ingest_motion_catalog.py & bci* -> ingest_bci_catalog.py)
-   - PeriodicEEDistributionWorker (auto-scrapes EE Distribution every 12h & triggers cross-match)
-   - PeriodicZoroScoutWorker (auto-scans Zoro.com MRO portal every 12h with SP-API verification)
-   - PeriodicSpecialtyScrapersWorker (auto-scrapes Atlantic Spice, JB Tools & Marlo Beauty every 12h)
-   - PeriodicBeautyMultipackWorker (hunts 0-FBA Beauty multipacks >=58% ROI every 12h)
-   - PeriodicReorderWorker
+  - HealthServer
+  - MasterTelegramListener
+  - TwoTierCatalogWatcher (auto-routes motion* -> ingest_motion_catalog.py & bci* -> ingest_bci_catalog.py)
+  - PeriodicEEDistributionWorker (auto-scrapes EE Distribution every 12h & triggers cross-match)
+  - PeriodicZoroScoutWorker (auto-scans Zoro.com MRO portal every 12h with SP-API verification)
+  - PeriodicSpecialtyScrapersWorker (auto-scrapes Atlantic Spice, JB Tools & Marlo Beauty every 12h)
+  - PeriodicBeautyMultipackWorker (hunts 0-FBA Beauty multipacks >=58% ROI every 12h)
+  - PeriodicReorderWorker
 """
 
 import os
@@ -69,7 +69,15 @@ else:
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 BUY_LIST_WEBHOOK_URL = get_verified_webhook_url()
 
-DATA_DIR = ROOT_DIR / "data"
+# Prefer Railway persistent volume (/app/data) when mounted, fallback to local ./data
+_env_data_dir = os.getenv("DATA_DIR", "").strip()
+if _env_data_dir and Path(_env_data_dir).exists():
+    DATA_DIR = Path(_env_data_dir)
+elif Path("/app/data").exists():
+    DATA_DIR = Path("/app/data")
+else:
+    DATA_DIR = ROOT_DIR / "data"
+
 CATALOG_DIR = DATA_DIR / "catalogs"
 REPORTS_DIR = DATA_DIR / "reports"
 PO_DIR = DATA_DIR / "purchase_orders"
@@ -98,6 +106,13 @@ EE_DIST_INTERVAL_SECONDS = int(os.getenv("EE_DIST_INTERVAL_SECONDS", 43200))
 ZORO_INTERVAL_SECONDS = int(os.getenv("ZORO_INTERVAL_SECONDS", 43200))
 SPECIALTY_INTERVAL_SECONDS = int(os.getenv("SPECIALTY_INTERVAL_SECONDS", 43200))
 BEAUTY_MULTIPACK_INTERVAL_SECONDS = int(os.getenv("BEAUTY_MULTIPACK_INTERVAL_SECONDS", 43200))
+MIN_SHEET_ACTIVE_ROWS = int(os.getenv("MIN_SHEET_ACTIVE_ROWS", 250))
+
+EXTRA_DIRECT_BRAND_BLOCKS = {
+    "JAKE SALES", "TOTOLY JAKE", "ICARCOVER", "SUMMIT HYDRAULICS",
+    "OSLTWI", "LIONMAX", "JACKSON PALMER", "KKBESTPACK", "DURAMIC 3D",
+    "ESUN", "FLUKE", "HONEYWELL", "RESMED"
+}
 
 for p in [REPORTS_DIR, DATA_DIR, CATALOG_DIR, PO_DIR, WHOLESALE_INCOMING, WHOLESALE_INDEXED, MFR_INCOMING, MFR_INDEXED]:
     p.mkdir(parents=True, exist_ok=True)
@@ -125,7 +140,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_2_self_healing_orchestrator"}')
+            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_3_self_healing_orchestrator"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -148,10 +163,15 @@ def run_health_server():
 
 
 def get_ip_blocklist_path() -> Path:
-    if PRIMARY_IP_FILE.parent.exists():
+    if PRIMARY_IP_FILE.exists():
         return PRIMARY_IP_FILE
-    FALLBACK_IP_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return FALLBACK_IP_FILE
+    if FALLBACK_IP_FILE.exists():
+        try:
+            PRIMARY_IP_FILE.write_text(FALLBACK_IP_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+            return PRIMARY_IP_FILE
+        except Exception:
+            return FALLBACK_IP_FILE
+    return PRIMARY_IP_FILE
 
 
 def clean_brand_text(brand: str) -> str:
@@ -167,7 +187,7 @@ def load_ip_blocklist_cached() -> set:
     global _IP_CACHE_DATA, _IP_CACHE_MTIME
     target = get_ip_blocklist_path()
     if not target.exists():
-        return set()
+        return {clean_brand_text(b) for b in EXTRA_DIRECT_BRAND_BLOCKS}
 
     try:
         mtime = target.stat().st_mtime
@@ -177,14 +197,15 @@ def load_ip_blocklist_cached() -> set:
 
             raw = json.loads(target.read_text(encoding="utf-8"))
             brand_list = raw if isinstance(raw, list) else raw.get("brands", [])
-            normalized = {clean_brand_text(b) for b in brand_list if b}
+            combined = list(brand_list) + list(EXTRA_DIRECT_BRAND_BLOCKS)
+            normalized = {clean_brand_text(b) for b in combined if b}
             _IP_CACHE_DATA = normalized
             _IP_CACHE_MTIME = mtime
-            logger.info(f"Loaded {len(_IP_CACHE_DATA)} normalized brands into active IP shield cache.")
+            logger.info(f"Loaded {len(_IP_CACHE_DATA)} normalized brands into active IP shield cache ({target}).")
             return _IP_CACHE_DATA
     except Exception as e:
         logger.error(f"Error reading IP blocklist: {e}")
-        return _IP_CACHE_DATA or set()
+        return _IP_CACHE_DATA or {clean_brand_text(b) for b in EXTRA_DIRECT_BRAND_BLOCKS}
 
 
 def is_brand_ip_blocked(brand_name: str) -> bool:
@@ -205,25 +226,22 @@ def append_brand_to_blocklist(brand: str) -> bool:
     if not brand_raw:
         return False
     target = get_ip_blocklist_path()
-    data = {"version": "6.0.0", "updated_at": "2026-11-16", "brands": [], "skus": []}
+    brands_set = set(EXTRA_DIRECT_BRAND_BLOCKS)
 
     if target.exists():
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
             if isinstance(raw, list):
-                data["brands"] = [str(b).strip().upper() for b in raw if str(b).strip()]
+                brands_set |= {str(b).strip().upper() for b in raw if str(b).strip()}
             elif isinstance(raw, dict):
-                data["brands"] = [str(b).strip().upper() for b in raw.get("brands", []) if str(b).strip()]
-                data["skus"] = raw.get("skus", [])
+                brands_set |= {str(b).strip().upper() for b in raw.get("brands", []) if str(b).strip()}
         except Exception:
             pass
 
-    existing = set(b.upper() for b in data["brands"])
     brand_upper = brand_raw.upper()
-    if brand_upper not in existing:
-        data["brands"].append(brand_upper)
-        data["brands"] = sorted(list(set(data["brands"])))
-        target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    if brand_upper not in brands_set:
+        brands_set.add(brand_upper)
+        target.write_text(json.dumps(sorted(list(brands_set)), indent=2), encoding="utf-8")
         logger.info(f"Appended brand '{brand_upper}' to IP blocklist at {target}")
 
         global _IP_CACHE_DATA
@@ -645,6 +663,63 @@ def sync_distributor_database():
                 logger.warning(f"Distributor sync notice ({name}): {exc}")
 
 
+def run_startup_backlog_backfill():
+    """
+    Permanently ensures the live Google Sheet stays populated with the full 50+ u/mo SQLite backlog.
+    Checks the live webhook row count on boot; if < MIN_SHEET_ACTIVE_ROWS (default 250), runs
+    tools/push_full_backlog_to_sheet.py in the background (or inline fallback if script is absent).
+    """
+    webhook_url = get_verified_webhook_url()
+    if not webhook_url:
+        return
+
+    try:
+        resp = requests.get(webhook_url, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            return
+        info = resp.json()
+        last_row = int(info.get("last_row") or 0)
+        active_rows = max(0, last_row - 5)
+
+        if active_rows >= MIN_SHEET_ACTIVE_ROWS:
+            logger.info(f"Live sheet healthy ({active_rows:,} active rows >= {MIN_SHEET_ACTIVE_ROWS}). Skipping startup backfill.")
+            return
+
+        logger.info(f"Live sheet has {active_rows} active rows (< {MIN_SHEET_ACTIVE_ROWS}). Launching BSR-aware backlog backfill...")
+        backlog_script = ROOT_DIR / "tools" / "push_full_backlog_to_sheet.py"
+        if backlog_script.exists():
+            subprocess.Popen([
+                sys.executable, "-u", str(backlog_script),
+                "--batch-size", "100",
+                "--min-velocity", "50"
+            ])
+        else:
+            logger.warning("tools/push_full_backlog_to_sheet.py not found in repo; running inline BSR-aware SQLite backfill...")
+            inline_cmd = (
+                "import sys, time, json, sqlite3, requests; "
+                "sys.path.insert(0, '.'); "
+                "from config import get_verified_webhook_url; "
+                "wh = get_verified_webhook_url(); "
+                "conn = sqlite3.connect('data/hunter_engine.db', timeout=60.0); "
+                "conn.row_factory = sqlite3.Row; cur = conn.cursor(); "
+                "def est_v(ms, d90, bsr): "
+                "  ms, d90, bsr = int(ms or 0), int(d90 or 0), int(bsr or 0); "
+                "  return ms if (ms > 0 and ms not in (20, 25)) else (max(1, round((d90/3.0)*1.15)) if d90 > 0 else (450 if 0 < bsr <= 500 else (220 if bsr <= 1500 else (110 if bsr <= 5000 else (55 if bsr <= 15000 else 0))))); "
+                "rows = cur.execute(\"SELECT * FROM candidate_cache WHERE status IS NULL OR UPPER(status) NOT IN ('BLOCKED_IP_BRAND','REJECTED','DELETED') ORDER BY monthly_sold DESC, drops_90 DESC, sales_rank ASC LIMIT 2500\").fetchall(); "
+                "payloads = []; "
+                "for r in rows: "
+                "  d = dict(r); bb = float(d.get('avg90_bb') or d.get('current_bb') or 0); vel = est_v(d.get('monthly_sold'), d.get('drops_90'), d.get('sales_rank')); fba = int(d.get('fba_sellers') or 0); "
+                "  if bb >= 13.50 and vel >= 50 and fba <= 6 and d.get('brand'): "
+                "    payloads.append({'asin': d['asin'], 'title': d.get('title') or '', 'brand': d['brand'], 'vendor': 'Unmapped (Needs Catalog Match)', 'sales_rank': int(d.get('sales_rank') or 0), 'monthly_velocity': vel, 'drops_90': int(d.get('drops_90') or 0), 'competitive_fba': fba, 'total_sellers': max(2, int(d.get('num_sellers') or (fba + 1))), 'buy_box_price': bb, 'avg90_bb': bb, 'wholesale_cost': round(bb*0.36, 2), 'landed_bundle_cogs': round(bb*0.36, 2)}); "
+                "for i in range(0, len(payloads), 100): "
+                "  chunk = payloads[i:i+100]; is_last = (i + 100 >= len(payloads)); "
+                "  requests.post(wh, json={'action': 'APPEND_LEADS', 'leads': chunk, 'skip_sync': (not is_last)}, timeout=60, allow_redirects=True); time.sleep(1.0)"
+            )
+            subprocess.Popen([sys.executable, "-c", inline_cmd])
+    except Exception as exc:
+        logger.warning(f"Startup backlog backfill notice: {exc}")
+
+
 def trigger_candidate_rescore():
     logger.info("Triggering cross-catalog matcher and candidate re-score against updated catalog index...")
     matcher_script = ROOT_DIR / "tools" / "auto_cross_catalog_matcher_daemon.py"
@@ -975,6 +1050,7 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
     log_fp = open(log_file, "a")
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["DATA_DIR"] = str(DATA_DIR)
     env["BUY_LIST_WEBHOOK_URL"] = get_verified_webhook_url()
     env["GOOGLE_SHEET_WEBHOOK_URL"] = get_verified_webhook_url()
     return subprocess.Popen(
@@ -986,7 +1062,7 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
 
 
 def main():
-    logger.info(f"Initializing Master Pipeline Orchestrator v7.9.2 (Target Webhook: {get_verified_webhook_url()})...")
+    logger.info(f"Initializing Master Pipeline Orchestrator v7.9.3 (DATA_DIR={DATA_DIR} | Webhook={get_verified_webhook_url()})...")
 
     load_ip_blocklist_cached()
 
@@ -997,6 +1073,7 @@ def main():
     telegram_thread.start()
 
     sync_distributor_database()
+    run_startup_backlog_backfill()
 
     watcher_thread = threading.Thread(target=run_catalog_watcher, daemon=True)
     watcher_thread.start()
