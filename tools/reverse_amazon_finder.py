@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """
-tools/reverse_amazon_finder.py (v20.12)
+tools/reverse_amazon_finder.py (v20.13)
 ---------------------------------------
 Reverse Amazon Hunter & Autonomous Sourcing Daemon:
-  1. 13 Low-Return Commercial & Consumable Root Categories (< 4.5% FBA Return Rate):
-       - Beauty & Personal Care (3760911 — Marlo Beauty / Salon Multipacks)
-       - Grocery & Gourmet Food (16310101 — Frontier Co-op / Atlantic Spice Multipacks)
-       - Toys & Games (165793011 — EE Distribution / Collectibles)
-       - Health & Household (3760901 — Frontier Co-op / Personal Care)
-       - Office Products (1064954 — B2B Consumables & Multipacks)
-       - Pet Supplies (2619533011 — Grooming, Filters, Treats & Multipacks)
-       - Arts, Crafts & Sewing (2617941011 — Adhesives, Blades, Thread & Craft Packs)
-       - Patio, Lawn & Garden (2972638011 — Irrigation, Pool & Lawn Consumables)
-       - Musical Instruments (11091801 — Strings, Reeds, Drumsticks & Cables Multipacks)
-       - Sports & Outdoors (3375251 — Fishing, Golf, Grip Tape & Outdoor Consumables)
-       - Industrial & Scientific (16310091 — Zoro / Motion / BCI / Contour)
-       - Tools & Home Improvement (228013 — JB Tools / Zoro / BCI)
-       - Automotive & Commercial Fleet (15684181 — Motion / Zoro)
-  2. Multipack Loophole + Two-Tier Profit Gates:
-       - Verified Multipack Loophole (Pack >= 2): >= $2.25/unit net profit, >= $180/mo pool, 0 (>=2 FBM) or 2-4 FBA
-       - Verified Single-Unit Catalog Match (Pack == 1): >= $3.00/unit net profit, >= $250/mo pool, 0 (>=3 FBM) or 2-4 FBA
-       - Caches qualifying unmapped Keepa discoveries into candidate_cache so push_full_backlog_to_sheet.py
+1. 22 Low-Return Commercial & Consumable Root Categories (< 5.0% FBA Return Rate):
+  - Beauty & Personal Care (3760911 — Marlo Beauty / Salon Multipacks)
+  - Grocery & Gourmet Food (16310101 — Frontier Co-op / Atlantic Spice Multipacks)
+  - Toys & Games (165793011 — EE Distribution / Collectibles)
+  - Health & Household (3760901 — Frontier Co-op / Personal Care)
+  - Office Products (1064954 — B2B Consumables & Multipacks)
+  - Pet Supplies (2619533011 — Grooming, Filters, Treats & Multipacks)
+  - Arts, Crafts & Sewing (2617941011 — Adhesives, Blades, Thread & Craft Packs)
+  - Patio, Lawn & Garden (2972638011 — Irrigation, Pool & Lawn Consumables)
+  - Musical Instruments (11091801 — Strings, Reeds, Drumsticks & Cables Multipacks)
+  - Sports & Outdoors (3375251 — Fishing, Golf, Grip Tape & Outdoor Consumables)
+  - Industrial & Scientific (16310091 — Zoro / Motion / BCI / Contour)
+  - Tools & Home Improvement (228013 — JB Tools / Zoro / BCI)
+  - Automotive & Commercial Fleet (15684181 — Motion / Zoro)
+  - Baby Products (165796011 — Wipes, Feeding & Safety Consumables)
+  - Home & Kitchen (1055398 — Water Filters, Vacuum Bags & Storage)
+  - Books (283155 — Technical Manuals, Workbooks & Activity Books)
+  - Video Games (468642 — Card Sleeves, Cases & Accessories)
+  - CDs & Vinyl (5174 — Sealed Physical Media & Box Sets)
+  - Movies & TV (2625373011 — Sealed Collector Editions & Box Sets)
+  - Software (229534 — Sealed Business & Utility Suites)
+  - Appliances (2619525011 — OEM Water Filters, Belts & Repair Parts)
+  - Gift Cards & Party Supplies (2238192011 — Tableware & Event Packs)
+2. Multipack Loophole + Two-Tier Profit Gates:
+  - Verified Multipack Loophole (Pack >= 2): >= $2.25/unit net profit, >= $180/mo pool, 0 (>=2 FBM) or 2-4 FBA
+  - Verified Single-Unit Catalog Match (Pack == 1): >= $3.00/unit net profit, >= $250/mo pool, 0 (>=3 FBM) or 2-4 FBA
+  - Caches qualifying unmapped Keepa discoveries into candidate_cache so push_full_backlog_to_sheet.py
          can evaluate them against >= $5.00/unit & >= $500/mo pool gates.
-  3. Recursive Catalog Indexer across all subfolders + 784-brand Unicode-normalized IP shield.
+3. Recursive Catalog Indexer across all subfolders + 784-brand Unicode-normalized IP shield.
 """
 
 import os
@@ -34,6 +43,7 @@ import re
 import fcntl
 import sqlite3
 import html
+import subprocess
 import unicodedata
 from contextlib import closing
 from pathlib import Path
@@ -114,11 +124,11 @@ DATED_RE = re.compile(
     re.IGNORECASE
 )
 
-# 13 Low-Return Amazon Root Categories (< 4.5% Return Rate)
+# 22 Low-Return Amazon US Root Categories (< 5.0% Baseline Return Rate)
 SECTOR_DEFINITIONS: Dict[int, Dict[str, Any]] = {
     3760911: {"name": "Beauty & Personal Care (Marlo Beauty)", "is_root": True, "ref_fee": 0.15},
     16310101: {"name": "Grocery & Gourmet Food (Frontier / Atlantic Spice)", "is_root": True, "ref_fee": 0.15},
-    165793011: {"name": "Toys & Games (EE Distribution)", "is_root": True, "ref_fee": 0.15},
+    165793011: {"name": "Toys & Games (EE Distribution — All Sellable Brands)", "is_root": True, "ref_fee": 0.15},
     3760901: {"name": "Health & Household (Frontier / Personal Care)", "is_root": True, "ref_fee": 0.15},
     1064954: {"name": "Office Products (Low-Return B2B Consumables)", "is_root": True, "ref_fee": 0.15},
     2619533011: {"name": "Pet Supplies (Consumables, Filters & Grooming)", "is_root": True, "ref_fee": 0.15},
@@ -129,6 +139,15 @@ SECTOR_DEFINITIONS: Dict[int, Dict[str, Any]] = {
     16310091: {"name": "Industrial & Scientific (Zoro / Motion / BCI)", "is_root": True, "ref_fee": 0.12},
     228013: {"name": "Tools & Home Improvement (JB Tools / Zoro / BCI)", "is_root": True, "ref_fee": 0.15},
     15684181: {"name": "Automotive & Commercial Fleet (Motion / Zoro)", "is_root": True, "ref_fee": 0.12},
+    165796011: {"name": "Baby Products (Wipes, Feeding & Safety Consumables)", "is_root": True, "ref_fee": 0.15},
+    1055398: {"name": "Home & Kitchen (Water Filters, Vacuum Bags & Storage)", "is_root": True, "ref_fee": 0.15},
+    283155: {"name": "Books (Technical Manuals, Workbooks & Activity Books)", "is_root": True, "ref_fee": 0.15},
+    468642: {"name": "Video Games (Card Sleeves, Cases & Accessories)", "is_root": True, "ref_fee": 0.15},
+    5174: {"name": "CDs & Vinyl (Sealed Physical Media & Box Sets)", "is_root": True, "ref_fee": 0.15},
+    2625373011: {"name": "Movies & TV (Sealed Collector Editions & Box Sets)", "is_root": True, "ref_fee": 0.15},
+    229534: {"name": "Software (Sealed Business & Utility Suites)", "is_root": True, "ref_fee": 0.15},
+    2619525011: {"name": "Appliances (OEM Water Filters, Belts & Repair Parts)", "is_root": True, "ref_fee": 0.15},
+    2238192011: {"name": "Gift Cards & Party Supplies (Tableware & Event Packs)", "is_root": True, "ref_fee": 0.15},
 }
 
 # Dedicated Multipack Loophole slices (title="pack", $13.50-$48) + Core Wholesale slices
@@ -279,7 +298,6 @@ def validate_real_buybox_and_brand_safety(
     if not brand or str(brand).strip().upper() in ("", "UNKNOWN", "GENERIC", "N/A"):
         return False, 0.0, "MISSING_OR_GENERIC_BRAND"
 
-    # Enforce 0 FBA (>= 2 FBM on Multipack Loophole, >= 3 FBM otherwise) OR 2 to 4 FBA sellers
     if fba_sellers == 1 or fba_sellers > 4:
         return False, 0.0, f"FBA_WINDOW_REJECTED (fba={fba_sellers}, must be 0 or 2-4)"
 
@@ -734,7 +752,6 @@ class ReverseAmazonHunter:
         landed_cost = wholesale_cost + total_prep
         roi_percent = round((net_profit / landed_cost) * 100.0, 1) if landed_cost > 0 else 0.0
 
-        # Two-Tier Profit Gate: Multipack Loophole (>= $2.25/unit, >= $180/mo) vs Single-Unit (>= $3.00/unit, >= $250/mo)
         profit_floor = 2.25 if is_multipack_loophole else 3.00
         min_pool_required = 180.0 if is_multipack_loophole else 250.0
         if net_profit < profit_floor or roi_percent < 18.0:
@@ -865,7 +882,7 @@ class ReverseAmazonHunter:
         return []
 
     def run_sweep(self):
-        logger.info("Executing balanced sweep across 13 low-return categories (Beauty, Grocery/Spices, Office, Pet, Crafts, Garden, Music, Sports, Toys & MRO)...")
+        logger.info("Executing balanced sweep across 22 low-return categories (Beauty, Grocery/Spices, Office, Pet, Crafts, Garden, Music, Sports, Toys, Baby, Home, Books, Media, Appliances & MRO)...")
         if not KEEPA_API_KEY:
             logger.warning("No KEEPA_API_KEY configured.")
             return
@@ -926,8 +943,16 @@ class ReverseAmazonHunter:
                     except Exception as e:
                         logger.debug(f"Slice query error: {e}")
 
+        # Stream newly discovered Tier-1 & Tier-2 leads to Google Sheets after each 22-category sweep
+        backlog_script = ROOT_DIR / "tools" / "push_full_backlog_to_sheet.py"
+        if backlog_script.exists():
+            try:
+                subprocess.Popen([sys.executable, "-u", str(backlog_script), "--batch-size", "100", "--max-leads", "2000"])
+            except Exception as exc:
+                logger.debug(f"Post-sweep backlog sync notice: {exc}")
+
     def start(self):
-        logger.info("Hunter Engine v20.12 Active — 13 Low-Return Root Categories + Multipack Loophole + 784-Brand Shield.")
+        logger.info("Hunter Engine v20.13 Active — 22 Low-Return Root Categories + Multipack Loophole + 784-Brand Shield.")
         while True:
             try:
                 self.run_sweep()
