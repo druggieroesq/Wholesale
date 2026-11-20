@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-tools/scrape_marlo_beauty.py (v2.0)
+tools/scrape_marlo_beauty.py (v2.2)
 -----------------------------------
-Live Product-Page Catalog Scraper for Marlo Beauty Supply (marlobeauty.com)
-- Authenticates using MARLO_USER & MARLO_PASS from Railway environment variables (with login check)
-- Harvests all product URLs across Shopify product sitemaps (supports --max-items 0 for full catalog)
+Authenticated Product-Page Catalog Scraper for Marlo Beauty Supply (marlobeauty.com)
+- Authenticates via POST https://www.marlobeauty.com/login.php?action=process
+  using MARLO_USER (email_address) & MARLO_PASS (password) from Railway environment variables
+- Fail-closed authentication guard (aborts immediately if login is missing/invalid so
+  unauthenticated '$0.00 / Log In for Pro Prices' pages are never ingested)
+- Crawls manufacturers.php (/b\d+/ brand pages) and category trees (/c\d+/) to discover
+  all live /p\d+/ product URLs (supports --max-items 0 for full catalog)
 - Normalizes multi-pack/box pricing to true per-unit COGS (+ inbound freight)
 - Enforces 5-Layer 3rd-Party / Amazon / eBay / Salon-Only Restriction Shield + Unicode IP blocklist
-- Filters aerosol/flammable/oxidizer beauty hazmat items before indexing
+- Tags aerosol/flammable/oxidizer beauty hazmat items (hazmat_flag="HAZMAT_APPROVAL_REQ")
+  instead of dropping them so SP-API restrictions daemon can verify FBA DG approval per ASIN
 - Incremental crash-safe CSV saves every 25 verified SKUs + finally-block flush (Ctrl+C safe)
 - Writes clean CSV to both incoming/ and indexed/ so all daemons index it immediately
 - Optional --run-pipeline flag chains multipack_reverse_upc_hunter.py -> push_full_backlog_to_sheet.py
@@ -23,9 +28,9 @@ import logging
 import argparse
 import subprocess
 import unicodedata
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin
 
 import requests
 import pandas as pd
@@ -59,8 +64,10 @@ REJECT_LOG_CSV = DATA_DIR / "reports" / "marlo_beauty_restricted_skipped.csv"
 REJECT_LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
 BLOCKLIST_PATH = DATA_DIR / "ip_blocklist.json"
 
-SITEMAP_URL = "https://www.marlobeauty.com/sitemap.xml"
-XML_NS = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+BASE_URL = "https://www.marlobeauty.com"
+LOGIN_PAGE_URL = f"{BASE_URL}/login.php"
+LOGIN_POST_URL = f"{BASE_URL}/login.php?action=process"
+MANUFACTURERS_URL = f"{BASE_URL}/manufacturers.php"
 
 HAZMAT_KEYWORDS = (
     "aerosol", "flammable", "acetone", "peroxide", "developer 20", "developer 30",
@@ -125,7 +132,7 @@ def get_with_backoff(session: requests.Session, url: str, timeout: int = 20) -> 
         try:
             resp = session.get(url, timeout=timeout, allow_redirects=True)
             if resp.status_code == 429:
-                wait_s = 8 * attempt
+                wait_s = 10 * attempt
                 logger.warning(f"Rate limited (HTTP 429) on {url} — sleeping {wait_s}s before retry {attempt}/3...")
                 time.sleep(wait_s)
                 continue
@@ -136,28 +143,55 @@ def get_with_backoff(session: requests.Session, url: str, timeout: int = 20) -> 
     return None
 
 
-def init_marlo_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update(HEADERS)
+def create_authenticated_marlo_session() -> requests.Session:
     user = os.getenv("MARLO_USER", "").strip()
     pwd = os.getenv("MARLO_PASS", "").strip()
-    if user and pwd:
-        try:
-            login_url = "https://www.marlobeauty.com/account/login"
-            session.get(login_url, timeout=15)
-            post_resp = session.post(
-                login_url,
-                data={"form_type": "customer_login", "utf8": "✓", "customer[email]": user, "customer[password]": pwd},
-                headers={"Referer": login_url},
-                timeout=20,
-                allow_redirects=True,
-            )
-            if "/account" in post_resp.url and "/login" not in post_resp.url:
-                logger.info("Authenticated Marlo Beauty pro session verified.")
-            else:
-                logger.info("Marlo Beauty session initialized (continuing with public/pro catalog access).")
-        except Exception as exc:
-            logger.warning(f"Marlo Beauty login notice: {exc}")
+    if not user or not pwd:
+        raise RuntimeError(
+            "FAIL-CLOSED: Missing MARLO_USER or MARLO_PASS in Railway environment variables. "
+            "Marlo Beauty hides wholesale pro prices ('$0.00 / Log In for Pro Prices') until authenticated."
+        )
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    r0 = session.get(LOGIN_PAGE_URL, timeout=20)
+    r0.raise_for_status()
+    soup = BeautifulSoup(r0.text, "html.parser")
+
+    payload: Dict[str, str] = {}
+    for inp in soup.find_all("input"):
+        name = inp.get("name")
+        if name:
+            payload[name] = inp.get("value", "")
+
+    payload["email_address"] = user
+    payload["password"] = pwd
+    payload["remember"] = "1"
+
+    post_resp = session.post(
+        LOGIN_POST_URL,
+        data=payload,
+        headers={"Referer": LOGIN_PAGE_URL, "Origin": BASE_URL},
+        timeout=20,
+        allow_redirects=True,
+    )
+    body_lower = post_resp.text.lower()
+    is_logged_in = (
+        any(tok in body_lower for tok in ("logoff.php", "log off", "sign out", "my account", "account.php"))
+        and "log in / register for pro prices" not in body_lower
+    )
+    if not is_logged_in:
+        check = session.get(BASE_URL, timeout=15).text.lower()
+        is_logged_in = "logoff.php" in check or "log off" in check
+
+    if not is_logged_in:
+        raise RuntimeError(
+            "FAIL-CLOSED: Marlo Beauty /login.php?action=process authentication failed. "
+            "Verify MARLO_USER and MARLO_PASS in Railway Variables."
+        )
+
+    logger.info("Authenticated Marlo Beauty pro wholesale session verified via /login.php (FAIL-CLOSED guard passed).")
     return session
 
 
@@ -174,34 +208,52 @@ def check_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tuple[b
     return True, "ALLOWED_3RD_PARTY"
 
 
-def discover_product_urls(session: requests.Session, max_urls: int = 0) -> List[str]:
-    urls: List[str] = []
-    try:
-        r = get_with_backoff(session, SITEMAP_URL, timeout=25)
-        if r is None or r.status_code != 200:
-            return []
-        root = ET.fromstring(r.content)
-        sub_maps = [
-            loc.text.strip()
-            for loc in root.findall(".//ns:sitemap/ns:loc", XML_NS)
-            if loc.text and "product" in loc.text.lower()
-        ]
-        target_maps = sub_maps if sub_maps else [SITEMAP_URL]
-        for sm in target_maps:
-            sr = get_with_backoff(session, sm, timeout=25)
-            if sr is None or sr.status_code != 200:
-                continue
-            sroot = ET.fromstring(sr.content)
-            for loc in sroot.findall(".//ns:url/ns:loc", XML_NS):
-                if loc.text:
-                    u = loc.text.strip()
-                    if "/products/" in u or "/p/" in u:
-                        urls.append(u)
-                        if max_urls > 0 and len(urls) >= max_urls:
-                            return list(dict.fromkeys(urls))
-    except Exception as exc:
-        logger.warning(f"Marlo Beauty sitemap notice: {exc}")
-    return list(dict.fromkeys(urls))
+def discover_product_urls(
+    session: requests.Session,
+    blocked: Set[str],
+    blocked_multi: List[str],
+    max_urls: int = 0,
+) -> List[str]:
+    product_urls: List[str] = []
+    listing_pages: List[str] = []
+
+    rm = get_with_backoff(session, MANUFACTURERS_URL, timeout=20)
+    if rm and rm.status_code == 200:
+        sm = BeautifulSoup(rm.text, "html.parser")
+        for a in sm.select("a[href]"):
+            href = a.get("href", "").strip()
+            full = urljoin(BASE_URL, href.split("?")[0])
+            if re.search(r"/b\d+/", full):
+                brand_label = a.get_text(strip=True)
+                if brand_label and is_brand_blocked(brand_label, blocked, blocked_multi):
+                    continue
+                if full not in listing_pages:
+                    listing_pages.append(full)
+
+    r0 = get_with_backoff(session, BASE_URL, timeout=20)
+    if r0 and r0.status_code == 200:
+        s0 = BeautifulSoup(r0.text, "html.parser")
+        for a in s0.select("a[href]"):
+            full = urljoin(BASE_URL, a.get("href", "").split("?")[0])
+            if re.search(r"/c\d+(?:_\d+)?/", full) and full not in listing_pages:
+                listing_pages.append(full)
+
+    logger.info(f"Scanning {len(listing_pages)} Marlo Beauty brand/category pages for /p\\d+/ product links...")
+
+    for lp in listing_pages:
+        rl = get_with_backoff(session, lp, timeout=20)
+        if rl is None or rl.status_code != 200:
+            continue
+        sl = BeautifulSoup(rl.text, "html.parser")
+        for a in sl.select("a[href]"):
+            u = urljoin(BASE_URL, a.get("href", "").split("?")[0])
+            if re.search(r"/p\d+/?$", u) and u not in product_urls:
+                product_urls.append(u)
+                if max_urls > 0 and len(product_urls) >= max_urls:
+                    return product_urls
+        time.sleep(0.35)
+
+    return product_urls
 
 
 def parse_product_page(
@@ -220,10 +272,16 @@ def parse_product_page(
     page_text = soup.get_text("\n", strip=True)
     lower_text = page_text.lower()
 
+    if "log in / register for pro prices" in lower_text:
+        logger.warning(f"Session logged out on {url} — skipping.")
+        return None, None
+
     if "out of stock" in lower_text and "add to cart" not in lower_text:
         return None, None
 
-    slug_mpn = url.strip("/").split("/")[-1][:32].upper()
+    m_pid = re.search(r"/p(\d+)/?$", url)
+    slug_mpn = f"MBS-{m_pid.group(1)}" if m_pid else url.strip("/").split("/")[-1][:32].upper()
+
     allowed, reason = check_marketplace_eligibility(soup, html)
     if not allowed:
         return None, {"sku": slug_mpn, "url": url, "reason": reason}
@@ -260,27 +318,29 @@ def parse_product_page(
         title = h1.get_text(strip=True) if h1 else ""
 
     if not brand:
-        b_el = soup.select_one(".product__vendor, .vendor, [itemprop='brand']")
-        brand = b_el.get_text(strip=True) if b_el else ""
+        m_br = re.search(r"Brand Name\s*:?\s*\n?\s*([A-Za-z0-9 &'.-]+)", page_text)
+        if m_br:
+            brand = m_br.group(1).strip()
 
     if not brand or is_brand_blocked(brand, blocked, blocked_multi):
         return None, None
 
-    if any(k in title.lower() for k in HAZMAT_KEYWORDS):
-        return None, None
+    is_hazmat = any(k in title.lower() for k in HAZMAT_KEYWORDS)
+    hazmat_flag = "HAZMAT_APPROVAL_REQ" if is_hazmat else "STANDARD_NON_HAZMAT"
 
     if price <= 0:
-        for sel in (".price__regular .price-item", ".price", ".product__price", "[data-product-price]"):
-            p_el = soup.select_one(sel)
-            if p_el:
-                m = re.search(r"\$([0-9,]+\.[0-9]{2})", p_el.get_text())
-                if m:
-                    price = float(m.group(1).replace(",", ""))
-                    if price > 0:
-                        break
+        for m_p in re.finditer(r"\$([0-9,]+\.[0-9]{2})", page_text):
+            val = float(m_p.group(1).replace(",", ""))
+            if val > 0:
+                price = val
+                break
+
+    if not mpn:
+        m_item = re.search(r"Item\s*#\s*:?\s*\n?\s*([A-Za-z0-9_-]{3,24})", page_text, re.IGNORECASE)
+        mpn = m_item.group(1).strip() if m_item else slug_mpn
 
     if not upc:
-        m_upc = re.search(r"\b(?:UPC|GTIN|Barcode)\s*:?\s*([0-9]{12,13})\b", page_text, re.IGNORECASE | re.MULTILINE)
+        m_upc = re.search(r"\b(?:UPC|GTIN|Barcode)\s*:?\s*\n?\s*([0-9]{12,13})\b", page_text, re.IGNORECASE)
         if not m_upc:
             m_upc = re.search(r"\b(?:UPC|GTIN|barcode)[^0-9]{0,25}([0-9]{12,13})\b", html, re.IGNORECASE | re.DOTALL)
         if m_upc:
@@ -314,6 +374,7 @@ def parse_product_page(
         "case_cost": round(price, 2),
         "uom": "EA",
         "pack_qty": pack_qty,
+        "hazmat_flag": hazmat_flag,
         "marketplace_status": "ALLOWED_3RD_PARTY",
         "direct_url": url,
     }, None
@@ -334,15 +395,17 @@ def flush_outputs(approved_records: List[Dict[str, Any]], rejected_records: List
 def run_marlo_beauty_ingestion(
     max_items: int = 0,
     freight_per_unit: float = 0.65,
-    delay_sec: float = 0.4,
+    delay_sec: float = 0.45,
 ) -> int:
-    logger.info("Starting live Marlo Beauty Supply catalog scrape...")
-    session = init_marlo_session()
+    logger.info("Starting authenticated Marlo Beauty Supply catalog scrape...")
+    session = create_authenticated_marlo_session()
     blocked, blocked_multi = load_blocked_brands()
 
-    urls = discover_product_urls(session, max_urls=(max_items * 2 if max_items > 0 else 0))
+    urls = discover_product_urls(
+        session, blocked, blocked_multi, max_urls=(max_items * 2 if max_items > 0 else 0)
+    )
     target_urls = urls[:max_items] if max_items > 0 else urls
-    logger.info(f"Discovered {len(urls)} Marlo Beauty product URLs. Harvesting {len(target_urls)}...")
+    logger.info(f"Discovered {len(urls)} Marlo Beauty /p\\d+/ product URLs. Harvesting {len(target_urls)}...")
 
     approved_records: List[Dict[str, Any]] = []
     rejected_records: List[Dict[str, str]] = []
@@ -384,10 +447,10 @@ def trigger_downstream_match_and_sync():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Marlo Beauty Live Product Scraper v2.0")
+    parser = argparse.ArgumentParser(description="Authenticated Marlo Beauty Live Product Scraper v2.2")
     parser.add_argument("--max-items", type=int, default=0, help="Max product pages to crawl (0 = all)")
     parser.add_argument("--freight-per-unit", type=float, default=0.65, help="Estimated inbound freight per unit")
-    parser.add_argument("--delay", type=float, default=0.4, help="Delay in seconds between requests")
+    parser.add_argument("--delay", type=float, default=0.45, help="Delay in seconds between requests")
     parser.add_argument("--run-pipeline", action="store_true", help="Run Keepa UPC matcher and Google Sheets sync after scraping")
     args = parser.parse_args()
 
