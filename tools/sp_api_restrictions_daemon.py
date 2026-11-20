@@ -317,7 +317,7 @@ def run_restrictions_audit(max_brands: int = 100) -> int:
                 "is_ungated": is_ungated_flag,
             })
 
-            unlocked_at = now if (status == "UNRESTRICTED" and prev_status != "UNRESTRICTED") else (prev["unlocked_at"] if prev else 0)
+            unlocked_at = now if (status == "UNRESTRICTED" and prev_status != "UNRESTRICTED") else (prev["unlocked_at"] if (prev and "unlocked_at" in prev.keys() and prev["unlocked_at"]) else 0)
             cur.execute("""
                 INSERT INTO brand_gating_state (brand, status, sample_asin, reason_code, last_checked, unlocked_at)
                 VALUES (?, ?, ?, ?, ?, ?)
