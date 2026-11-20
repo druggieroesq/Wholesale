@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-tools/scrape_marlo_beauty.py (v2.2)
+tools/scrape_marlo_beauty.py (v2.3)
 -----------------------------------
 Authenticated Product-Page Catalog Scraper for Marlo Beauty Supply (marlobeauty.com)
 - Authenticates via POST https://www.marlobeauty.com/login.php?action=process
   using MARLO_USER (email_address) & MARLO_PASS (password) from Railway environment variables
-- Fail-closed authentication guard (aborts immediately if login is missing/invalid so
-  unauthenticated '$0.00 / Log In for Pro Prices' pages are never ingested)
+- Strict fail-closed authentication guard: inspects .messageStackError and requires logoff.php
+  session confirmation so unauthenticated '$0.00' pages are never scraped
 - Crawls manufacturers.php (/b\d+/ brand pages) and category trees (/c\d+/) to discover
   all live /p\d+/ product URLs (supports --max-items 0 for full catalog)
 - Normalizes multi-pack/box pricing to true per-unit COGS (+ inbound freight)
@@ -176,18 +176,21 @@ def create_authenticated_marlo_session() -> requests.Session:
         timeout=20,
         allow_redirects=True,
     )
+    s_post = BeautifulSoup(post_resp.text, "html.parser")
+    err_el = s_post.select_one(".messageStackError, .messageStackWarning")
+    if err_el:
+        err_msg = " ".join(err_el.get_text(" ", strip=True).split())
+        raise RuntimeError(f"FAIL-CLOSED: Marlo Beauty rejected login credentials -> {err_msg}")
+
     body_lower = post_resp.text.lower()
-    is_logged_in = (
-        any(tok in body_lower for tok in ("logoff.php", "log off", "sign out", "my account", "account.php"))
-        and "log in / register for pro prices" not in body_lower
-    )
+    is_logged_in = "logoff.php" in body_lower or "log off" in body_lower
     if not is_logged_in:
         check = session.get(BASE_URL, timeout=15).text.lower()
         is_logged_in = "logoff.php" in check or "log off" in check
 
     if not is_logged_in:
         raise RuntimeError(
-            "FAIL-CLOSED: Marlo Beauty /login.php?action=process authentication failed. "
+            "FAIL-CLOSED: Marlo Beauty /login.php?action=process did not establish an authenticated session (logoff.php absent). "
             "Verify MARLO_USER and MARLO_PASS in Railway Variables."
         )
 
@@ -268,13 +271,13 @@ def parse_product_page(
         return None, None
 
     html = resp.text
+    if "logoff.php" not in html.lower() and "log off" not in html.lower():
+        logger.warning(f"Session logged out on {url} — skipping.")
+        return None, None
+
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text("\n", strip=True)
     lower_text = page_text.lower()
-
-    if "log in / register for pro prices" in lower_text:
-        logger.warning(f"Session logged out on {url} — skipping.")
-        return None, None
 
     if "out of stock" in lower_text and "add to cart" not in lower_text:
         return None, None
@@ -447,7 +450,7 @@ def trigger_downstream_match_and_sync():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Authenticated Marlo Beauty Live Product Scraper v2.2")
+    parser = argparse.ArgumentParser(description="Authenticated Marlo Beauty Live Product Scraper v2.3")
     parser.add_argument("--max-items", type=int, default=0, help="Max product pages to crawl (0 = all)")
     parser.add_argument("--freight-per-unit", type=float, default=0.65, help="Estimated inbound freight per unit")
     parser.add_argument("--delay", type=float, default=0.45, help="Delay in seconds between requests")
