@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
-tools/ingest_eedistribution_catalog.py (v2.6)
+tools/ingest_eedistribution_catalog.py (v2.7)
 ---------------------------------------------
-Authenticated EE Distribution Catalog & Strict Marketplace-Restriction Scraper
+Authenticated EE Distribution All-Brand Catalog & Strict Marketplace-Restriction Scraper
 - Authenticates via POST https://www.eedistribution.com/Account/Login with __RequestVerificationToken
 - Fail-closed authentication guard (aborts immediately if login fails so public pages
   without account-level restriction notices are never scraped)
+- Auto-discovers ALL sellable brand slugs on eedistribution.com when --all-brands is passed
+  (or no --brands restriction is specified), filtered by the 784-brand IP blocklist
 - Polite 2.2s PDP pacing + adaptive 429 backoff (stays under EE's 10 req / 20s sliding window)
 - Incremental crash-safe CSV saves every 10 verified SKUs + finally-block flush (Ctrl+C safe)
 - 5-Layer 3rd-Party / Amazon / eBay Restriction Detector on both listing cards and
-  every Product Detail Page (PDP):
-    1. Listing grid restriction badges/icons
-    2. Alert/warning banners, tooltips (title / aria-label / data-original-title), & restriction divs
-    3. Specification table / attribute rows (e.g., "Amazon: No", "3rd Party Sales: Not Allowed")
-    4. Full visible page text regex sweep (Amazon, eBay, Walmart, 3rd Party, Brick & Mortar Only)
-    5. Embedded JSON / script state flags (amazonRestricted, thirdPartyRestricted, ebayRestricted)
+  every Product Detail Page (PDP)
 - Logs every excluded SKU + exact trigger phrase to data/reports/ee_marketplace_restricted_skipped.csv
-- Extracts exact Piece Price / Case Price (e.g., "6 pieces (1 case): $52.10" -> $8.68/ea) and multiline UPC
 - Writes clean CSV to both incoming/ and indexed/ so all daemons index it immediately
-- Optional --run-pipeline flag chains multipack_reverse_upc_hunter.py -> push_full_backlog_to_sheet.py
 """
 
 import os
@@ -99,8 +94,24 @@ EE_RESTRICTION_PATTERNS = [
 EE_WHITELIST_OVERRIDE = {
     "FUNKO", "HASBRO", "MATTEL", "BANDAI", "MCFARLANE TOYS", "NECA",
     "SPIN MASTER", "JAZWARES", "DIAMOND SELECT", "SUPER7", "LOUNGEFLY",
-    "MEZCO", "KOTOBUKIYA", "GOOD SMILE", "MONOGRAM", "ABYSSE"
+    "MEZCO", "KOTOBUKIYA", "GOOD SMILE", "GOOD SMILE COMPANY", "MONOGRAM",
+    "ABYSSE", "BANPRESTO", "TAMASHII NATIONS", "HOT TOYS", "JAKKS PACIFIC",
+    "PLAYMATES", "TRICK OR TREAT STUDIOS", "WIZKIDS", "RAVENSBURGER",
+    "ULTRA PRO", "KONAMI", "GUND", "BIOWORLD", "PALADONE", "YOUTOOZ",
+    "KIDROBOT", "BEAST KINGDOM", "IRON STUDIOS", "SIDESHOW", "SQUARE ENIX"
 }
+
+DEFAULT_SEED_BRAND_SLUGS = [
+    "funko", "hasbro", "mattel", "bandai", "mcfarlane-toys", "neca",
+    "spin-master", "jazwares", "diamond-select", "super7", "loungefly",
+    "mezco", "kotobukiya", "good-smile-company", "monogram", "abysse",
+    "banpresto", "tamashii-nations", "hot-toys", "jakks-pacific",
+    "playmates", "trick-or-treat-studios", "wizkids", "ravensburger",
+    "ultra-pro", "konami", "gund", "bioworld", "paladone", "youtooz",
+    "kidrobot", "beast-kingdom", "iron-studios", "sideshow", "square-enix",
+    "aquarius", "usaopoly", "the-noble-collection", "factory-entertainment",
+    "enESCO", "department-56", "schleich", "papo", "safari-ltd", "melissa-and-doug"
+]
 
 
 def norm_brand(b: Any) -> str:
@@ -209,12 +220,48 @@ def create_authenticated_session() -> requests.Session:
     return session
 
 
+def discover_all_ee_brand_slugs(
+    session: requests.Session,
+    blocked_brands: Set[str],
+    blocked_multi: List[str],
+) -> List[str]:
+    """Discovers every sellable brand slug from EE Distribution's brand directory and navigation."""
+    discovered: List[str] = []
+    seen: Set[str] = set()
+
+    for directory_url in (f"{BASE_URL}/brands", f"{BASE_URL}/s/brands/c", HOME_URL):
+        resp = get_with_backoff(session, directory_url, timeout=25)
+        if not resp or resp.status_code != 200:
+            continue
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.select("a[href*='/s/'][href$='/c'], a[href*='/s/'][href*='/c?']"):
+            href = a.get("href", "").strip()
+            m = re.search(r"/s/([a-z0-9-]+)/c", href, re.IGNORECASE)
+            if not m:
+                continue
+            slug = m.group(1).lower()
+            if slug in ("brands", "new-releases", "hot-off-the-truck", "sale", "clearance", "in-stock"):
+                continue
+            brand_label = slug.replace("-", " ").upper()
+            if is_brand_blocked(brand_label, blocked_brands, blocked_multi):
+                continue
+            if slug not in seen:
+                seen.add(slug)
+                discovered.append(slug)
+
+    for fallback_slug in DEFAULT_SEED_BRAND_SLUGS:
+        s = fallback_slug.lower()
+        brand_label = s.replace("-", " ").upper()
+        if s not in seen and not is_brand_blocked(brand_label, blocked_brands, blocked_multi):
+            seen.add(s)
+            discovered.append(s)
+
+    logger.info(f"Discovered {len(discovered)} sellable EE Distribution brand slugs (post-IP shield).")
+    return discovered
+
+
 def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tuple[bool, str]:
-    """
-    5-Layer Marketplace Restriction Shield:
-    Inspects the EE Distribution page for ANY Amazon, eBay, Walmart, or 3rd-party
-    marketplace selling prohibition. Returns (is_allowed, reason).
-    """
+    """5-Layer Marketplace Restriction Shield."""
     alert_selectors = [
         ".restriction", ".restrictions", ".marketplace-restriction",
         ".product-restrictions", ".alert-warning", ".alert-danger",
@@ -276,11 +323,12 @@ def check_ee_marketplace_eligibility(soup: BeautifulSoup, raw_html: str) -> Tupl
 def discover_brand_product_urls(
     session: requests.Session,
     brand_slug: str,
-    max_pages: int = 3,
+    max_pages: int = 12,
     rejected_records: Optional[List[Dict[str, str]]] = None,
 ) -> List[str]:
     urls: List[str] = []
-    for page in range(1, max_pages + 1):
+    page_limit = 50 if max_pages <= 0 else max_pages
+    for page in range(1, page_limit + 1):
         list_url = f"{BASE_URL}/s/{brand_slug}/c" if page == 1 else f"{BASE_URL}/s/{brand_slug}/c?page={page}"
         r = get_with_backoff(session, list_url, timeout=25)
         if r is None or r.status_code != 200 or "/Error/NotFound" in r.url:
@@ -472,9 +520,10 @@ def flush_outputs(approved_records: List[Dict[str, Any]], rejected_records: List
 
 
 def run_ee_ingestion(
-    brands: List[str],
-    max_pages: int = 3,
-    max_pdps_per_brand: int = 40,
+    brands: Optional[List[str]] = None,
+    all_brands: bool = True,
+    max_pages: int = 12,
+    max_pdps_per_brand: int = 120,
     freight_per_unit: float = 0.85,
     in_stock_only: bool = True,
     pdp_delay: float = 2.2,
@@ -482,19 +531,25 @@ def run_ee_ingestion(
     session = create_authenticated_session()
     blocked_brands, blocked_multi = load_blocked_brands()
 
+    if all_brands or not brands:
+        target_brands = discover_all_ee_brand_slugs(session, blocked_brands, blocked_multi)
+    else:
+        target_brands = brands
+
     all_urls: List[str] = []
     rejected_records: List[Dict[str, str]] = []
 
-    for b in brands:
+    for b in target_brands:
         logger.info(f"Scanning EE Distribution listings for brand: {b}")
         b_urls = discover_brand_product_urls(session, b, max_pages=max_pages, rejected_records=rejected_records)
         if max_pdps_per_brand > 0:
             b_urls = b_urls[:max_pdps_per_brand]
-        logger.info(f"  -> Queued {len(b_urls)} candidate product URLs for '{b}'")
+        if b_urls:
+            logger.info(f"  -> Queued {len(b_urls)} candidate product URLs for '{b}'")
         all_urls.extend(b_urls)
 
     all_urls = list(dict.fromkeys(all_urls))
-    logger.info(f"Inspecting {len(all_urls)} EE Distribution PDPs with 5-Layer 3rd-Party Shield ({pdp_delay}s pacing)...")
+    logger.info(f"Inspecting {len(all_urls)} EE Distribution PDPs across {len(target_brands)} brands with 5-Layer 3rd-Party Shield ({pdp_delay}s pacing)...")
 
     approved_records: List[Dict[str, Any]] = []
 
@@ -525,6 +580,7 @@ def run_ee_ingestion(
 def trigger_downstream_match_and_sync():
     logger.info("Triggering Keepa UPC/Multipack matching and Google Sheets backlog sync...")
     for cmd in (
+        [sys.executable, str(ROOT_DIR / "tools" / "auto_cross_catalog_matcher_daemon.py"), "--run-once"],
         [sys.executable, str(ROOT_DIR / "tools" / "multipack_reverse_upc_hunter.py")],
         [sys.executable, str(ROOT_DIR / "tools" / "push_full_backlog_to_sheet.py"), "--wipe-first"],
     ):
@@ -535,27 +591,26 @@ def trigger_downstream_match_and_sync():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Authenticated EE Distribution Scraper v2.6 with 5-Layer Marketplace Gate")
+    parser = argparse.ArgumentParser(description="Authenticated EE Distribution All-Brand Scraper v2.7 with 5-Layer Marketplace Gate")
     parser.add_argument(
         "--brands",
         nargs="+",
-        default=[
-            "funko", "hasbro", "mattel", "bandai", "mcfarlane-toys", "neca",
-            "spin-master", "jazwares", "diamond-select", "super7", "loungefly",
-            "mezco", "kotobukiya", "good-smile", "monogram", "abysse"
-        ],
-        help="Brand slugs to crawl on eedistribution.com"
+        default=None,
+        help="Optional explicit brand slugs (defaults to auto-discovering ALL sellable brands on eedistribution.com)"
     )
-    parser.add_argument("--max-pages", type=int, default=3, help="Max pagination pages per brand (60 items/page)")
-    parser.add_argument("--max-pdps-per-brand", type=int, default=40, help="Max PDPs to inspect per brand")
+    parser.add_argument("--all-brands", action="store_true", help="Auto-discover and crawl ALL sellable brands on eedistribution.com")
+    parser.add_argument("--max-pages", type=int, default=12, help="Max pagination pages per brand (0 = unlimited up to 50 pages)")
+    parser.add_argument("--max-pdps-per-brand", type=int, default=120, help="Max PDPs to inspect per brand (0 = unlimited)")
     parser.add_argument("--freight-per-unit", type=float, default=0.85, help="Estimated inbound freight per unit")
     parser.add_argument("--pdp-delay", type=float, default=2.2, help="Delay in seconds between PDP requests (avoids 429)")
     parser.add_argument("--include-preorders", action="store_true", help="Include pre-order items as well as In Stock Now")
-    parser.add_argument("--run-pipeline", action="store_true", help="Run Keepa UPC matcher and Google Sheets sync after scraping")
+    parser.add_argument("--run-pipeline", action="store_true", help="Run Cross-Catalog Matcher, Keepa UPC matcher, and Google Sheets sync after scraping")
     args = parser.parse_args()
 
+    use_all = args.all_brands or (not args.brands)
     count = run_ee_ingestion(
         brands=args.brands,
+        all_brands=use_all,
         max_pages=args.max_pages,
         max_pdps_per_brand=args.max_pdps_per_brand,
         freight_per_unit=args.freight_per_unit,
