@@ -48,8 +48,9 @@ RUN mkdir -p /app/data/catalogs/incoming \
              /app/data/purchase_orders \
              /app/data/logs
 
-# Copy application source code
+# Copy application source code and ensure start.sh is executable
 COPY . .
+RUN chmod +x /app/start.sh
 
-# Run master pipeline supervisor
-CMD ["python", "-u", "master_orchestrator.py"]
+# Run boot sync, background daemons, and master pipeline supervisor
+CMD ["bash", "/app/start.sh"]
