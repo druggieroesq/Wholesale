@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-tools/scrape_marlo_beauty.py (v2.3)
+tools/scrape_marlo_beauty.py (v2.4)
 -----------------------------------
 Authenticated Product-Page Catalog Scraper for Marlo Beauty Supply (marlobeauty.com)
-- Authenticates via POST https://www.marlobeauty.com/login.php?action=process
-  using MARLO_USER (email_address) & MARLO_PASS (password) from Railway environment variables
-- Strict fail-closed authentication guard: inspects .messageStackError and requires logoff.php
-  session confirmation so unauthenticated '$0.00' pages are never scraped
+- Supports direct browser session injection via MARLO_COOKIE (e.g. "ecosid=...") OR
+  form login via POST https://www.marlobeauty.com/login.php?action=process (MARLO_USER / MARLO_PASS)
+- Strict fail-closed authentication guard: verifies logoff.php session presence so
+  unauthenticated '$0.00' pages are never scraped
 - Crawls manufacturers.php (/b\d+/ brand pages) and category trees (/c\d+/) to discover
   all live /p\d+/ product URLs (supports --max-items 0 for full catalog)
 - Normalizes multi-pack/box pricing to true per-unit COGS (+ inbound freight)
@@ -144,26 +144,39 @@ def get_with_backoff(session: requests.Session, url: str, timeout: int = 20) -> 
 
 
 def create_authenticated_marlo_session() -> requests.Session:
-    user = os.getenv("MARLO_USER", "").strip()
-    pwd = os.getenv("MARLO_PASS", "").strip()
-    if not user or not pwd:
-        raise RuntimeError(
-            "FAIL-CLOSED: Missing MARLO_USER or MARLO_PASS in Railway environment variables. "
-            "Marlo Beauty hides wholesale pro prices ('$0.00 / Log In for Pro Prices') until authenticated."
-        )
-
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    raw_cookie = os.getenv("MARLO_COOKIE", "").strip().strip('"').strip("'")
+    if raw_cookie:
+        for part in raw_cookie.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                session.cookies.set(k.strip(), v.strip(), domain="www.marlobeauty.com")
+        check = session.get(BASE_URL, timeout=15).text.lower()
+        if "logoff.php" in check or "log off" in check:
+            logger.info("Authenticated Marlo Beauty pro session verified via MARLO_COOKIE (FAIL-CLOSED guard passed).")
+            return session
+        logger.warning("MARLO_COOKIE expired or invalid — falling back to MARLO_USER / MARLO_PASS login...")
+
+    user = os.getenv("MARLO_USER", "").strip().strip('"').strip("'")
+    pwd = os.getenv("MARLO_PASS", "").strip().strip('"').strip("'")
+    if not user or not pwd:
+        raise RuntimeError(
+            "FAIL-CLOSED: Missing valid MARLO_COOKIE or MARLO_USER/MARLO_PASS in Railway environment variables."
+        )
+
+    session.get(BASE_URL, timeout=15)
     r0 = session.get(LOGIN_PAGE_URL, timeout=20)
     r0.raise_for_status()
     soup = BeautifulSoup(r0.text, "html.parser")
 
+    login_form = soup.find("form", {"name": "login"}) or soup.find("form", action=re.compile(r"login\.php", re.I))
     payload: Dict[str, str] = {}
-    for inp in soup.find_all("input"):
-        name = inp.get("name")
-        if name:
-            payload[name] = inp.get("value", "")
+    if login_form:
+        for inp in login_form.find_all("input"):
+            if inp.get("name"):
+                payload[inp["name"]] = inp.get("value", "")
 
     payload["email_address"] = user
     payload["password"] = pwd
@@ -190,8 +203,8 @@ def create_authenticated_marlo_session() -> requests.Session:
 
     if not is_logged_in:
         raise RuntimeError(
-            "FAIL-CLOSED: Marlo Beauty /login.php?action=process did not establish an authenticated session (logoff.php absent). "
-            "Verify MARLO_USER and MARLO_PASS in Railway Variables."
+            "FAIL-CLOSED: Marlo Beauty /login.php?action=process did not establish an authenticated session. "
+            "Verify MARLO_USER/MARLO_PASS or set MARLO_COOKIE='ecosid=...' in Railway Variables."
         )
 
     logger.info("Authenticated Marlo Beauty pro wholesale session verified via /login.php (FAIL-CLOSED guard passed).")
@@ -450,7 +463,7 @@ def trigger_downstream_match_and_sync():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Authenticated Marlo Beauty Live Product Scraper v2.3")
+    parser = argparse.ArgumentParser(description="Authenticated Marlo Beauty Live Product Scraper v2.4")
     parser.add_argument("--max-items", type=int, default=0, help="Max product pages to crawl (0 = all)")
     parser.add_argument("--freight-per-unit", type=float, default=0.65, help="Estimated inbound freight per unit")
     parser.add_argument("--delay", type=float, default=0.45, help="Delay in seconds between requests")
