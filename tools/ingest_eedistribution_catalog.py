@@ -11,9 +11,16 @@ Authenticated EE Distribution All-Brand Catalog & Strict Marketplace-Restriction
 - Polite 2.2s PDP pacing + adaptive 429 backoff (stays under EE's 10 req / 20s sliding window)
 - Incremental crash-safe CSV saves every 10 verified SKUs + finally-block flush (Ctrl+C safe)
 - 5-Layer 3rd-Party / Amazon / eBay Restriction Detector on both listing cards and
-  every Product Detail Page (PDP)
+  every Product Detail Page (PDP):
+    1. Listing grid restriction badges/icons
+    2. Alert/warning banners, tooltips (title / aria-label / data-original-title), & restriction divs
+    3. Specification table / attribute rows (e.g., "Amazon: No", "3rd Party Sales: Not Allowed")
+    4. Full visible page text regex sweep (Amazon, eBay, Walmart, 3rd Party, Brick & Mortar Only)
+    5. Embedded JSON / script state flags (amazonRestricted, thirdPartyRestricted, ebayRestricted)
 - Logs every excluded SKU + exact trigger phrase to data/reports/ee_marketplace_restricted_skipped.csv
+- Extracts exact Piece Price / Case Price (e.g., "6 pieces (1 case): $52.10" -> $8.68/ea) and multiline UPC
 - Writes clean CSV to both incoming/ and indexed/ so all daemons index it immediately
+- Optional --run-pipeline flag chains auto_cross_catalog_matcher_daemon.py -> multipack_reverse_upc_hunter.py -> push_full_backlog_to_sheet.py
 """
 
 import os
@@ -110,7 +117,7 @@ DEFAULT_SEED_BRAND_SLUGS = [
     "ultra-pro", "konami", "gund", "bioworld", "paladone", "youtooz",
     "kidrobot", "beast-kingdom", "iron-studios", "sideshow", "square-enix",
     "aquarius", "usaopoly", "the-noble-collection", "factory-entertainment",
-    "enESCO", "department-56", "schleich", "papo", "safari-ltd", "melissa-and-doug"
+    "enesco", "department-56", "schleich", "papo", "safari-ltd", "melissa-and-doug"
 ]
 
 
