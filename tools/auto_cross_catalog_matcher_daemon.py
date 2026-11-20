@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-tools/auto_cross_catalog_matcher_daemon.py (v2.2)
+tools/auto_cross_catalog_matcher_daemon.py (v2.3)
 -------------------------------------------------
 Permanent Cross-Catalog Matcher Daemon for Wholesale MRO & Specialty Pipelines:
 - Loads the full 784-brand IP & Private-Label Blocklist (/app/data/ip_blocklist.json)
   with Unicode accent normalization and multi-word substring protection
+- Syncs legacy /app/data/ip_blacklist.json to match ip_blocklist.json automatically
 - Indexes BOTH .parquet AND .csv distributor catalogs across indexed/, incoming/,
   and normalized/ (including Jb_Tools_Catalog.csv, Atlantic_Spice_Catalog.csv,
   EEDistribution_Catalog.csv, Marlo_Beauty_Catalog.csv, and bci_normalized_index.csv)
 - Scans BOTH verified_deals AND candidate_cache (72,000+ ASINs) using:
-    1. Exact UPC / EAN / GTIN Barcode Match
-    2. Brand-Verified Alphanumeric MPN / SKU Match
-    3. High-Precision Brand + Title Token Match (for no-UPC catalogs like JB Tools & Atlantic Spice)
+  1. Exact UPC / EAN / GTIN Barcode Match
+  2. Brand-Verified Alphanumeric MPN / SKU Match
+  3. High-Precision Brand + Title Token Match (for no-UPC catalogs like JB Tools & Atlantic Spice)
 - Promotes matched leads directly into verified_deals with real wholesale COGS,
   net profit, ROI, and confidence tier so push_full_backlog_to_sheet.py streams them live
 """
@@ -28,7 +29,7 @@ import sqlite3
 import argparse
 import unicodedata
 from pathlib import Path
-from typing import Dict, Any, List, Set, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -100,10 +101,18 @@ class CrossCatalogMatcherBot:
         self._load_blacklist()
 
     def _load_blacklist(self):
+        primary = "/app/data/ip_blocklist.json"
+        legacy = "/app/data/ip_blacklist.json"
+        if os.path.exists(primary):
+            try:
+                shutil.copy2(primary, legacy)
+            except Exception:
+                pass
+
         candidates = [
             self.blacklist_path,
-            "/app/data/ip_blocklist.json",
-            "/app/data/ip_blacklist.json",
+            primary,
+            legacy,
         ]
         for path in candidates:
             if os.path.exists(path):
@@ -404,7 +413,6 @@ class CrossCatalogMatcherBot:
                                 candidate_hits.append(hit)
 
             if candidate_hits:
-                # Keep lowest wholesale cost / highest net profit match for this ASIN
                 best = sorted(candidate_hits, key=lambda x: (-x["net_profit"], x["wholesale_cost"]))[0]
                 best_by_asin[asin] = best
 
@@ -504,7 +512,7 @@ class CrossCatalogMatcherBot:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Automated Cross-Catalog Wholesale Matcher Daemon v2.2")
+    parser = argparse.ArgumentParser(description="Automated Cross-Catalog Wholesale Matcher Daemon v2.3")
     parser.add_argument("--run-once", action="store_true", help="Run a single cross-match cycle and exit")
     parser.add_argument("--interval", type=int, default=1800, help="Seconds between daemon cycles")
     args = parser.parse_args()
