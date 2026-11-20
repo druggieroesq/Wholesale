@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Master Orchestrator & Centralized Telegram Gateway (v7.9.3 Self-Healing Engine)
+Master Orchestrator & Centralized Telegram Gateway (v7.9.4 Self-Healing Engine)
 -------------------------------------------------------------------------------
 Supervises dedicated background workers, persistent volume state, and automated catalog ingestion:
-1. ReverseAmazonHunter         (tools/reverse_amazon_finder.py)
-2. SheetSyncDaemon             (tools/sync_today_leads_to_sheet.py --daemon)
+1. ReverseAmazonHunter         (tools/reverse_amazon_finder.py — 22 Low-Return Root Categories)
+2. CrossCatalogMatcher         (tools/auto_cross_catalog_matcher_daemon.py --interval 1800)
 3. WebDistributorScout         (tools/web_distributor_scout.py)
 4. AutonomousRecruiter         (tools/autonomous_recruiter.py)
 5. DriveManufacturerSync       (tools/sync_drive_manufacturer_catalogs.py --daemon)
@@ -14,10 +14,11 @@ Supervises dedicated background workers, persistent volume state, and automated 
   - HealthServer
   - MasterTelegramListener
   - TwoTierCatalogWatcher (auto-routes motion* -> ingest_motion_catalog.py & bci* -> ingest_bci_catalog.py)
-  - PeriodicEEDistributionWorker (auto-scrapes EE Distribution every 12h & triggers cross-match)
+  - PeriodicEEDistributionWorker (auto-scrapes ALL sellable EE Distribution brands every 12h & triggers cross-match)
   - PeriodicZoroScoutWorker (auto-scans Zoro.com MRO portal every 12h with SP-API verification)
   - PeriodicSpecialtyScrapersWorker (auto-scrapes Atlantic Spice, JB Tools & Marlo Beauty every 12h)
   - PeriodicBeautyMultipackWorker (hunts 0-FBA Beauty multipacks >=58% ROI every 12h)
+  - PeriodicBacklogSheetSyncWorker (streams full Two-Tier 1,945+ lead backlog without 38-row wipes)
   - PeriodicReorderWorker
 """
 
@@ -93,19 +94,21 @@ MFR_INCOMING = CATALOG_DIR / "manufacturer_catalogs" / "incoming"
 MFR_INDEXED = CATALOG_DIR / "manufacturer_catalogs" / "indexed"
 
 HUNTER_LOG_FILE = DATA_DIR / "hunter_live.log"
-SHEET_SYNC_LOG_FILE = DATA_DIR / "sheet_sync.log"
+SHEET_SYNC_LOG_FILE = REPORTS_DIR / "sheet_sync.log"
+CROSS_CATALOG_LOG_FILE = REPORTS_DIR / "cross_catalog_daemon.log"
 SCOUT_LOG_FILE = DATA_DIR / "scout_live.log"
 RECRUITER_LOG_FILE = DATA_DIR / "recruiter_live.log"
 DRIVE_SYNC_LOG_FILE = DATA_DIR / "drive_sync.log"
 REORDER_LOG_FILE = DATA_DIR / "reorder_po.log"
 ANTI_REGATE_LOG_FILE = DATA_DIR / "anti_regate.log"
-SP_API_RESTRICTIONS_LOG_FILE = DATA_DIR / "sp_api_restrictions.log"
+SP_API_RESTRICTIONS_LOG_FILE = REPORTS_DIR / "sp_api_restrictions.log"
 
 REORDER_INTERVAL_SECONDS = int(os.getenv("REORDER_INTERVAL_SECONDS", 21600))
 EE_DIST_INTERVAL_SECONDS = int(os.getenv("EE_DIST_INTERVAL_SECONDS", 43200))
 ZORO_INTERVAL_SECONDS = int(os.getenv("ZORO_INTERVAL_SECONDS", 43200))
 SPECIALTY_INTERVAL_SECONDS = int(os.getenv("SPECIALTY_INTERVAL_SECONDS", 43200))
 BEAUTY_MULTIPACK_INTERVAL_SECONDS = int(os.getenv("BEAUTY_MULTIPACK_INTERVAL_SECONDS", 43200))
+BACKLOG_SYNC_INTERVAL_SECONDS = int(os.getenv("BACKLOG_SYNC_INTERVAL_SECONDS", 7200))
 MIN_SHEET_ACTIVE_ROWS = int(os.getenv("MIN_SHEET_ACTIVE_ROWS", 250))
 
 EXTRA_DIRECT_BRAND_BLOCKS = {
@@ -140,7 +143,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_3_self_healing_orchestrator"}')
+            self.wfile.write(b'{"status":"healthy","service":"wholesale_mro_engine","engine":"v7_9_4_self_healing_orchestrator"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -665,59 +668,48 @@ def sync_distributor_database():
 
 def run_startup_backlog_backfill():
     """
-    Permanently ensures the live Google Sheet stays populated with the full 50+ u/mo SQLite backlog.
-    Checks the live webhook row count on boot; if < MIN_SHEET_ACTIVE_ROWS (default 250), runs
-    tools/push_full_backlog_to_sheet.py in the background (or inline fallback if script is absent).
+    Streams the full Two-Tier Wholesale backlog (1,945+ leads) on startup using
+    tools/push_full_backlog_to_sheet.py so the live Google Sheet never gets stuck at 38 rows.
     """
     webhook_url = get_verified_webhook_url()
     if not webhook_url:
         return
 
     try:
-        resp = requests.get(webhook_url, timeout=15, allow_redirects=True)
-        if resp.status_code != 200:
-            return
-        info = resp.json()
-        last_row = int(info.get("last_row") or 0)
-        active_rows = max(0, last_row - 5)
-
-        if active_rows >= MIN_SHEET_ACTIVE_ROWS:
-            logger.info(f"Live sheet healthy ({active_rows:,} active rows >= {MIN_SHEET_ACTIVE_ROWS}). Skipping startup backfill.")
-            return
-
-        logger.info(f"Live sheet has {active_rows} active rows (< {MIN_SHEET_ACTIVE_ROWS}). Launching BSR-aware backlog backfill...")
         backlog_script = ROOT_DIR / "tools" / "push_full_backlog_to_sheet.py"
         if backlog_script.exists():
-            subprocess.Popen([
-                sys.executable, "-u", str(backlog_script),
-                "--batch-size", "100",
-                "--min-velocity", "50"
-            ])
-        else:
-            logger.warning("tools/push_full_backlog_to_sheet.py not found in repo; running inline BSR-aware SQLite backfill...")
-            inline_cmd = (
-                "import sys, time, json, sqlite3, requests; "
-                "sys.path.insert(0, '.'); "
-                "from config import get_verified_webhook_url; "
-                "wh = get_verified_webhook_url(); "
-                "conn = sqlite3.connect('data/hunter_engine.db', timeout=60.0); "
-                "conn.row_factory = sqlite3.Row; cur = conn.cursor(); "
-                "def est_v(ms, d90, bsr): "
-                "  ms, d90, bsr = int(ms or 0), int(d90 or 0), int(bsr or 0); "
-                "  return ms if (ms > 0 and ms not in (20, 25)) else (max(1, round((d90/3.0)*1.15)) if d90 > 0 else (450 if 0 < bsr <= 500 else (220 if bsr <= 1500 else (110 if bsr <= 5000 else (55 if bsr <= 15000 else 0))))); "
-                "rows = cur.execute(\"SELECT * FROM candidate_cache WHERE status IS NULL OR UPPER(status) NOT IN ('BLOCKED_IP_BRAND','REJECTED','DELETED') ORDER BY monthly_sold DESC, drops_90 DESC, sales_rank ASC LIMIT 2500\").fetchall(); "
-                "payloads = []; "
-                "for r in rows: "
-                "  d = dict(r); bb = float(d.get('avg90_bb') or d.get('current_bb') or 0); vel = est_v(d.get('monthly_sold'), d.get('drops_90'), d.get('sales_rank')); fba = int(d.get('fba_sellers') or 0); "
-                "  if bb >= 13.50 and vel >= 50 and fba <= 6 and d.get('brand'): "
-                "    payloads.append({'asin': d['asin'], 'title': d.get('title') or '', 'brand': d['brand'], 'vendor': 'Unmapped (Needs Catalog Match)', 'sales_rank': int(d.get('sales_rank') or 0), 'monthly_velocity': vel, 'drops_90': int(d.get('drops_90') or 0), 'competitive_fba': fba, 'total_sellers': max(2, int(d.get('num_sellers') or (fba + 1))), 'buy_box_price': bb, 'avg90_bb': bb, 'wholesale_cost': round(bb*0.36, 2), 'landed_bundle_cogs': round(bb*0.36, 2)}); "
-                "for i in range(0, len(payloads), 100): "
-                "  chunk = payloads[i:i+100]; is_last = (i + 100 >= len(payloads)); "
-                "  requests.post(wh, json={'action': 'APPEND_LEADS', 'leads': chunk, 'skip_sync': (not is_last)}, timeout=60, allow_redirects=True); time.sleep(1.0)"
+            logger.info("Launching Two-Tier Backlog Streamer on startup (push_full_backlog_to_sheet.py --wipe-first)...")
+            log_fp = open(SHEET_SYNC_LOG_FILE, "a")
+            subprocess.Popen(
+                [sys.executable, "-u", str(backlog_script), "--batch-size", "100", "--max-leads", "2000", "--wipe-first"],
+                stdout=log_fp,
+                stderr=log_fp,
             )
-            subprocess.Popen([sys.executable, "-c", inline_cmd])
     except Exception as exc:
         logger.warning(f"Startup backlog backfill notice: {exc}")
+
+
+def run_periodic_backlog_sheet_sync_worker():
+    """Periodically streams the full Two-Tier backlog to Google Sheets every 2h without 38-row wipes."""
+    backlog_script = ROOT_DIR / "tools" / "push_full_backlog_to_sheet.py"
+    if not backlog_script.exists():
+        return
+
+    logger.info(f"Periodic Two-Tier Backlog Sheet Sync ACTIVE (Interval: {BACKLOG_SYNC_INTERVAL_SECONDS}s).")
+    while True:
+        time.sleep(BACKLOG_SYNC_INTERVAL_SECONDS)
+        try:
+            logger.info("Running scheduled Two-Tier Backlog sync to Google Sheets...")
+            with open(SHEET_SYNC_LOG_FILE, "a") as log_fp:
+                subprocess.run(
+                    [sys.executable, "-u", str(backlog_script), "--batch-size", "100", "--max-leads", "2000"],
+                    stdout=log_fp,
+                    stderr=log_fp,
+                    check=False,
+                    timeout=600,
+                )
+        except Exception as exc:
+            logger.warning(f"Periodic backlog sync notice: {exc}")
 
 
 def trigger_candidate_rescore():
@@ -742,13 +734,13 @@ def trigger_candidate_rescore():
 
 
 def run_periodic_ee_distribution_worker():
-    """Automatically scrapes In-Stock EE Distribution SKUs on startup and every 12h."""
+    """Automatically scrapes ALL sellable EE Distribution brands on startup and every 12h."""
     ee_script = ROOT_DIR / "tools" / "ingest_eedistribution_catalog.py"
     if not ee_script.exists():
         logger.info("tools/ingest_eedistribution_catalog.py not found. EE Distribution worker in standby.")
         return
 
-    logger.info(f"Periodic EE Distribution Catalog Scraper ACTIVE (Interval: {EE_DIST_INTERVAL_SECONDS}s).")
+    logger.info(f"Periodic EE Distribution ALL-BRANDS Catalog Scraper ACTIVE (Interval: {EE_DIST_INTERVAL_SECONDS}s).")
     time.sleep(45)
 
     while True:
@@ -756,31 +748,28 @@ def run_periodic_ee_distribution_worker():
             if not os.getenv("EE_DIST_EMAIL") or not os.getenv("EE_DIST_PASSWORD"):
                 logger.warning("EE_DIST_EMAIL or EE_DIST_PASSWORD not set in Railway Variables; skipping EE scrape.")
             else:
-                logger.info("Running scheduled EE Distribution In-Stock catalog ingestion pass...")
+                logger.info("Running scheduled EE Distribution ALL-BRANDS In-Stock catalog ingestion pass...")
                 res = subprocess.run(
                     [
                         sys.executable,
                         "-u",
                         str(ee_script),
-                        "--brands",
-                        "funko",
-                        "hasbro",
-                        "mattel",
-                        "bandai",
-                        "mcfarlane-toys",
-                        "neca",
+                        "--all-brands",
                         "--max-pages",
-                        "4",
+                        "0",
+                        "--max-pdps-per-brand",
+                        "0",
                         "--freight-per-unit",
                         "0.85",
+                        "--run-pipeline",
                     ],
                     capture_output=True,
                     text=True,
                     check=False,
-                    timeout=900,
+                    timeout=7200,
                 )
                 if res.returncode == 0:
-                    logger.info("EE Distribution catalog ingestion pass completed successfully.")
+                    logger.info("EE Distribution ALL-BRANDS catalog ingestion pass completed successfully.")
                     trigger_candidate_rescore()
                 else:
                     logger.warning(f"EE Distribution scraper exited with code {res.returncode}:\n{res.stderr or res.stdout}")
@@ -848,11 +837,11 @@ def run_periodic_specialty_scrapers_worker():
             try:
                 logger.info(f"Running scheduled live web scrape pass for {name}...")
                 res = subprocess.run(
-                    [sys.executable, "-u", str(script_path), "--max-items", "350"],
+                    [sys.executable, "-u", str(script_path), "--max-items", "0"],
                     capture_output=True,
                     text=True,
                     check=False,
-                    timeout=900,
+                    timeout=3600,
                 )
                 if res.returncode == 0:
                     logger.info(f"{name} live catalog scrape completed; CSV queued for auto-normalization.")
@@ -925,7 +914,6 @@ def run_catalog_watcher():
                             if f_key not in _KNOWN_CATALOG_MTIMES or _KNOWN_CATALOG_MTIMES[f_key] < mtime:
                                 time.sleep(1)
 
-                                # Auto-route Motion.com spreadsheets through standalone OEM normalizer
                                 if "motion" in f.name.lower() and motion_script.exists():
                                     logger.info(f"[MOTION OEM TIER] Motion feed detected: {f.name}. Routing to ingest_motion_catalog.py...")
                                     cmd = [sys.executable, str(motion_script), "--feed", str(f)]
@@ -938,7 +926,6 @@ def run_catalog_watcher():
                                         logger.error(f"Failed normalizing Motion feed {f.name}:\n{res.stderr or res.stdout}")
                                     continue
 
-                                # Auto-route BCI Full Inventory workbooks through dedicated Inven5Full parser
                                 if "bci" in f.name.lower() and bci_script.exists():
                                     logger.info(f"[BCI WHOLESALE TIER] BCI inventory detected: {f.name}. Routing to ingest_bci_catalog.py...")
                                     cmd = [sys.executable, str(bci_script), "--feed", str(f)]
@@ -1062,7 +1049,7 @@ def spawn_worker(cmd_args: list, log_file: Path) -> subprocess.Popen:
 
 
 def main():
-    logger.info(f"Initializing Master Pipeline Orchestrator v7.9.3 (DATA_DIR={DATA_DIR} | Webhook={get_verified_webhook_url()})...")
+    logger.info(f"Initializing Master Pipeline Orchestrator v7.9.4 (DATA_DIR={DATA_DIR} | Webhook={get_verified_webhook_url()})...")
 
     load_ip_blocklist_cached()
 
@@ -1090,12 +1077,15 @@ def main():
     beauty_multipack_thread = threading.Thread(target=run_periodic_beauty_multipack_worker, daemon=True)
     beauty_multipack_thread.start()
 
+    backlog_sync_thread = threading.Thread(target=run_periodic_backlog_sheet_sync_worker, daemon=True)
+    backlog_sync_thread.start()
+
     reorder_thread = threading.Thread(target=run_periodic_reorder_worker, daemon=True)
     reorder_thread.start()
 
     workers = [
         ("ReverseAmazonHunter", [sys.executable, "-u", str(ROOT_DIR / "tools" / "reverse_amazon_finder.py")], HUNTER_LOG_FILE),
-        ("SheetSyncDaemon", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sync_today_leads_to_sheet.py"), "--daemon"], SHEET_SYNC_LOG_FILE),
+        ("CrossCatalogMatcher", [sys.executable, "-u", str(ROOT_DIR / "tools" / "auto_cross_catalog_matcher_daemon.py"), "--interval", "1800"], CROSS_CATALOG_LOG_FILE),
         ("WebDistributorScout", [sys.executable, "-u", str(ROOT_DIR / "tools" / "web_distributor_scout.py")], SCOUT_LOG_FILE),
         ("AutonomousRecruiter", [sys.executable, "-u", str(ROOT_DIR / "tools" / "autonomous_recruiter.py")], RECRUITER_LOG_FILE),
         ("DriveManufacturerSync", [sys.executable, "-u", str(ROOT_DIR / "tools" / "sync_drive_manufacturer_catalogs.py"), "--daemon"], DRIVE_SYNC_LOG_FILE),
